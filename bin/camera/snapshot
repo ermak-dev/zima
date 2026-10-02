@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Save one JPEG from the OpenIPC camera without exposing credentials.
+set -euo pipefail
+umask 077
+
+fail() { echo "robot snapshot: $*" >&2; exit 1; }
+(( $# <= 1 )) || fail 'usage: robot snapshot [output.jpg]'
+netrc=${ROBOT_CAMERA_NETRC:-${XDG_CONFIG_HOME:-$HOME/.config}/robot/camera.netrc}
+[[ -f $netrc && ! -L $netrc ]] || fail "missing regular credential file $netrc (create a mode-0600 netrc entry for machine cam)"
+[[ $(stat -c %a -- "$netrc") == 600 && $(stat -c %u -- "$netrc") == "$(id -u)" ]] || fail "credential file $netrc must be owned by you with mode 0600"
+
+private_dir=
+if (( $# )); then
+    dest=$1
+    dir=$(dirname -- "$dest")
+    [[ -d $dir ]] || fail "output directory does not exist: $dir"
+else
+    private_dir=$(mktemp -d "${TMPDIR:-/tmp}/robot-snapshot.XXXXXXXX")
+    dir=$private_dir
+    dest=$dir/frame.jpg
+fi
+[[ ! -e $dest && ! -L $dest ]] || fail "output already exists: $dest"
+temp=$(mktemp "$dir/.robot-snapshot.XXXXXXXX")
+cleanup() {
+    rm -f -- "$temp"
+    if [[ -n $private_dir && ! -e $dest ]]; then rmdir -- "$private_dir" || true; fi
+}
+trap cleanup EXIT
+
+start=$(date +%s%3N)
+"${ROBOT_CURL:-curl}" --fail --silent --show-error --connect-timeout 2 --max-time 6 \
+    --max-filesize 5242880 --noproxy cam --proto '=http' \
+    --netrc-file "$netrc" --header 'Cache-Control: no-cache' \
+    --output "$temp" http://cam/image.jpg || fail 'camera request failed (check connectivity and credentials)'
+size=$(stat -c %s -- "$temp")
+(( size > 512 && size <= 5242880 )) || fail "invalid JPEG size: $size bytes"
+first=$(head -c 2 "$temp" | od -An -tx1 | tr -d ' \n')
+last=$(tail -c 2 "$temp" | od -An -tx1 | tr -d ' \n')
+[[ $first == ffd8 && $last == ffd9 ]] || fail 'camera returned an invalid JPEG'
+ln -- "$temp" "$dest" || fail "output already exists: $dest"
+finish=$(date +%s%3N)
+printf '%s (%s bytes, %s ms)\n' "$dest" "$size" "$((finish - start))"
