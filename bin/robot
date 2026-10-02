@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Control the rooted vacuum through Player without starting cleaning.
+# Usage: robot controller status|stop|start
+#        robot position|fan
+#        robot move forward|backward|left|right <seconds (0, 2]>
+#        robot stop
+set -euo pipefail
+
+base=${ROBOT_BIN_DIR:-$(dirname "$(realpath "$0")")/controller}
+ssh_cmd=${ROBOT_SSH:-ssh}
+
+usage() { sed -n '2,5s/^# //p' "$0"; }
+fail() { echo "robot: $*" >&2; exit 2; }
+
+controller_status() {
+    "$ssh_cmd" robot bash -s <<'REMOTE'
+set -e
+list=/opt/rockrobo/watchdog/ProcessList.conf
+if grep -Fqx 'RoboController,setsid RoboController&,1,3,0' "$list" && pgrep -x RoboController >/dev/null && pgrep -x WatchDoge >/dev/null; then
+    echo enabled
+elif grep -Fqx '# ROBOT_DISABLED: RoboController,setsid RoboController&,1,3,0' "$list" && ! pgrep -x RoboController >/dev/null && pgrep -x WatchDoge >/dev/null; then
+    echo disabled
+else
+    echo 'inconsistent controller/watchdog state' >&2
+    exit 1
+fi
+REMOTE
+}
+
+player() {
+    local binary=${ROBOT_PLAYER_CLIENT:-$base/player-bin} host
+    if [[ ! -v ROBOT_PLAYER_CLIENT ]]; then
+        local source=$base/player.c tree=${ROBOT_PLAYER_ROOT:-$HOME/Projects/robot/ros2/player} cache=${XDG_CACHE_HOME:-$HOME/.cache}/robot
+        mkdir -p "$cache"
+        binary=$cache/player
+        if [[ ! -x $binary || $source -nt $binary ]]; then
+            gcc -Wall -Wextra -Werror -I"$tree/replace" -I"$tree" -I"$tree/client_libs/libplayerc" -I"$tree/libplayerinterface" "$source" -o "$binary.tmp" \
+                -L"$tree/client_libs/libplayerc" -L"$tree/libplayerinterface" -L"$tree/libplayerwkb" -L"$tree/libplayerjpeg" -L"$tree/libplayercommon" \
+                -lplayerc -lplayerinterface -lplayerwkb -lplayerjpeg -lplayercommon -lm -lz
+            mv "$binary.tmp" "$binary"
+        fi
+        export LD_LIBRARY_PATH="$tree/client_libs/libplayerc:$tree/libplayerinterface:$tree/libplayerwkb:$tree/libplayerjpeg:$tree/libplayercommon${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    host=$($ssh_cmd -G robot | awk '$1 == "hostname" { print $2; exit }')
+    [[ -n $host ]] || fail 'cannot resolve SSH host robot'
+    if [[ ${1:-} == move ]]; then
+        local guard
+        guard=$($ssh_cmd robot bash -s <<'REMOTE'
+set -e
+marker=$(mktemp /tmp/robot-drive-guard.XXXXXX)
+nohup sh -c 'sleep 10; if test -f "$1"; then pkill -TERM -x player; rm -f "$1"; fi' robot-guard "$marker" </dev/null >/dev/null 2>&1 &
+echo "$marker"
+REMOTE
+)
+        [[ $guard == /tmp/robot-drive-guard.* && $guard != *[!a-zA-Z0-9_./-]* ]] || fail 'could not arm on-robot stop guard'
+        if "$binary" "$host" "$@"; then
+            "$ssh_cmd" robot rm -f -- "$guard"
+        else
+            echo 'robot: movement failed; on-robot guard will restart Player after 10 seconds' >&2
+            return 1
+        fi
+    else
+        "$binary" "$host" "$@"
+    fi
+}
+
+cmd=${1:---help}
+(( $# == 0 )) || shift
+case $cmd in
+    --help|-h|help) usage ;;
+    controller)
+        (( $# == 1 )) || fail 'usage: robot controller status|stop|start'
+        case $1 in
+            status) controller_status ;;
+            stop) exec "$base/disable" ;;
+            start) exec "$base/enable" ;;
+            *) fail 'usage: robot controller status|stop|start' ;;
+        esac ;;
+    position|fan)
+        (( $# == 0 )) || fail "$cmd takes no arguments"
+        player "$cmd" ;;
+    move)
+        (( $# == 2 )) || fail 'usage: robot move forward|backward|left|right <seconds>'
+        case $1 in forward|backward|left|right) ;; *) fail 'unknown direction' ;; esac
+        [[ $2 =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || fail 'duration must be a finite positive number'
+        awk -v n="$2" 'BEGIN {exit !(n > 0 && n <= 2)}' || fail 'duration must be between 0 and 2 seconds'
+        [[ $(controller_status) == disabled ]] || fail 'stop RoboController first'
+        player move "$1" "$2" ;;
+    stop)
+        (( $# == 0 )) || fail 'stop takes no arguments'
+        player stop ;;
+    *) fail "unknown command: $cmd" ;;
+esac

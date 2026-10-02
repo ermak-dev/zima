@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Restore the stock controller and its WatchDoge supervision.
+set -euo pipefail
+
+"${ROBOT_SSH:-ssh}" robot bash -s <<'REMOTE'
+set -euo pipefail
+list=${ROBOT_PROCESS_LIST:-/opt/rockrobo/watchdog/ProcessList.conf}
+backup=${ROBOT_BACKUP:-/mnt/data/rockrobo/ProcessList.conf.robot-backup}
+entry='RoboController,setsid RoboController&,1,3,0'
+marker="# ROBOT_DISABLED: $entry"
+tmp=
+disabled_copy=
+changed=0
+cleanup() {
+    local status=$?
+    [[ -z $tmp ]] || rm -f "$tmp"
+    if (( status && changed )) && [[ -n $disabled_copy && -f $disabled_copy ]]; then
+        cp -p "$disabled_copy" "$list"
+        initctl restart rrwatchdoge >&2 || true
+    fi
+    [[ -z $disabled_copy ]] || rm -f "$disabled_copy"
+}
+trap cleanup EXIT
+
+if grep -Fqx "$entry" "$list"; then
+    if [[ -e $backup ]]; then
+        cmp -s "$list" "$backup" || { echo 'robot: recovery copy differs from enabled config' >&2; exit 1; }
+        initctl restart rrwatchdoge
+        for i in 1 2 3 4 5; do
+            if pgrep -x RoboController >/dev/null; then break; fi
+            sleep 1
+        done
+    fi
+    pgrep -x RoboController >/dev/null && pgrep -x WatchDoge >/dev/null || {
+        echo 'robot: entry enabled but controller/watchdog is not running' >&2; exit 1;
+    }
+    rm -f "$backup"
+    echo 'controller enabled'
+    exit 0
+fi
+[[ -f $backup && $(grep -Fxc "$entry" "$backup") == 1 && $(grep -Fxc "$marker" "$list") == 1 ]] || {
+    echo 'robot: no valid recovery copy and disabled entry; refusing to guess' >&2; exit 1;
+}
+disabled_copy=$(mktemp "${list}.disabled.XXXXXX")
+cp -p "$list" "$disabled_copy"
+tmp=$(mktemp "${list}.robot.XXXXXX")
+cp -p "$list" "$tmp"
+awk -v entry="$entry" -v marker="$marker" '{ if ($0 == marker) print entry; else print }' "$list" > "$tmp"
+changed=1
+mv -f "$tmp" "$list"
+tmp=
+initctl restart rrwatchdoge
+pgrep -x WatchDoge >/dev/null || { echo 'robot: watchdog failed to start' >&2; exit 1; }
+for i in 1 2 3 4 5; do
+    if pgrep -x RoboController >/dev/null; then break; fi
+    sleep 1
+done
+pgrep -x RoboController >/dev/null || { echo 'robot: RoboController did not restart' >&2; exit 1; }
+rm -f "$backup"
+changed=0
+echo 'controller enabled and watched'
+REMOTE
