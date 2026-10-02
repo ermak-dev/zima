@@ -2,14 +2,15 @@
 # Control the rooted vacuum through Player without starting cleaning.
 # Usage: robot controller status|stop|start
 #        robot position|fan
-#        robot move forward|backward|left|right <seconds (0, 2]>
+#        robot snapshot [output.jpg]
+#        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot stop
 set -euo pipefail
 
 base=${ROBOT_BIN_DIR:-$(dirname "$(realpath "$0")")/controller}
 ssh_cmd=${ROBOT_SSH:-ssh}
 
-usage() { sed -n '2,5s/^# //p' "$0"; }
+usage() { sed -n '2,7s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 
 controller_status() {
@@ -79,12 +80,21 @@ case $cmd in
     position|fan)
         (( $# == 0 )) || fail "$cmd takes no arguments"
         player "$cmd" ;;
+    snapshot)
+        exec "${ROBOT_CAMERA_BIN:-$(dirname "$(realpath "$0")")/camera/snapshot}" "$@" ;;
     move)
-        (( $# == 2 )) || fail 'usage: robot move forward|backward|left|right <seconds>'
+        with_controller=0
+        if [[ ${1:-} == --with-controller ]]; then with_controller=1; shift; fi
+        (( $# == 2 )) || fail 'usage: robot move [--with-controller] forward|backward|left|right <seconds>'
         case $1 in forward|backward|left|right) ;; *) fail 'unknown direction' ;; esac
         [[ $2 =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || fail 'duration must be a finite positive number'
         awk -v n="$2" 'BEGIN {exit !(n > 0 && n <= 2)}' || fail 'duration must be between 0 and 2 seconds'
-        [[ $(controller_status) == disabled ]] || fail 'stop RoboController first'
+        state=$(controller_status)
+        if (( with_controller )); then
+            [[ $state == enabled ]] || fail '--with-controller requires the stock controller to be running'
+        else
+            [[ $state == disabled ]] || fail 'stop RoboController first, or use --with-controller for a supervised test'
+        fi
         player move "$1" "$2" ;;
     stop)
         (( $# == 0 )) || fail 'stop takes no arguments'

@@ -14,7 +14,7 @@ if [[ $1 == -G ]]; then printf 'hostname 192.0.2.82\n'; exit; fi
 printf 'ssh:%s\n' "$*" >> "$ROBOT_TEST_LOG"
 if [[ $* == 'robot bash -s' ]]; then
     script=$(cat)
-    if [[ $script == *'ROBOT_DISABLED'* ]]; then printf 'disabled\n'; else printf '/tmp/robot-drive-guard.TEST\n'; fi
+    if [[ $script == *'ROBOT_DISABLED'* ]]; then printf '%s\n' "${ROBOT_TEST_CONTROLLER_STATE:-disabled}"; else printf '/tmp/robot-drive-guard.TEST\n'; fi
 else
     printf 'disabled\n'
 fi
@@ -31,7 +31,12 @@ printf 'controller:%s\n' "$(basename "$0")" >> "$ROBOT_TEST_LOG"
 EOF
     chmod +x "$tmp/controller/$action"
 done
-chmod +x "$tmp/bin/ssh" "$tmp/bin/player"
+cat > "$tmp/bin/camera" <<'EOF'
+#!/usr/bin/env bash
+printf 'camera:%s\n' "$*" >> "$ROBOT_TEST_LOG"
+EOF
+chmod +x "$tmp/bin/ssh" "$tmp/bin/player" "$tmp/bin/camera"
+export ROBOT_CAMERA_BIN="$tmp/bin/camera"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_log() { grep -Fqx -- "$1" "$tmp/log" || fail "expected $1"; }
@@ -49,16 +54,25 @@ assert_log 'controller:enable'
 assert_log 'player:192.0.2.82 position'
 "$root/bin/robot" fan
 assert_log 'player:192.0.2.82 fan'
+"$root/bin/robot" snapshot "$tmp/frame.jpg"
+assert_log "camera:$tmp/frame.jpg"
 : > "$tmp/log"
 "$root/bin/robot" move forward 0.5
 assert_log 'player:192.0.2.82 move forward 0.5'
 assert_log 'ssh:robot rm -f -- /tmp/robot-drive-guard.TEST'
 [[ $(grep -n 'ssh:robot bash -s' "$tmp/log" | tail -1 | cut -d: -f1) -lt $(grep -n 'player:.* move ' "$tmp/log" | cut -d: -f1) ]] || fail 'guard was not armed before movement'
 : > "$tmp/log"
+ROBOT_TEST_CONTROLLER_STATE=enabled expect_failure "$root/bin/robot" move forward 0.5
+if grep -q 'player:.* move ' "$tmp/log"; then fail 'default move bypassed controller gate'; fi
+: > "$tmp/log"
+ROBOT_TEST_CONTROLLER_STATE=enabled "$root/bin/robot" move --with-controller forward 0.5
+assert_log 'player:192.0.2.82 move forward 0.5'
+assert_log 'ssh:robot rm -f -- /tmp/robot-drive-guard.TEST'
+: > "$tmp/log"
 ROBOT_PLAYER_FAIL=1 expect_failure "$root/bin/robot" move forward 0.1
 if grep -q 'ssh:robot rm -f -- /tmp/robot-drive-guard.TEST' "$tmp/log"; then fail 'guard was disarmed after failed movement'; fi
 : > "$tmp/log"
-for args in 'move sideways 1' 'move forward 0' 'move forward 3' 'move forward nan' 'move forward -1' 'move forward 1 extra' 'position extra' 'fan extra' 'controller unknown'; do
+for args in 'move sideways 1' 'move forward 0' 'move forward 3' 'move forward nan' 'move forward -1' 'move forward 1 extra' 'move --with-controller forward 3' 'move --with-controller sideways 0.5' 'position extra' 'fan extra' 'controller unknown'; do
     read -r -a argv <<< "$args"
     expect_failure "$root/bin/robot" "${argv[@]}"
 done
