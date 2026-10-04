@@ -10,7 +10,7 @@ publish = false
 # sensor_msgs etc. are non-functional stubs, which is why they are not
 # used directly.
 [dependencies]
-player-bridge = { path = "../../rust/player_to_ros2" }
+player-bridge = { path = "../../rust/player-bridge" }
 rclrs = "0.8"
 ros-env = "0.3"
 

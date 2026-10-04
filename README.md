@@ -29,7 +29,7 @@ robot bug new "Подключить датчики" --epic 1 --body-file task.md
 
 `robot bug epic new` creates an organizing **issue** with a checklist, not a native GitLab Epic: this project is in a user namespace, while GitLab's Epic API requires a group. Tasks created with `--epic` link back to it and enter its checklist.
 
-Use `~/robot/bin/robot` directly, or keep a `~/bin/robot` symlink pointing at it. All SSH access goes through the `robot` alias in `~/.ssh/config`. Movement, position and stop use the Rust `robotctl` client built from `rust/player_to_ros2` (`cargo build -p player-bridge --release`); no C client library is involved. No binaries or libraries are installed on the robot.
+Use `~/robot/bin/robot` directly, or keep a `~/bin/robot` symlink pointing at it. All SSH access goes through the `robot` alias in `~/.ssh/config`. Movement, position and stop use the Rust `robotctl` client built from `rust/player-bridge` (`cargo build -p player-bridge --release`); no C client library is involved. No binaries or libraries are installed on the robot.
 
 `robot disable` saves the original `/opt/rockrobo/watchdog/ProcessList.conf` on the robot, comments out only the `RoboController` entry, restarts `rrwatchdoge` to reload the list, and stops `RoboController`. `robot enable` restores that entry and supervision. A failed restart retains a recovery copy and can be retried with `robot enable`; inspect manually if it reports an inconsistent config. While disabled, normal buttons, Mi Home and Valetudo control may not work. Always restore the controller when finished.
 
