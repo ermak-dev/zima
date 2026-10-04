@@ -4,13 +4,19 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# No external dependencies: the owner must cross-build to a static ARM
-# binary with nothing but the Rust toolchain (see tools/arm-lld.sh).
+# Dependencies stay workspace-local only: player-bridge provides the XDR
+# velocity command used by the rollback path, keeping the ARM cross-build
+# fully static with no external crates (see tools/arm-lld.sh).
 [dependencies]
+player-bridge = { path = "../player-bridge" }
 
 [[bin]]
 name = "mask-owner"
 path = "src/main.rs"
+
+[[bin]]
+name = "robot-supervisor"
+path = "src/bin/robot-supervisor.rs"
 
 [lib]
 name = "mask_owner"

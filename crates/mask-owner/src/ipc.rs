@@ -232,3 +232,95 @@ impl Drop for Owner {
         let _ = self.restore(Duration::from_secs(5));
     }
 }
+
+/// Full rollback recipe: everything needed to stop the robot and hand
+/// control back to the stock controller, executable entirely on the
+/// robot with no network access to the workstation.
+#[derive(Debug, Clone)]
+pub struct Rollback {
+    /// Player TCP host for the zero-velocity command (loopback on the robot).
+    pub player_host: String,
+    pub player_port: u16,
+    pub send_fifo: String,
+    pub recv_fifo: String,
+    /// Shell command (script path + args) restoring the stock controller.
+    pub restore_command: String,
+}
+
+/// Execute the rollback in the safety-relevant order:
+/// 1. zero velocity over Player TCP (reaches the MCU immediately),
+/// 2. standby mask over the FIFO (disables the wheel permission — an
+///    independent second stop path that also zeroes the saved command),
+/// 3. controller-restore command.
+/// Steps are best-effort in sequence: a failure in an earlier step is
+/// logged and the later steps still run, but the function reports the
+/// first error so callers can retry.
+pub fn full_rollback(r: &Rollback, timeout: Duration) -> Result<(), OwnerError> {
+    let mut first_err = None;
+
+    // 1. Zero velocity.
+    match player_bridge::Client::connect(&r.player_host, r.player_port) {
+        Ok(mut client) => {
+            // Velocity commands (PLAYER_MSGTYPE_CMD) need no subscription:
+            // send the stop directly, before any data could confuse us.
+            if let Err(e) = client.send_velocity(0, 0.0, 0.0, 1) {
+                eprintln!("[rollback] zero velocity failed: {e}");
+                first_err.get_or_insert(OwnerError::WriteFailed);
+            } else {
+                eprintln!("[rollback] zero velocity sent");
+            }
+        }
+        Err(e) => {
+            eprintln!("[rollback] cannot reach Player for zero velocity: {e}");
+            first_err.get_or_insert(OwnerError::WriteFailed);
+        }
+    }
+
+    // 2. Standby mask (with a bounded number of retries).
+    let mut mask_ok = false;
+    for attempt in 1..=3u32 {
+        let seq = ((std::process::id() + attempt) & 0xffff) as u32;
+        let result = Channel::open_with(&r.send_fifo, &r.recv_fifo).and_then(|mut c| {
+            c.drain().ok();
+            c.exchange(seq, MASK_STANDBY, timeout)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+        match result {
+            Ok(()) => {
+                eprintln!("[rollback] standby mask applied (attempt {attempt})");
+                mask_ok = true;
+                break;
+            }
+            Err(e) => eprintln!("[rollback] standby attempt {attempt} failed: {e}"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !mask_ok {
+        first_err.get_or_insert(OwnerError::Timeout);
+    }
+
+    // 3. Restore the stock controller. Split the command string the
+    // simple way (script + args, no quoting needs so far).
+    let mut parts = r.restore_command.split_whitespace();
+    if let Some(script) = parts.next() {
+        let args: Vec<&str> = parts.collect();
+        match std::process::Command::new(script).args(&args).status() {
+            Ok(status) if status.success() => {
+                eprintln!("[rollback] controller restore command succeeded");
+            }
+            Ok(status) => {
+                eprintln!("[rollback] controller restore exited {status}");
+                first_err.get_or_insert(OwnerError::WriteFailed);
+            }
+            Err(e) => {
+                eprintln!("[rollback] cannot run controller restore: {e}");
+                first_err.get_or_insert(OwnerError::WriteFailed);
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}

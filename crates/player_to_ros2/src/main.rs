@@ -10,6 +10,7 @@
 //! - The bridge never enables the device mask itself: run the mask owner
 //!   (bin/robot mask hold) separately, or the laser will stay silent.
 
+use std::io::Write;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,6 +66,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let odom_frame: String = odom_frame.get().to_string();
 
     let host_for_log = host.clone();
+
+    // Heartbeat to the on-robot supervisor (if configured): one byte per
+    // second proves this process is alive. The supervisor stops the robot
+    // and restores the stock controller when the bytes stop.
+    let heartbeat = std::env::var("ROBOT_BRIDGE_HEARTBEAT").ok().map(|addr| {
+        std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(&addr).ok();
+            if let Some(s) = stream.as_mut() {
+                let _ = s.write_all(b"ACTIVATE\n");
+                let _ = s.flush();
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let beat_ok = match stream.as_mut() {
+                    Some(s) => s.write_all(b"hb").is_ok(),
+                    None => false,
+                };
+                if !beat_ok {
+                    eprintln!("player_to_ros2: heartbeat connection lost");
+                    // Losing the supervisor means the robot is being
+                    // rolled back: exit so no velocity commands keep
+                    // flowing from a dead session.
+                    std::process::exit(0);
+                }
+            }
+        })
+    });
+
     let reader = std::thread::spawn(move || {
         let run = || -> Result<(), PlayerError> {
             let mut client = Client::connect(&host, port)?;

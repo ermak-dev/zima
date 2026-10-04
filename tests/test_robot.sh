@@ -26,6 +26,9 @@ if [[ $* == 'robot bash -s' ]]; then
 elif [[ $1 == robot && $2 == /tmp/mask-owner/mask-owner ]]; then
     # Emulate remote execution of the deployed binary.
     exec "$(dirname "$0")/mask-owner" "${@:3}"
+elif [[ $1 == robot && $2 == *robot-supervisor*listen* ]]; then
+    printf 'supervisor:%s\n' "$2" >> "$ROBOT_TEST_LOG"
+    exit 0
 else
     printf 'disabled\n'
 fi
@@ -104,6 +107,32 @@ for args in 'mask' 'mask unknown' 'mask hold --mask zzz' 'mask hold --mask 1f8ff
     expect_failure "$root/bin/robot" "${argv[@]}"
 done
 [[ ! -s $tmp/log ]] || fail 'invalid mask commands contacted robot'
+
+# --- robot bridge: supervisor first, then disable, then the ROS node ---
+mkdir -p "$tmp/fake-ros"
+cat > "$tmp/fake-ros/ros2" <<'ROSEOF'
+#!/usr/bin/env bash
+printf 'ros2:%s\n' "$*" >> "$ROBOT_TEST_LOG"
+[[ ${ROBOT_BRIDGE_FAIL:-0} != 1 ]]
+ROSEOF
+chmod +x "$tmp/fake-ros/ros2"
+: > "$tmp/log"
+PATH="$tmp/fake-ros:$PATH" ROBOT_TEST_CONTROLLER_STATE=disabled "$root/bin/robot" bridge
+grep -q "supervisor:.*listen" "$tmp/log" || fail 'supervisor not started for bridge'
+# disable travels as a stdin heredoc: count the bash -s dispatch between
+# the supervisor start and the ros2 launch
+[[ $(awk '/supervisor:/{s=1} /ros2:run/{e=1} s && !e && /bash -s/{n++} END{print n+0}' "$tmp/log") -ge 1 ]] || fail 'controller not disabled for bridge'
+grep -q 'ros2:run player_to_ros2' "$tmp/log" || fail 'bridge node not launched'
+: > "$tmp/log"
+PATH="$tmp/fake-ros:$PATH" ROBOT_BRIDGE_FAIL=1 ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
+: > "$tmp/log"
+for args in 'bridge extra' 'bridge --heartbeat-port' 'bridge --timeout-ms x'; do
+    read -r -a argv <<< "$args"
+    expect_failure "$root/bin/robot" "${argv[@]}"
+done
+[[ ! -s $tmp/log ]] || fail 'invalid bridge commands contacted robot'
+: > "$tmp/log"
+
 "$root/bin/robot" stop
 assert_log 'robotctl:192.0.2.82 stop'
 "$root/bin/robot" fan

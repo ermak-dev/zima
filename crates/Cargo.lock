@@ -478,6 +478,9 @@ dependencies = [
 [[package]]
 name = "mask-owner"
 version = "0.1.0"
+dependencies = [
+ "player-bridge",
+]
 
 [[package]]
 name = "memchr"

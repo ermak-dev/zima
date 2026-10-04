@@ -6,6 +6,7 @@
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
+#        robot bridge            # full supervised session (needs sourced ROS 2)
 #        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
 set -euo pipefail
 
@@ -201,6 +202,26 @@ mask_owner_remote() {
     printf '%s/mask-owner\n' "$remote_dir"
 }
 
+# Deploy the ARM robot-supervisor binary and controller-restore script,
+# then start the supervisor listening for the bridge heartbeat. Prints
+# nothing; the supervisor log goes to stderr paths on the robot.
+supervisor_start() {
+    local repo binary remote_dir=/tmp/mask-owner local_sha remote_sha port=${1:-7665} timeout_ms=${2:-5000}
+    repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+    binary=$repo/crates/target/armv7-unknown-linux-musleabihf/release/robot-supervisor
+    [[ -x $binary ]] || fail 'robot-supervisor binary is missing; build: (cd crates && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)'
+    "$ssh_cmd" robot mkdir -p -- "$remote_dir" >&2
+    remote_sha=$("$ssh_cmd" robot "sha256sum $remote_dir/robot-supervisor 2>/dev/null | cut -d' ' -f1") || true
+    local_sha=$(sha256sum "$binary" | cut -d' ' -f1)
+    if [[ $remote_sha != "$local_sha" ]]; then
+        "$ssh_cmd" robot "cat > $remote_dir/robot-supervisor.tmp && chmod 700 $remote_dir/robot-supervisor.tmp && mv $remote_dir/robot-supervisor.tmp $remote_dir/robot-supervisor" <"$binary" >&2             || fail 'could not upload robot-supervisor'
+    fi
+    "$ssh_cmd" robot "cat > $remote_dir/controller-restore.sh && chmod 700 $remote_dir/controller-restore.sh" <"$repo/crates/mask-owner/controller-restore.sh" >&2         || fail 'could not upload controller-restore.sh'
+    # Fresh log each session; the wrapper tails it on exit.
+    "$ssh_cmd" robot ': > /tmp/robot-supervisor.log' >&2
+    "$ssh_cmd" robot "nohup $remote_dir/robot-supervisor listen --heartbeat-port $port --timeout-ms $timeout_ms > /tmp/robot-supervisor.log 2>&1 < /dev/null &" >&2
+}
+
 cmd=${1:---help}
 (( $# == 0 )) || shift
 case $cmd in
@@ -263,6 +284,32 @@ case $cmd in
                 exec "$ssh_cmd" robot "$remote" restore ;;
             *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
         esac ;;
+    bridge)
+        (( $# == 0 )) || fail 'usage: robot bridge [--heartbeat-port N] [--timeout-ms M]'
+        heartbeat_port=7665 timeout_ms=5000
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --heartbeat-port) heartbeat_port=$2; shift 2 ;;
+                --timeout-ms) timeout_ms=$2; shift 2 ;;
+                *) fail "unknown bridge option: $1" ;;
+            esac
+        done
+        repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+        [[ -d $repo/crates ]] || fail 'crates/ not found'
+        # 1. supervisor first (it must never be missing while masked)
+        supervisor_start "$heartbeat_port" "$timeout_ms"
+        # 2. hand over controller supervision
+        controller_disable >&2
+        # 3. run the bridge; its heartbeat activates the supervisor
+        host=$($ssh_cmd -G robot | awk '$1 == "hostname" { print $2; exit }')
+        status=0
+        ROBOT_BRIDGE_HEARTBEAT="$host:$heartbeat_port" \
+            ros2 run player_to_ros2 player_to_ros2 --ros-args -p "player_host:=$host" || status=$?
+        # 4. the supervisor rolls the robot back when the bridge dies;
+        #    surface its log so the rollback is visible.
+        sleep 1
+        "$ssh_cmd" robot 'cat /tmp/robot-supervisor.log' >&2 || true
+        exit "$status" ;;
     stop)
         (( $# == 0 )) || fail 'stop takes no arguments'
         robotctl stop ;;
