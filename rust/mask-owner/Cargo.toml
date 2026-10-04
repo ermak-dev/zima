@@ -1,0 +1,17 @@
+[package]
+name = "mask-owner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# No external dependencies: the owner must cross-build to a static ARM
+# binary with nothing but the Rust toolchain (see tools/arm-lld.sh).
+[dependencies]
+
+[[bin]]
+name = "mask-owner"
+path = "src/main.rs"
+
+[lib]
+name = "mask_owner"
+path = "src/lib.rs"
