@@ -15,12 +15,14 @@ if pgrep -f '[o]dom_tf_replay.py$' >/dev/null; then
     exit 9
 fi
 echo "[stage] replay node" >> "$LOG"
+# The replay node always runs: it re-stamps scans onto the bag odom
+# timeline; REPLAY_TF only controls whether it also republishes TF.
 python3 ~/robot/ros2/odom_tf_replay.py >> "$LOG" 2>&1 &
 REPLAY=$!
 sleep 1
 
 echo "[stage] bag play (rate 0.5 for stability)" >> "$LOG"
-ros2 bag play ~/robot-bags/live-session-20261004 --rate 0.5 >> "$LOG" 2>&1 &
+ros2 bag play "${BAG:-$HOME/robot-bags/live-session-20261004}" --rate 0.5 >> "$LOG" 2>&1 &
 BAG=$!
 sleep 4
 
@@ -38,8 +40,8 @@ BAG_RC=$?
 echo "[stage] bag done rc=$BAG_RC" >> "$LOG"
 sleep 5
 ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap \
-    "{name: {data: ./maps/live_session_20261004}}" >> "$LOG" 2>&1
-kill $REPLAY $SLAM 2>/dev/null
-wait $REPLAY $SLAM 2>/dev/null
+    "{name: {data: "${MAP_NAME:-./maps/live_session_20261004}"}}" >> "$LOG" 2>&1
+[[ -n $REPLAY ]] && kill $REPLAY 2>/dev/null; kill $SLAM 2>/dev/null
+[[ -n $REPLAY ]] && wait $REPLAY 2>/dev/null; wait $SLAM 2>/dev/null
 echo "[stage] done" >> "$LOG"
 exit $BAG_RC

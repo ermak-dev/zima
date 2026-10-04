@@ -50,6 +50,7 @@ class OdomTfReplay(Node):
         self.static_sent = False
         # latest odom pose, re-stamped as TF on demand
         self.latest_pose = None
+        self.latest_odom_stamp = None
 
     def _stamp_now(self):
         return self.get_clock().now().to_msg()
@@ -84,6 +85,14 @@ class OdomTfReplay(Node):
     def on_odom(self, msg):
         pos = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         self.latest_pose = (pos, msg.pose.pose.orientation)
+        self.latest_odom_stamp = msg.header.stamp
+
+        # Bag mode: TF is already recorded in the bag with valid stamps;
+        # republishing odom->base_link is only needed for bags that
+        # predate bridge TF support (REPLAY_TF=1).
+        import os
+        if os.environ.get('REPLAY_TF', '1') != '1':
+            return
 
         tf = TFMessage()
         t = TransformStamped()
@@ -98,15 +107,20 @@ class OdomTfReplay(Node):
         self.pub.publish(tf)
 
     def on_scan(self, msg):
-        stamp = self._stamp_now()
+        # Stamp the scan with the latest odom stamp from the same bag
+        # timeline: /tf in the bag carries these stamps, so the message
+        # filter matches exactly. (The bag's own scan stamps are zero —
+        # the recording bridge predated scan stamping.)
+        stamp = self.latest_odom_stamp or self._stamp_now()
         msg.header.stamp = stamp
         self.scan_pub.publish(msg)
 
-        # Republish odom->base_link with the scan's exact stamp so the
-        # message filter always finds a matching transform.
-        tf = self._tf_message(stamp)
-        if tf is not None:
-            self.pub.publish(tf)
+        # In TF-replay mode also refresh the transform at this stamp.
+        import os
+        if os.environ.get('REPLAY_TF', '1') == '1':
+            tf = self._tf_message(stamp)
+            if tf is not None:
+                self.pub.publish(tf)
 
 
 def main():

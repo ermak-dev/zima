@@ -1,6 +1,6 @@
 slam_toolbox:
   ros__parameters:
-    scan_topic: /scan_stamped
+    scan_topic: /scan
     odom_frame: odom
     base_frame: base_link
     laser_frame: laser
@@ -18,7 +18,7 @@ slam_toolbox:
     use_scan_barycenter: true
     minimum_time_interval: 0.5
     transform_publish_period: 0.0
-    map_file_name: ./maps/live_session_20261004
+    mode: mapping
     map_start_at_dock: false
     debug_logging: false
     throttle_scans: 1
