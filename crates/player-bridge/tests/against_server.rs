@@ -1,9 +1,10 @@
 //! Integration test against a REAL local Player server.
 //!
-//! Prerequisites: the Player 3.1 tree built at ~/robot/ros2/player
-//! and its dummy config (laser:0 + position2d:0). The test starts the
-//! server itself on a private port; if the tree is missing the test is
-//! skipped (env ROBOT_PLAYER_SRC points at the tree, default as above).
+//! Prerequisites: the Player 3.1 server vendored into the local cache by
+//! tools/get-player.sh (default ~/.cache/robot/player) with its dummy
+//! config (laser:0 + position2d:0). The test starts the server itself on
+//! a private port; if the cache is missing the test is skipped (env
+//! ROBOT_PLAYER_SRC points at the tree, default as above).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -23,7 +24,7 @@ impl Drop for Server {
 
 fn start_server() -> Option<(Server, u16)> {
     let src = std::env::var("ROBOT_PLAYER_SRC")
-        .unwrap_or_else(|_| format!("{}/robot/ros2/player", std::env::var("HOME").unwrap()));
+        .unwrap_or_else(|_| format!("{}/.cache/robot/player", std::env::var("HOME").unwrap()));
     let bin = format!("{src}/server/player");
     let cfg = format!("{src}/config/dummy.cfg");
     if !std::path::Path::new(&bin).exists() || !std::path::Path::new(&cfg).exists() {

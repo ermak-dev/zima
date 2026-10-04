@@ -152,9 +152,9 @@ robotctl() {
     local binary=${ROBOT_ROBOTCTL_BIN:-} repo
     if [[ -z $binary ]]; then
         repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
-        binary=$repo/rust/target/release/robotctl
-        [[ -x $binary ]] || binary=$repo/rust/target/debug/robotctl
-        [[ -x $binary ]] || fail 'robotctl binary is missing; build: (cd rust && cargo build -p player-bridge --release)'
+        binary=$repo/crates/target/release/robotctl
+        [[ -x $binary ]] || binary=$repo/crates/target/debug/robotctl
+        [[ -x $binary ]] || fail 'robotctl binary is missing; build: (cd crates && cargo build --release)'
     fi
     local host
     host=$($ssh_cmd -G robot | awk '$1 == "hostname" { print $2; exit }')
@@ -188,8 +188,8 @@ mask_owner_remote() {
     if [[ -z $binary ]]; then
         local repo
         repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
-        binary=$repo/rust/target/armv7-unknown-linux-musleabihf/release/mask-owner
-        [[ -x $binary ]] || fail 'mask-owner binary is missing; build: (cd rust && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)'
+        binary=$repo/crates/target/armv7-unknown-linux-musleabihf/release/mask-owner
+        [[ -x $binary ]] || fail 'mask-owner binary is missing; build: (cd crates && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)'
     fi
     "$ssh_cmd" robot mkdir -p -- "$remote_dir" >&2
     remote_sha=$("$ssh_cmd" robot "sha256sum $remote_dir/mask-owner 2>/dev/null | cut -d' ' -f1") || true

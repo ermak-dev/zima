@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vendor the Player 3.1 tree into ros2/player as test infrastructure.
+# Vendor the Player 3.1 tree into the local cache as test infrastructure.
 #
 # The tree is NOT committed (74 MB of upstream git history): this script
 # clones upstream release-3.1 at the exact commit we validated against,
@@ -16,13 +16,13 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 ref=${1:-cb1e0b13}
-dest=$root/ros2/player
+dest=${XDG_CACHE_HOME:-$HOME/.cache}/robot/player
 
 if [[ -x $dest/server/player && -d $dest/.git ]]; then
-    echo "ros2/player already vendored and built at $dest" >&2
+    echo "player already vendored and built at $dest" >&2
     exit 0
 fi
-mkdir -p "$(dirname "$dest")"
+mkdir -p "$dest"
 git clone https://github.com/playerproject/player.git "$dest"
 git -C "$dest" checkout "$ref"
 git -C "$dest" apply "$root/tools/player-modern-gcc.patch"
@@ -33,4 +33,4 @@ cd "$dest"
 cmake -DCMAKE_BUILD_TYPE=Release -DHAVE_GEOS:BOOL=OFF . >/dev/null
 make -j"$(nproc)" player >/dev/null
 test -x server/player
-echo "ros2/player ready (ref $ref)"
+echo "player ready at $dest (ref $ref)"

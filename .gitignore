@@ -1,6 +1,4 @@
 .env
 __pycache__/
 *.pyc
-rust/target/
-ros2/player/.git/
-ros2/player/
+crates/target/
