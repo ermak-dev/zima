@@ -1,0 +1,19 @@
+[package]
+name = "player_to_ros2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Message types come from ros-env: it picks up the Rust bindings that
+# rosidl generated into the sourced ROS workspace (the colcon workspace
+# at ~/Projects/robot/ros2/rust-ws for now). The crates.io entries named
+# sensor_msgs etc. are non-functional stubs, which is why they are not
+# used directly.
+[dependencies]
+player-bridge = { path = "../../rust/player_to_ros2" }
+rclrs = "0.8"
+ros-env = "0.3"
+
+[[bin]]
+name = "player_to_ros2"
+path = "src/main.rs"
