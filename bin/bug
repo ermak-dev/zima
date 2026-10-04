@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""robot bug — GitLab issues for the robot project.
+
+Credentials are loaded from the private .env beside the repository, with process
+variables taking precedence. No issue labels or workflow from Rugent are assumed.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GITLAB_KEYS = {"GITLAB_SITE", "GITLAB_USER", "GITLAB_PASSWORD", "GITLAB_PROJECT_ID"}
+_token = None
+
+
+def load_gitlab_env(path, environ):
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key = key.strip()
+        if key in GITLAB_KEYS and key not in environ:
+            parts = shlex.split(value, comments=True)
+            environ[key] = parts[0] if parts else ""
+
+
+def fail(message):
+    raise SystemExit(f"robot bug: {message}")
+
+
+def project_id():
+    return os.environ.get("GITLAB_PROJECT_ID", "40")
+
+
+def site():
+    value = os.environ.get("GITLAB_SITE")
+    if not value:
+        fail("GITLAB_SITE отсутствует в .env")
+    return value
+
+
+def token():
+    global _token
+    if _token is None:
+        user = os.environ.get("GITLAB_USER")
+        password = os.environ.get("GITLAB_PASSWORD")
+        if not user or not password:
+            fail("GITLAB_USER / GITLAB_PASSWORD отсутствуют в .env")
+        data = urllib.parse.urlencode(
+            {"grant_type": "password", "username": user, "password": password}
+        ).encode()
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(f"https://{site()}/oauth/token", data=data), timeout=20
+            ) as response:
+                _token = json.load(response)["access_token"]
+        except urllib.error.HTTPError as error:
+            fail(f"авторизация GitLab: HTTP {error.code}")
+        except urllib.error.URLError as error:
+            fail(f"соединение с GitLab: {error.reason}")
+    return _token
+
+
+def call(method, path, payload=None):
+    request = urllib.request.Request(
+        f"https://{site()}/api/v4/projects/{project_id()}{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {token()}"},
+    )
+    if payload is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            content = response.read()
+            return json.loads(content) if content else None
+    except urllib.error.HTTPError as error:
+        fail(f"{method} {path}: HTTP {error.code}")
+    except urllib.error.URLError as error:
+        fail(f"соединение с GitLab: {error.reason}")
+
+
+def paged(path):
+    result = []
+    for page in range(1, 1001):
+        separator = "&" if "?" in path else "?"
+        batch = call("GET", f"{path}{separator}per_page=100&page={page}")
+        if not batch:
+            return result
+        result.extend(batch)
+    fail("слишком много страниц ответа GitLab")
+
+
+def body_from(args, inline=None):
+    if inline:
+        return inline
+    if getattr(args, "body_file", None):
+        return Path(args.body_file).read_text()
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    fail("укажите --body-file или передайте текст через stdin")
+
+
+def new_labels(labels):
+    return labels
+
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].rstrip("-")
+
+
+def strip_closing(text):
+    return re.sub(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#", "#", text, flags=re.I)
+
+
+def branch_name(labels, iid, slug=None):
+    kind = "bug" if "bug" in labels or "type::bug" in labels else "feat"
+    name = f"{kind}/{iid}"
+    suffix = slugify(slug) if slug else ""
+    return f"{name}-{suffix}" if suffix else name
+
+
+def git(*args):
+    result = subprocess.run(["git", *args], cwd=ROOT, text=True, capture_output=True)
+    if result.returncode:
+        fail(f"git {' '.join(args)}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def command_list(args):
+    query = {"state": "all" if args.all else "opened"}
+    if args.label:
+        query["labels"] = ",".join(args.label)
+    issues = paged("/issues?" + urllib.parse.urlencode(query))
+    if args.json:
+        print(json.dumps(issues, ensure_ascii=False, indent=2))
+        return
+    for issue in issues:
+        mark = "✓" if issue["state"] == "closed" else " "
+        print(f"{mark} #{issue['iid']:<4} {issue['title']}")
+    print(f"{len(issues)} issue · {call('GET', '')['web_url']}/-/issues")
+
+
+def command_show(args):
+    issue = call("GET", f"/issues/{args.iid}")
+    print(f"#{issue['iid']} [{issue['state']}] {issue['title']}")
+    print(f"labels: {', '.join(issue['labels'])}\n{issue['web_url']}\n")
+    print(issue.get("description") or "(нет описания)")
+    for note in reversed(paged(f"/issues/{args.iid}/notes")):
+        if not note.get("system"):
+            print(f"\n--- {note['author']['username']} · {note['created_at'][:16]} ---\n{note['body']}")
+
+
+def command_labels(args):
+    for label in sorted(paged("/labels"), key=lambda item: item["name"]):
+        print(f"{label['name']:<24} {label.get('description') or ''}")
+
+
+def command_new(args):
+    body = body_from(args)
+    if not body.strip():
+        fail("пустое описание issue")
+    epic_id = getattr(args, "epic", None)
+    if epic_id is not None:
+        epic = call("GET", f"/issues/{epic_id}")
+        if not epic["title"].startswith("[Эпик] "):
+            fail(f"#{epic_id} не является issue-эпиком")
+        body = f"Эпик: #{epic_id}\n\n{body}"
+    issue = call("POST", "/issues", {
+        "title": args.title,
+        "description": body,
+        "labels": ",".join(new_labels(args.label)),
+    })
+    print(f"#{issue['iid']} создан · {issue['web_url']}")
+    if epic_id is not None:
+        description = (epic.get("description") or "").rstrip()
+        if "## Задачи" not in description:
+            description += "\n\n## Задачи"
+        description += f"\n\n- [ ] #{issue['iid']} {args.title}" if description.endswith("## Задачи") else f"\n- [ ] #{issue['iid']} {args.title}"
+        call("PUT", f"/issues/{epic_id}", {"description": description})
+
+
+def command_epic_new(args):
+    if not args.title.strip():
+        fail("пустой заголовок эпика")
+    args.title = f"[Эпик] {args.title}"
+    command_new(args)
+
+
+def command_comment(args):
+    body = body_from(args, args.text)
+    if not body.strip():
+        fail("пустой комментарий")
+    call("POST", f"/issues/{args.iid}/notes", {"body": body})
+    print(f"#{args.iid} прокомментирован")
+
+
+def command_edit(args):
+    payload = {}
+    if args.title is not None:
+        if not args.title.strip():
+            fail("пустой заголовок")
+        payload["title"] = args.title
+    if args.body_file is not None:
+        body = Path(args.body_file).read_text()
+        if not body.strip():
+            fail("пустое описание issue")
+        payload["description"] = body
+    if not payload:
+        fail("укажите --title и/или --body-file")
+    issue = call("PUT", f"/issues/{args.iid}", payload)
+    print(f"#{args.iid} обновлён · {issue['web_url']}")
+
+
+def command_close(args):
+    if args.comment:
+        call("POST", f"/issues/{args.iid}/notes", {"body": args.comment})
+    call("PUT", f"/issues/{args.iid}", {"state_event": "close"})
+    print(f"#{args.iid} закрыт")
+
+
+def command_reopen(args):
+    call("PUT", f"/issues/{args.iid}", {"state_event": "reopen"})
+    print(f"#{args.iid} переоткрыт")
+
+
+def command_relabel(args):
+    if not args.label and not args.remove_label:
+        fail("укажите --label и/или --remove-label")
+    issue = call("GET", f"/issues/{args.iid}")
+    labels = [label for label in issue["labels"] if label not in args.remove_label]
+    for label in args.label:
+        if label not in labels:
+            labels.append(label)
+    call("PUT", f"/issues/{args.iid}", {"labels": ",".join(labels)})
+    print(f"#{args.iid} → {', '.join(labels)}")
+
+
+def default_branch():
+    return call("GET", "")["default_branch"]
+
+
+def command_start(args):
+    issue = call("GET", f"/issues/{args.iid}")
+    branch = branch_name(issue["labels"], args.iid, args.slug)
+    base = default_branch()
+    git("fetch", "origin", base)
+    git("switch", "-c", branch, f"origin/{base}")
+    print(f"#{args.iid} → {branch} (от origin/{base})")
+
+
+def command_mr(args):
+    branch = git("branch", "--show-current")
+    target = args.target or default_branch()
+    if not branch or branch == target:
+        fail("MR открывается из отдельной ветки, не из ветки по умолчанию")
+    issue = call("GET", f"/issues/{args.iid}")
+    git("push", "-u", "origin", "HEAD")
+    mr = call("POST", "/merge_requests", {
+        "source_branch": branch,
+        "target_branch": target,
+        "title": strip_closing(args.title or git("log", "-1", "--format=%s")),
+        "description": f"Задача #{args.iid}: {issue['title']}",
+        "remove_source_branch": True,
+    })
+    print(f"MR !{mr['iid']} открыт · {mr['web_url']}")
+
+
+def main():
+    load_gitlab_env(ROOT / ".env", os.environ)
+    parser = argparse.ArgumentParser(prog="robot bug", description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    list_cmd = commands.add_parser("list", help="список issues")
+    list_cmd.add_argument("--all", action="store_true")
+    list_cmd.add_argument("--label", action="append", default=[])
+    list_cmd.add_argument("--json", action="store_true")
+    list_cmd.set_defaults(fn=command_list)
+    show = commands.add_parser("show", help="issue и комментарии")
+    show.add_argument("iid", type=int)
+    show.set_defaults(fn=command_show)
+    commands.add_parser("labels", help="лейблы проекта (только чтение)").set_defaults(fn=command_labels)
+    new = commands.add_parser("new", help="создать issue")
+    new.add_argument("title")
+    new.add_argument("--body-file")
+    new.add_argument("--label", action="append", default=[])
+    new.add_argument("--epic", type=int, help="привязать к issue-эпику")
+    new.set_defaults(fn=command_new)
+    epic = commands.add_parser("epic", help="issue-эпик для проекта без групповых Epic")
+    epic_commands = epic.add_subparsers(dest="epic_command", required=True)
+    epic_new = epic_commands.add_parser("new", help="создать issue-эпик")
+    epic_new.add_argument("title")
+    epic_new.add_argument("--body-file")
+    epic_new.add_argument("--label", action="append", default=[])
+    epic_new.set_defaults(fn=command_epic_new)
+    comment = commands.add_parser("comment", help="написать комментарий")
+    comment.add_argument("iid", type=int)
+    comment.add_argument("text", nargs="?")
+    comment.add_argument("--body-file")
+    comment.set_defaults(fn=command_comment)
+    edit = commands.add_parser("edit", help="изменить заголовок/описание")
+    edit.add_argument("iid", type=int)
+    edit.add_argument("--title")
+    edit.add_argument("--body-file")
+    edit.set_defaults(fn=command_edit)
+    close = commands.add_parser("close", help="закрыть issue")
+    close.add_argument("iid", type=int)
+    close.add_argument("--comment")
+    close.set_defaults(fn=command_close)
+    reopen = commands.add_parser("reopen", help="переоткрыть issue")
+    reopen.add_argument("iid", type=int)
+    reopen.set_defaults(fn=command_reopen)
+    relabel = commands.add_parser("relabel", help="изменить метки issue")
+    relabel.add_argument("iid", type=int)
+    relabel.add_argument("--label", action="append", default=[])
+    relabel.add_argument("--remove-label", action="append", default=[])
+    relabel.set_defaults(fn=command_relabel)
+    start = commands.add_parser("start", help="создать ветку для issue")
+    start.add_argument("iid", type=int)
+    start.add_argument("slug", nargs="?")
+    start.set_defaults(fn=command_start)
+    mr = commands.add_parser("mr", help="отправить ветку и создать MR")
+    mr.add_argument("iid", type=int)
+    mr.add_argument("--target")
+    mr.add_argument("--title")
+    mr.set_defaults(fn=command_mr)
+    commands.add_parser("project", help="показать проект и ветку по умолчанию").set_defaults(
+        fn=lambda args: print(f"{call('GET', '')['web_url']} · {default_branch()}")
+    )
+    args = parser.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
