@@ -1,0 +1,20 @@
+[package]
+name = "player-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Zero dependencies by design: the Player wire-protocol subset (XDR
+# 40-byte header, banner handshake, device subscribe, laser scan and
+# position2d state payloads) is decoded by hand. This keeps the core
+# testable against a real local Player server and cross-buildable for
+# the robot exactly like mask-owner. The ROS 2 layer is a separate
+# concern layered on top (see docs/player-platform-survey.md).
+
+[lib]
+name = "player_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "player_to_ros2"
+path = "src/main.rs"
