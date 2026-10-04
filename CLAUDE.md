@@ -8,10 +8,9 @@ For every behavior change or bug fix: write a focused failing test first; run it
 
 ```sh
 bash tests/test_robot.sh
-bash tests/test_robot_player.sh
 bash tests/test_robot_camera.sh
 python3 tests/test_robot_bug.py
-shellcheck bin/robot bin/camera/snapshot bin/controller/{disable,enable} tests/*.sh
+shellcheck bin/robot bin/camera/snapshot tests/*.sh
 ```
 
 ## Commands

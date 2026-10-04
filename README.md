@@ -5,8 +5,8 @@ Direct wheel control for the rooted Roborock V1 at `ssh robot`. The CLI uses the
 ## Commands
 
 ```sh
-robot controller status       # enabled / disabled
-robot controller stop         # suspend RoboController supervision
+robot status                  # enabled / disabled
+robot disable                 # suspend RoboController supervision
 robot position                # fresh Player odometry, metres and radians
 robot fan                     # raw Player fan_motor_status sensor (IR index 6)
 robot snapshot                # save one camera JPEG under a private /tmp directory
@@ -20,7 +20,7 @@ robot mask hold                # hold 0x10f8ff (LDS+motion, brushes off) until C
 robot mask hold --mask 10f0ff  # custom mask; RoboController must be stopped first
 robot mask restore             # one-shot standby mask restore
 robot stop                    # send zero velocity
-robot controller start        # restore RoboController supervision
+robot enable                  # restore RoboController supervision
 robot bug project             # GitLab project and its current default branch
 robot bug list                # project issues (other actions: robot bug --help)
 robot bug epic new "Эффектор и командер" --body-file epic.md  # issue-эпик
@@ -29,9 +29,9 @@ robot bug new "Подключить датчики" --epic 1 --body-file task.md
 
 `robot bug epic new` creates an organizing **issue** with a checklist, not a native GitLab Epic: this project is in a user namespace, while GitLab's Epic API requires a group. Tasks created with `--epic` link back to it and enter its checklist.
 
-Use `~/robot/bin/robot` directly, or keep a `~/bin/robot` symlink pointing at it. All SSH access goes through the `robot` alias in `~/.ssh/config`. The Player client compiles on first use to `${XDG_CACHE_HOME:-~/.cache}/robot/player`. It needs `gcc` and the locally built Player 3.1 library and headers at `~/Projects/robot/ros2/player` (override with `ROBOT_PLAYER_ROOT`). No binaries or libraries are installed on the robot.
+Use `~/robot/bin/robot` directly, or keep a `~/bin/robot` symlink pointing at it. All SSH access goes through the `robot` alias in `~/.ssh/config`. Movement, position and stop use the Rust `robotctl` client built from `rust/player_to_ros2` (`cargo build -p player-bridge --release`); no C client library is involved. No binaries or libraries are installed on the robot.
 
-`controller stop` saves the original `/opt/rockrobo/watchdog/ProcessList.conf` on the robot, comments out only the `RoboController` entry, restarts `rrwatchdoge` to reload the list, and stops `RoboController`. `controller start` restores that entry and supervision. A failed restart retains a recovery copy and can be retried with `controller start`; inspect manually if it reports an inconsistent config. While disabled, normal buttons, Mi Home and Valetudo control may not work. Always restore the controller when finished.
+`robot disable` saves the original `/opt/rockrobo/watchdog/ProcessList.conf` on the robot, comments out only the `RoboController` entry, restarts `rrwatchdoge` to reload the list, and stops `RoboController`. `robot enable` restores that entry and supervision. A failed restart retains a recovery copy and can be retried with `robot enable`; inspect manually if it reports an inconsistent config. While disabled, normal buttons, Mi Home and Valetudo control may not work. Always restore the controller when finished.
 
 By default, `robot move` requires `RoboController` to be stopped. `--with-controller` is an explicit, bounded experiment that requires it to be running; the controller may override direct wheel commands or start other motors. The OpenIPC camera serves `http://cam/image.jpg` using HTTP Basic authentication. Create `~/.config/robot/camera.netrc` with `machine cam login USER password PASSWORD`, owned by you with mode `0600`; keep the real password out of the repo and chat. The snapshot command uses this file, never sends Player or motor commands, and validates the JPEG before saving. HTTP Basic over plain HTTP protects neither credentials nor images on the LAN; use it only on a trusted network (or arrange an SSH tunnel). Capture time reported by the command does not prove the camera frame itself is fresh. The RTSP main stream is `rtsp://cam:554/stream=0` for a later continuous reader.
 
@@ -45,10 +45,9 @@ Movement is limited to 0.1 m/s or 0.4 rad/s and 2 seconds per call. The Player c
 
 ```sh
 bash tests/test_robot.sh
-bash tests/test_robot_player.sh
 bash tests/test_robot_camera.sh
 python3 tests/test_robot_bug.py
-shellcheck bin/robot bin/camera/snapshot bin/controller/{disable,enable} tests/*.sh
+shellcheck bin/robot bin/camera/snapshot tests/*.sh
 ```
 
 The tests use local SSH/Player fakes and do not contact the vacuum or camera. A supervised test on 2026-10-02 moved the robot 0.204 m according to fresh Player odometry; 20 `fan_motor_status` readings overlapping motion were `0.000` (raw sensor, not calibrated RPM). The stock controller and WatchDoge were restored afterward.
