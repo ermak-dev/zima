@@ -18,6 +18,8 @@ use std::time::Duration;
 use rclrs::*;
 use ros_env::sensor_msgs::msg::LaserScan;
 use ros_env::nav_msgs::msg::Odometry;
+use ros_env::tf2_msgs::msg::TFMessage;
+use ros_env::geometry_msgs::msg::{Transform, TransformStamped, Vector3};
 
 use player_bridge::{
     decode_position2d, decode_laser_scanangle, Client, Error as PlayerError, LaserScanAngle,
@@ -53,6 +55,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .declare_parameter("odom_frame")
         .default("odom".into())
         .mandatory()?;
+    let base_frame: rclrs::MandatoryParameter<Arc<str>> = node
+        .declare_parameter("base_frame")
+        .default("base_link".into())
+        .mandatory()?;
+    // Laser mounting on the vacuum: from the Player config of the vendor
+    // driver (position [-0.100, 0, 0] m, yaw 97.6 deg). Override until a
+    // live calibration says otherwise.
+    let laser_x: rclrs::MandatoryParameter<f64> = node
+        .declare_parameter("laser_x")
+        .default(-0.100)
+        .mandatory()?;
+    let laser_y: rclrs::MandatoryParameter<f64> = node
+        .declare_parameter("laser_y")
+        .default(0.0)
+        .mandatory()?;
+    let laser_yaw_deg: rclrs::MandatoryParameter<f64> = node
+        .declare_parameter("laser_yaw_deg")
+        .default(97.6)
+        .mandatory()?;
 
     // Player reader thread: decodes wire messages, forwards them, and
     // flushes outgoing velocity commands between reads.
@@ -64,6 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = u16::try_from(port.get()).unwrap_or(6665);
     let laser_frame: String = laser_frame.get().to_string();
     let odom_frame: String = odom_frame.get().to_string();
+    let base_frame: String = base_frame.get().to_string();
+    let (laser_x, laser_y, laser_yaw) =
+        (laser_x.get(), laser_y.get(), laser_yaw_deg.get().to_radians());
 
     let host_for_log = host.clone();
 
@@ -139,6 +163,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scan_pub = node.create_publisher::<LaserScan>("/scan")?;
     let odom_pub = node.create_publisher::<Odometry>("/odom")?;
+    let tf_pub = node.create_publisher::<TFMessage>("/tf")?;
+
+    // Static base_link -> laser transform (mounting from the vendor config).
+    let static_tf = {
+        let mut m = TFMessage::default();
+        let mut t = TransformStamped::default();
+        t.header.frame_id = base_frame.clone();
+        t.child_frame_id = laser_frame.clone();
+        t.transform = Transform {
+            translation: Vector3 { x: laser_x, y: laser_y, z: 0.0 },
+            rotation: yaw_to_quat(laser_yaw),
+        };
+        m.transforms.push(t);
+        m
+    };
     let clock = Clock::system();
 
     let subscription = node.create_subscription(
@@ -148,6 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
+    let _ = tf_pub.publish(&static_tf);
+    let mut last_static_tf = std::time::Instant::now();
     let mut last_report = std::time::Instant::now();
     loop {
         loop {
@@ -169,6 +210,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     beams.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
                     let n = beams.len();
                     let mut ros_scan = LaserScan::default();
+                    // Stamp at local receive time: the Player scan carries
+                    // no portable timestamp, and an unstamped message is
+                    // unusable for TF-synced consumers (SLAM drops it).
+                    // The stamp then honestly reflects the data's age.
+                    if let Ok(stamp) = clock.now().to_ros_msg() {
+                        ros_scan.header.stamp = stamp;
+                    }
                     ros_scan.header.frame_id = laser_frame.clone();
                     if n >= 2 {
                         ros_scan.angle_min = beams[0].0;
@@ -193,6 +241,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     odom.twist.twist.linear.x = state.vx;
                     odom.twist.twist.angular.z = state.vyaw;
                     let _ = odom_pub.publish(&odom);
+
+                    // odom -> base_link from the same odometry pose.
+                    let mut tf = TFMessage::default();
+                    let mut t = TransformStamped::default();
+                    t.header.frame_id = odom_frame.clone();
+                    t.child_frame_id = base_frame.clone();
+                    t.header.stamp = odom.header.stamp;
+                    t.transform = Transform {
+                        translation: Vector3 { x: state.x, y: state.y, z: 0.0 },
+                        rotation: yaw_to_quat(state.yaw),
+                    };
+                    tf.transforms.push(t);
+                    let _ = tf_pub.publish(&tf);
                 }
                 Ok(BridgeEvent::ProtocolError(e)) => return Err(e.into()),
                 Err(TryRecvError::Empty) => break,
@@ -202,6 +263,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         executor.spin(SpinOptions::spin_once().timeout(Duration::from_millis(10)));
+        if last_static_tf.elapsed() >= Duration::from_secs(1) {
+            let _ = tf_pub.publish(&static_tf);
+            last_static_tf = std::time::Instant::now();
+        }
         if last_report.elapsed() >= Duration::from_secs(30) {
             log_info!(node.logger(), "bridge alive (player {}:{})", host_for_log, port);
             last_report = std::time::Instant::now();

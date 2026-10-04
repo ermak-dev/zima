@@ -13,6 +13,7 @@ publish = false
 player-bridge = { path = "../player-bridge" }
 rclrs = "0.8"
 ros-env = "0.3"
+tf2_msgs = { path = "$ROS2_WS/install/tf2_msgs/share/tf2_msgs/rust" }
 
 [[bin]]
 name = "player_to_ros2"
