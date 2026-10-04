@@ -20,14 +20,14 @@ use ros_env::sensor_msgs::msg::LaserScan;
 use ros_env::nav_msgs::msg::Odometry;
 
 use player_bridge::{
-    decode_laser_scan, decode_position2d, Client, Error as PlayerError, LaserScan as PlayerScan,
-    Position2dState, LASER_CODE, LASER_DATA_SCAN, MSGTYPE_DATA, POSITION2D_CODE,
+    decode_position2d, decode_laser_scanangle, Client, Error as PlayerError, LaserScanAngle,
+    Position2dState, LASER_CODE, LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE,
     POSITION2D_DATA_STATE,
 };
 
 /// A decoded Player message handed from the reader thread to the ROS loop.
 enum BridgeEvent {
-    Scan(PlayerScan),
+    Scan(LaserScanAngle),
     Odom(Position2dState),
     ProtocolError(String),
 }
@@ -112,8 +112,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let msg = client.read_message()?;
                 match (msg.header.msg_type, msg.header.addr.interf, msg.header.subtype) {
-                    (MSGTYPE_DATA, LASER_CODE, LASER_DATA_SCAN) => {
-                        let scan = decode_laser_scan(&msg.payload)?;
+                    (MSGTYPE_DATA, LASER_CODE, LASER_DATA_SCANANGLE) => {
+                        // The vendor driver publishes per-beam angles
+                        // (subtype 3) in a wrapped, descending order; the
+                        // conversion to a ROS LaserScan happens on the
+                        // ROS side (see the Scan arm below).
+                        let scan = decode_laser_scanangle(&msg.payload)?;
                         if tx.send(BridgeEvent::Scan(scan)).is_err() {
                             return Ok(()); // ROS side went away
                         }
@@ -149,14 +153,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match rx.try_recv() {
                 Ok(BridgeEvent::Scan(scan)) => {
+                    // Normalize the vendor scan: unwrap the circular
+                    // order, sort ascending, and derive a uniform grid
+                    // (start, step, count) for sensor_msgs/LaserScan.
+                    let mut beams: Vec<(f32, f32)> =
+                        scan.angles.iter().copied().zip(scan.ranges.iter().copied()).collect();
+                    // unwrap: rotate so the array starts at the smallest
+                    // angle after adding 2*pi to wrapped negatives
+                    let min_a = beams.iter().map(|b| b.0).fold(f32::INFINITY, f32::min);
+                    for b in beams.iter_mut() {
+                        while b.0 < min_a {
+                            b.0 += std::f32::consts::TAU;
+                        }
+                    }
+                    beams.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+                    let n = beams.len();
                     let mut ros_scan = LaserScan::default();
                     ros_scan.header.frame_id = laser_frame.clone();
-                    ros_scan.angle_min = scan.min_angle;
-                    ros_scan.angle_max = scan.max_angle;
-                    ros_scan.angle_increment = scan.resolution;
+                    if n >= 2 {
+                        ros_scan.angle_min = beams[0].0;
+                        ros_scan.angle_max = beams[n - 1].0;
+                        ros_scan.angle_increment = (beams[n - 1].0 - beams[0].0) / (n - 1) as f32;
+                    }
                     ros_scan.range_max = scan.max_range;
-                    ros_scan.ranges = scan.ranges;
-                    ros_scan.intensities = scan.intensities.into_iter().map(f32::from).collect();
+                    ros_scan.ranges = beams.iter().map(|b| b.1).collect();
+                    ros_scan.intensities = scan.intensities.iter().map(|&i| i as f32).collect();
                     let _ = scan_pub.publish(&ros_scan);
                 }
                 Ok(BridgeEvent::Odom(state)) => {

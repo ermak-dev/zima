@@ -32,6 +32,7 @@ pub const REQ_DEV: u8 = 3; // PLAYER_PLAYER_REQ_DEV
 pub const OPEN_MODE: u8 = 1;
 
 pub const LASER_DATA_SCAN: u8 = 1; // PLAYER_LASER_DATA_SCAN
+pub const LASER_DATA_SCANANGLE: u8 = 3; // PLAYER_LASER_DATA_SCANANGLE (vendor form)
 pub const POSITION2D_DATA_STATE: u8 = 1;
 
 pub const MSGHDR_SIZE: usize = 40;
@@ -393,4 +394,73 @@ mod tests {
         assert_eq!(&req[8..12], &[0, 0, 0, 6]);
         assert_eq!(&req[16..20], &[0, 0, 0, 1]);
     }
+}
+
+/// A decoded laser scan in per-beam angle form (player_laser_data_scanangle_t,
+/// subtype 3): the vendor ruby_laser driver publishes this on the real robot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaserScanAngle {
+    pub max_range: f32,
+    pub ranges: Vec<f32>,
+    /// Per-beam bearing [rad] — the authoritative geometry, since the
+    /// driver does not publish a single start/resolution pair.
+    pub angles: Vec<f32>,
+    pub intensities: Vec<u8>,
+    pub id: u32,
+}
+
+/// Decode a player_laser_data_scanangle_t payload (XDR).
+pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
+    let rd_u32 = |off: usize| -> Result<u32, Error> {
+        payload
+            .get(off..off + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+            .ok_or(Error::ShortPayload { need: off + 4, got: payload.len() })
+    };
+    let rd_f32 = |off: usize| -> Result<f32, Error> {
+        payload
+            .get(off..off + 4)
+            .map(|b| f32::from_be_bytes(b.try_into().unwrap()))
+            .ok_or(Error::ShortPayload { need: off + 4, got: payload.len() })
+    };
+    let mut off = 0;
+    let max_range = rd_f32(off)?;
+    off += 4;
+
+    let read_array_f32 = |off: &mut usize| -> Result<Vec<f32>, Error> {
+        let count = rd_u32(*off)? as usize;
+        *off += 4;
+        // xdr_array duplicate count word
+        let dup = rd_u32(*off)? as usize;
+        if dup != count {
+            return Err(Error::CorruptChannel);
+        }
+        *off += 4;
+        let mut v = Vec::with_capacity(count);
+        for _ in 0..count {
+            v.push(rd_f32(*off)?);
+            *off += 4;
+        }
+        Ok(v)
+    };
+
+    let ranges = read_array_f32(&mut off)?;
+    let angles = read_array_f32(&mut off)?;
+    let intensity_count = rd_u32(off)? as usize;
+    off += 4;
+    let dup = rd_u32(off)? as usize;
+    if dup != intensity_count {
+        return Err(Error::CorruptChannel);
+    }
+    off += 4;
+    let mut intensities = Vec::with_capacity(intensity_count);
+    for i in 0..intensity_count {
+        match payload.get(off + i) {
+            Some(&b) => intensities.push(b),
+            None => return Err(Error::ShortPayload { need: off + i + 1, got: payload.len() }),
+        }
+    }
+    off += intensity_count + ((4 - intensity_count % 4) % 4);
+    let id = rd_u32(off)?;
+    Ok(LaserScanAngle { max_range, ranges, angles, intensities, id })
 }

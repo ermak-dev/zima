@@ -300,8 +300,14 @@ case $cmd in
         supervisor_start "$heartbeat_port" "$timeout_ms"
         # 2. hand over controller supervision
         controller_disable >&2
-        # 3. run the bridge; its heartbeat activates the supervisor
+        # 3. run the bridge; its heartbeat activates the supervisor.
+        # `disable` restarts rrwatchdoge, which may bounce Player: wait
+        # for TCP 6665 to accept before launching the node.
         host=$($ssh_cmd -G robot | awk '$1 == "hostname" { print $2; exit }')
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if timeout 1 bash -c "exec 3<>/dev/tcp/$host/6665" 2>/dev/null; then break; fi
+            sleep 1
+        done
         status=0
         ROBOT_BRIDGE_HEARTBEAT="$host:$heartbeat_port" \
             ros2 run player_to_ros2 player_to_ros2 --ros-args -p "player_host:=$host" || status=$?
