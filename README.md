@@ -1,53 +1,296 @@
-# Robot control
+# Roborock V1 → ROS 2 / Nav2
 
-Direct wheel control for the rooted Roborock V1 at `ssh robot`. The CLI uses the robot's Player server (`position2d:0` on TCP 6665), not Valetudo's remote-control mode: on this firmware, that mode switches on the vacuum fan.
+Превращаем root-нутый Roborock V1 в мобильную базу ROS 2: штатный сервер
+**Player** на роботе остаётся драйвером железа, тонкий Rust-мост публикует его
+данные в ROS 2, а навигацию считает **Nav2**. Цель — поездка в заданную точку
+по карте.
 
-## Commands
+> Перед любыми командами движения прочитайте раздел «Безопасность».
 
-```sh
-robot status                  # enabled / disabled
-robot disable                 # suspend RoboController supervision
-robot position                # fresh Player odometry, metres and radians
-robot fan                     # raw Player fan_motor_status sensor (IR index 6)
-robot snapshot                # save one camera JPEG under a private /tmp directory
-robot snapshot ./frame.jpg    # refuse to replace an existing file
-robot move forward 0.5        # bounded velocity for 0.5 s; max 2 s
-robot move backward 0.5
-robot move left 0.5           # rotate counterclockwise
-robot move right 0.5
-robot move --with-controller forward 0.5  # supervised test with RoboController still running
-robot mask hold                # hold 0x10f8ff (LDS+motion, brushes off) until Ctrl-C
-robot mask hold --mask 10f0ff  # custom mask; RoboController must be stopped first
-robot mask restore             # one-shot standby mask restore
-robot stop                    # send zero velocity
-robot enable                  # restore RoboController supervision
-robot bug project             # GitLab project and its current default branch
-robot bug list                # project issues (other actions: robot bug --help)
-robot bug epic new "Эффектор и командер" --body-file epic.md  # issue-эпик
-robot bug new "Подключить датчики" --epic 1 --body-file task.md # задача в чек-листе эпика
+## Содержание
+
+- [Архитектура](#архитектура)
+- [Требования](#требования)
+- [Установка](#установка)
+- [Команды CLI](#команды-cli-robot)
+- [Навигация: карта и поездка](#навигация-от-карты-до-поездки)
+- [Конфигурация и скрипты](#конфигурация-и-скрипты)
+- [Разработка и тесты](#разработка-и-тесты)
+- [Безопасность](#безопасность)
+
+## Архитектура
+
+```
+┌─ рабочая машина (x86, ROS 2 Jazzy) ────────────────────────────┐
+│                                                                │
+│  bin/robot  ──ssh──►  disable / mask hold / guard              │
+│  (управление)         (снять RoboController, владеть маской)   │
+│                                                                │
+│  player_to_ros2 (Rust) ══прямой TCP :6665══► Player            │
+│    /scan    ◄── laser:0                                        │
+│    /odom    ◄── position2d:0        ┌────────────────────────┐ │
+│    /cmd_vel ──► position2d:0   ◄────│ Nav2 / SLAM / RViz     │ │
+│    /tf (odom→base_link→laser)       └────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+                                  │
+┌─ робот (ARMv7, Ubuntu 14.04) ────┴─────────────────────────────┐
+│  player           штатный сервер Player (TCP 6665)             │
+│  RoboController   штатный владелец режимов (на сессию снимаем) │
+│  rrwatchdoge      супервизор процессов (перезапускает упавших) │
+│  robot-supervisor наш статический ARM-бинарь — владелец маски  │
+│                   и аварийный откат                            │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-`robot bug epic new` creates an organizing **issue** with a checklist, not a native GitLab Epic: this project is in a user namespace, while GitLab's Epic API requires a group. Tasks created with `--epic` link back to it and enter its checklist.
+Ключевые решения (обоснованы в `PLAN.md` и `LESSWRONG.md`):
 
-Use `~/robot/bin/robot` directly, or keep a `~/bin/robot` symlink pointing at it. All SSH access goes through the `robot` alias in `~/.ssh/config`. Movement, position and stop use the Rust `robotctl` client built from `crates/player-bridge` (`cd crates && cargo build --release`); no C client library is involved. No binaries or libraries are installed on the robot.
+* **Мост живёт на рабочей машине, а не на роботе.** Робот — Ubuntu 14.04 с
+  EGLIBC 2.19 и 512 МБ RAM: стек ROS 2 Jazzy там не запустится. Трафик
+  тривиален (~10 КБ/с сканы), задержка LAN ничтожна.
+* **На роботе — только `mask-owner` / `robot-supervisor`.** Владелец маски
+  обязан быть локальным: он работает с внутренними FIFO Player.
+* **Аварийный откат независим от сети.** Супервизор следит за heartbeat
+  моста: пропал heartbeat (упал мост, оборвалась сеть) → супервизор сам
+  возвращает штатное состояние.
+* **Лидар без уборки.** Маска `0x10f8ff` включает LDS и колёса, но оставляет
+  **обе щётки выключенными** — проверено живьём на роботе.
 
-`robot disable` saves the original `/opt/rockrobo/watchdog/ProcessList.conf` on the robot, comments out only the `RoboController` entry, restarts `rrwatchdoge` to reload the list, and stops `RoboController`. `robot enable` restores that entry and supervision. A failed restart retains a recovery copy and can be retried with `robot enable`; inspect manually if it reports an inconsistent config. While disabled, normal buttons, Mi Home and Valetudo control may not work. Always restore the controller when finished.
+## Требования
 
-By default, `robot move` requires `RoboController` to be stopped. `--with-controller` is an explicit, bounded experiment that requires it to be running; the controller may override direct wheel commands or start other motors. The OpenIPC camera serves `http://cam/image.jpg` using HTTP Basic authentication. Create `~/.config/robot/camera.netrc` with `machine cam login USER password PASSWORD`, owned by you with mode `0600`; keep the real password out of the repo and chat. The snapshot command uses this file, never sends Player or motor commands, and validates the JPEG before saving. HTTP Basic over plain HTTP protects neither credentials nor images on the LAN; use it only on a trusted network (or arrange an SSH tunnel). Capture time reported by the command does not prove the camera frame itself is fresh. The RTSP main stream is `rtsp://cam:554/stream=0` for a later continuous reader.
+* Рабочая машина: Linux x86_64, **ROS 2 Jazzy** (`/opt/ros/jazzy`), Rust
+  (stable), `colcon`, `colcon-cargo`, `colcon-ros-cargo`, `libclang-dev`.
+* Робот: root-доступ по ssh через алиас `robot` в `~/.ssh/config`.
+* Доступ к Player: TCP `robot:6665` из доверенной сети.
 
-The Player 3.1 tree is vendored into the local cache (`~/.cache/robot/player`, outside the repo): its only build product we use is the local `player` server — ground truth for the `player-bridge` integration tests. No C headers or client libraries are consumed: the Rust `player-bridge` core implements the wire protocol itself. Reproduce the cache with `tools/get-player.sh`: it clones upstream playerproject/player at the validated commit, applies the two modern-GCC compile fixes kept in `tools/player-modern-gcc.patch`, and builds the server in-tree with geos disabled.
+## Установка
 
-`robot mask hold` uploads the cross-built ARM `mask-owner` binary to `/tmp/mask-owner/` on the robot (re-uploading only when the sha256 changes) and runs it there over the internal Rc/Mc FIFOs. It requires the stock controller to be stopped, because the owner must be the sole IPC party. The binary applies the device bitmap, waits for the 0xa9 acknowledgement, and holds the mask until SIGTERM; a guard process forked **before** the mask is applied restores the stock standby bitmap 0x40 if the owner dies hard (Player does not roll the mask back on its own — measured live). The mask replaces the whole device state: 0x10f8ff keeps LDS, wheel, odometry, IMU and Slam enabled with both brushes off; an unacknowledged mask means unknown physical state — treat any failure as needing `robot mask restore` and controller restart. Build the binary with `(cd rust && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)`.
-
-Movement is limited to 0.1 m/s or 0.4 rad/s and 2 seconds per call. The Player client sends zero velocity at the end and on caught signals. Additionally, each move arms an on-robot 10-second guard; if not disarmed on success, it kills the Player process so WatchDoge restarts it. This is a fallback, **not a guarantee of immediate stop** after a network or hardware failure: supervise the robot in a clear area and be ready to power it off. `fan` shows a raw sensor value, not calibrated RPM. A successful CLI exit alone does not prove movement or prove the fan stayed off throughout a run.
-
-## Tests
+### 1. Rust-крейты
 
 ```sh
+git clone <repo> ~/robot && cd ~/robot/crates
+cargo build --release        # robotctl (position/move/stop)
+cargo test                   # локальные тесты, робот не нужен
+```
+
+ARM-бинарь владельца маски (кросс-сборка под робота):
+
+```sh
+cd ~/robot/crates
+cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf
+```
+
+### 2. Colcon-рабочее пространство для ROS-моста
+
+Узел `player_to_ros2` требует сгенерированных `rosidl`-биндингов сообщений,
+поэтому собирается через `colcon` (в обычном `cargo`-воркспейсе он исключён
+из `default-members`):
+
+```sh
+mkdir -p ~/robot/ros-ws/src && cd ~/robot/ros-ws
+git clone --depth 1 https://github.com/ros2-rust/ros2_rust src/ros2_rust
+vcs import src < src/ros2_rust/ros2_rust_jazzy.repos
+ln -s ~/robot/crates/player_to_ros2 src/player_to_ros2
+
+source /opt/ros/jazzy/setup.sh
+colcon build --packages-up-to sensor_msgs nav_msgs tf2_msgs
+colcon build --packages-select player_to_ros2
+```
+
+> Путь к этому workspace зашит в `crates/player_to_ros2/Cargo.toml` (зависимость
+> `tf2_msgs`). Если разместите его иначе — поправьте путь там.
+
+### 3. Тестовый сервер Player (для интеграционных тестов, необязательно)
+
+```sh
+~/robot/tools/get-player.sh    # клонирует и собирает в ~/.cache/robot/player
+```
+
+## Команды CLI `robot`
+
+Всё управление роботом идёт через `bin/robot` (удобен симлинк `~/bin/robot`).
+CLI говорит с роботом по ssh, а с Player — напрямую по TCP 6665.
+
+```sh
+robot status                  # enabled / disabled — состояние контроллера
+robot enable                  # вернуть штатный RoboController
+robot disable                 # снять RoboController (нужно для mask/nav)
+
+robot position                # свежая одометрия Player (метры, радианы)
+robot fan                     # сырой датчик fan_motor_status (IR index 6)
+robot stop                    # нулевая скорость
+robot move forward 0.5        # ограниченное движение, макс 2 с
+robot move backward 0.5
+robot move left 0.5           # поворот против часовой
+robot move right 0.5
+robot move --with-controller forward 0.5   # тест при работающем контроллере
+
+robot mask hold               # держать маску 0x10f8ff (LDS + колёса,
+                              #   щётки выключены) до Ctrl-C
+robot mask hold --mask 10f0ff # своя маска; контроллер должен быть снят
+robot mask restore            # разово вернуть standby-маску
+
+robot snapshot ./frame.jpg    # кадр с OpenIPC-камеры (HTTP Basic)
+
+robot bug list                # GitLab-задачи (см. robot bug --help)
+```
+
+`robot mask hold` сам заливает ARM-бинарь на робот и запускает его с
+guard-процессом: если владелец погибнет, guard вернёт standby-маску.
+
+## Навигация: от карты до поездки
+
+### Шаг 1. Надзорная сессия
+
+```sh
+source /opt/ros/jazzy/setup.sh
+source ~/robot/ros-ws/install/setup.sh
+
+robot bridge
+```
+
+`robot bridge` — это вся сессия одной командой:
+
+1. заливает `robot-supervisor` и `controller-restore.sh` на робот;
+2. снимает `RoboController` (`robot disable`);
+3. поднимает супервизор, который применяет маску (`LDS + колёса`, щётки
+   выключены);
+4. запускает `player_to_ros2` с heartbeat на супервизор.
+
+Пока сессия жива, в ROS 2 идут `/scan`, `/odom`, `/tf`, и принимается
+`/cmd_vel`. **Как только мост умирает** (Ctrl-C, обрыв сети, падение) —
+супервизор в течение ~5 с сам возвращает штатное состояние: нулевую скорость
+→ standby-маску → `RoboController`.
+
+Проверить поток:
+
+```sh
+ros2 topic hz /scan     # ~5 Гц
+ros2 topic hz /odom     # ~50 Гц
+ros2 topic echo /scan --once
+```
+
+### Шаг 2. Карта (SLAM)
+
+Пишем данные во время сессии:
+
+```sh
+# в отдельном терминале при живой сессии robot bridge:
+ros2 bag record -o ~/robot-bags/mapping /scan /odom /tf
+# ... проезжаем помещение (robot move) ...
+# Ctrl-C останавливает запись
+```
+
+Карта из записи:
+
+```sh
+bash ~/robot/scripts/slam-from-bag.sh     # пишет в ~/robot/maps/
+```
+
+Результат: `~/robot/maps/<имя>.pgm` + `.yaml`. Пример готовой карты в репозитории —
+`maps/mapping_drive_20261004.yaml`.
+
+> Если запись сделана мостом до фикса штампов времени, прогоните
+> `python3 scripts/stamp_bag.py <bag>` — он проставит корректные метки.
+
+### Шаг 3. Поездка в точку (Nav2)
+
+При живой сессии `robot bridge` поднимаем стек навигации:
+
+```sh
+ros2 launch nav2_bringup bringup_launch.py \
+    map:=$HOME/robot/maps/mapping_drive_20261004.yaml \
+    params_file:=$HOME/robot/config/nav2_replay.yaml \
+    use_sim_time:=false autostart:=true
+```
+
+Затем — цель:
+
+```sh
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+  "{pose: {header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0}, \
+   orientation: {w: 1.0}}}}"
+```
+
+Наблюдение в RViz:
+
+```sh
+ros2 run rviz2 rviz2     # топики /map, /scan, costmaps, TF-дерево
+```
+
+> **Сейчас `/cmd_vel` от Nav2 на реальные колёса не подаётся** — это
+> следующий барьер плана. Стек проверяется офлайн на записи, где команды
+> уходят в приёмник, а не на робота:
+
+```sh
+bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
+```
+
+## Конфигурация и скрипты
+
+| Файл | Назначение |
+|------|-----------|
+| `crates/player-bridge/` | протокол Player (XDR) + `robotctl`; без ROS |
+| `crates/player_to_ros2/` | ROS 2-узел: `/scan`, `/odom`, `/cmd_vel`, `/tf` |
+| `crates/mask-owner/` | владелец маски (`mask-owner`) и `robot-supervisor` |
+| `config/slam_offline.yaml` | slam_toolbox (режим mapping, фреймы) |
+| `config/amcl_replay.yaml` | AMCL + map_server для локализации |
+| `config/nav2_replay.yaml` | полный стек Nav2 (costmaps, DWB, планировщик) |
+| `scripts/slam-from-bag.sh` | bag → карта |
+| `scripts/slam-offline.sh` | bag → SLAM с проверками по стадиям |
+| `scripts/nav2-replay.sh` | bag → Nav2 → `/cmd_vel` в файл (без робота) |
+| `scripts/amcl-replay.sh` | локализация на карте против bag'а |
+| `scripts/stamp_bag.py` | проставить нулевые метки времени в старых bag'ах |
+| `ros2/odom_tf_replay.py` | odom → TF для записей без `/tf` |
+| `docs/player-platform-survey.md` | разбор платформы Player, протокола, железа |
+| `LESSWRONG.md` | журнал: что не сработало и почему |
+| `PLAN.md` | этапы и критерии перехода |
+
+Ключевые параметры моста (`--ros-args -p`, значения по умолчанию):
+
+```sh
+ros2 run player_to_ros2 player_to_ros2 --ros-args \
+  -p player_host:=192.0.2.82 \
+  -p player_port:=6665 \
+  -p laser_frame:=laser \
+  -p odom_frame:=odom \
+  -p base_frame:=base_link \
+  -p laser_x:=-0.100 -p laser_y:=0.0 -p laser_yaw_deg:=97.6
+```
+
+## Разработка и тесты
+
+```sh
+# Rust: юнит- и интеграционные тесты (без робота)
+cd crates && cargo test
+
+# shell-тесты CLI и обвязки; используют локальные фейки ssh/Player
 bash tests/test_robot.sh
 bash tests/test_robot_camera.sh
 python3 tests/test_robot_bug.py
-shellcheck bin/robot bin/camera/snapshot tests/*.sh
+bash tests/test_robot_owner.sh
+
+# линтер
+shellcheck bin/robot bin/camera/snapshot tests/*.sh scripts/*.sh tools/*.sh
 ```
 
-The tests use local SSH/Player fakes and do not contact the vacuum or camera. A supervised test on 2026-10-02 moved the robot 0.204 m according to fresh Player odometry; 20 `fan_motor_status` readings overlapping motion were `0.000` (raw sensor, not calibrated RPM). The stock controller and WatchDoge were restored afterward.
+Правила проекта (TDD, ограничения на живое железо) — в `CLAUDE.md`.
+
+## Безопасность
+
+* **Не отправляйте движение, не снимайте контроллер и не меняйте робота без
+  явной необходимости.** Для рутинной проверки используйте локальные фейки.
+* Робот ездит **не быстрее 0.1 м/с / 0.4 рад/с** и не дольше 2 с за команду.
+* `robot move` дополнительно взводит на роботе 10-секундный guard: если
+  команда не завершилась штатно, Player принудительно перезапускается.
+  **Это не гарантия мгновенной остановки** — держите робота в свободной зоне
+  и будьте готовы обесточить.
+* Обе щётки выключены только в режиме `mask hold 0x10f8ff`. Любой сбой без
+  подтверждения (`a9`) означает **неизвестное физическое состояние**: нужно
+  `robot mask restore` и возврат контроллера.
+* `robot bridge` возвращает штатный `RoboController` сам, но **всегда
+  проверяйте** `robot status` (должно быть `enabled`) после сессии.
+* Камера: HTTP Basic поверх открытого HTTP не защищает ни пароль, ни кадры —
+  только доверенная сеть. Пароль держите в `~/.config/robot/camera.netrc`
+  (режим 0600), не в репозитории. Домашние изображения и карты не выгружайте
+  во внешние сервисы без отдельного решения.
+* Порт 6665 не выставляйте за пределы доверенной сети.

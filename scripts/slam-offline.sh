@@ -2,7 +2,7 @@
 # Offline SLAM pipeline with self-checks at each stage.
 # (no set -u: ROS setup scripts reference unbound vars)
 source /opt/ros/jazzy/setup.sh
-source ~/Projects/robot/ros2/rust-ws/install/setup.sh
+source ~/robot/ros-ws/install/setup.sh
 LOG=/tmp/slam-run.log
 : > "$LOG"
 
