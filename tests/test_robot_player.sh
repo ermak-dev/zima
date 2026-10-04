@@ -3,7 +3,7 @@
 # SPEC: Reject invalid motion before contacting the robot; compile against local libplayerc.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-player=${ROBOT_PLAYER_ROOT:-$HOME/Projects/robot/ros2/player}
+player=${ROBOT_PLAYER_ROOT:-$HOME/robot/ros2/player}
 bin=$(mktemp)
 trap 'rm -f "$bin"' EXIT
 libs="$player/client_libs/libplayerc:$player/libplayerinterface:$player/libplayerwkb:$player/libplayerjpeg:$player/libplayercommon"

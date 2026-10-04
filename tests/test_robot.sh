@@ -7,7 +7,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/controller"
-export ROBOT_BIN_DIR="$tmp/controller" ROBOT_PLAYER_CLIENT="$tmp/bin/player" ROBOT_SSH="$tmp/bin/ssh" ROBOT_TEST_LOG="$tmp/log"
+export ROBOT_BIN_DIR="$tmp/controller" ROBOT_PLAYER_CLIENT="$tmp/bin/player" ROBOT_SSH="$tmp/bin/ssh" ROBOT_TEST_LOG="$tmp/log" ROBOT_MASK_OWNER_BIN="$tmp/bin/mask-owner"
 cat > "$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 if [[ $1 == -G ]]; then printf 'hostname 192.0.2.82\n'; exit; fi
@@ -15,6 +15,9 @@ printf 'ssh:%s\n' "$*" >> "$ROBOT_TEST_LOG"
 if [[ $* == 'robot bash -s' ]]; then
     script=$(cat)
     if [[ $script == *'ROBOT_DISABLED'* ]]; then printf '%s\n' "${ROBOT_TEST_CONTROLLER_STATE:-disabled}"; else printf '/tmp/robot-drive-guard.TEST\n'; fi
+elif [[ $1 == robot && $2 == /tmp/mask-owner/mask-owner ]]; then
+    # Emulate remote execution of the deployed binary.
+    exec "$(dirname "$0")/mask-owner" "${@:3}"
 else
     printf 'disabled\n'
 fi
@@ -35,7 +38,12 @@ cat > "$tmp/bin/camera" <<'EOF'
 #!/usr/bin/env bash
 printf 'camera:%s\n' "$*" >> "$ROBOT_TEST_LOG"
 EOF
-chmod +x "$tmp/bin/ssh" "$tmp/bin/player" "$tmp/bin/camera"
+cat > "$tmp/bin/mask-owner" <<'EOF'
+#!/usr/bin/env bash
+printf 'mask-owner:%s\n' "$*" >> "$ROBOT_TEST_LOG"
+[[ ${ROBOT_MASK_OWNER_FAIL:-0} != 1 ]]
+EOF
+chmod +x "$tmp/bin/ssh" "$tmp/bin/player" "$tmp/bin/camera" "$tmp/bin/mask-owner"
 export ROBOT_CAMERA_BIN="$tmp/bin/camera"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -76,7 +84,26 @@ for args in 'move sideways 1' 'move forward 0' 'move forward 3' 'move forward na
     read -r -a argv <<< "$args"
     expect_failure "$root/bin/robot" "${argv[@]}"
 done
-[[ ! -s $tmp/log ]] || fail 'invalid commands contacted robot'
+: > "$tmp/log"
+"$root/bin/robot" mask hold
+assert_log 'ssh:robot /tmp/mask-owner/mask-owner hold --mask 10f8ff --timeout 5'
+: > "$tmp/log"
+"$root/bin/robot" mask hold --mask 10f0ff
+assert_log 'ssh:robot /tmp/mask-owner/mask-owner hold --mask 10f0ff --timeout 5'
+: > "$tmp/log"
+ROBOT_TEST_CONTROLLER_STATE=enabled expect_failure "$root/bin/robot" mask hold
+if grep -q 'mask-owner' "$tmp/log"; then fail 'mask hold bypassed controller gate'; fi
+: > "$tmp/log"
+ROBOT_MASK_OWNER_FAIL=1 expect_failure "$root/bin/robot" mask hold
+: > "$tmp/log"
+"$root/bin/robot" mask restore
+assert_log 'ssh:robot /tmp/mask-owner/mask-owner restore'
+: > "$tmp/log"
+for args in 'mask' 'mask unknown' 'mask hold --mask zzz' 'mask hold --mask 1f8ff' 'mask hold --mask 10f8ff --timeout 0' 'mask restore extra' 'mask hold --mask 10f8ff --timeout' 'mask hold --mask'; do
+    read -r -a argv <<< "$args"
+    expect_failure "$root/bin/robot" "${argv[@]}"
+done
+[[ ! -s $tmp/log ]] || fail 'invalid mask commands contacted robot'
 "$root/bin/robot" stop
 assert_log 'player:192.0.2.82 stop'
 printf 'robot CLI tests passed\n'

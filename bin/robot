@@ -3,14 +3,17 @@
 # Usage: robot controller status|stop|start
 #        robot position|fan
 #        robot snapshot [output.jpg]
+#        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
+#        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
+#        robot mask restore
 #        robot stop
 set -euo pipefail
 
 base=${ROBOT_BIN_DIR:-$(dirname "$(realpath "$0")")/controller}
 ssh_cmd=${ROBOT_SSH:-ssh}
 
-usage() { sed -n '2,7s/^# //p' "$0"; }
+usage() { sed -n '2,8s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 
 controller_status() {
@@ -31,7 +34,7 @@ REMOTE
 player() {
     local binary=${ROBOT_PLAYER_CLIENT:-$base/player-bin} host
     if [[ ! -v ROBOT_PLAYER_CLIENT ]]; then
-        local source=$base/player.c tree=${ROBOT_PLAYER_ROOT:-$HOME/Projects/robot/ros2/player} cache=${XDG_CACHE_HOME:-$HOME/.cache}/robot
+        local source=$base/player.c tree=${ROBOT_PLAYER_ROOT:-$HOME/robot/ros2/player} cache=${XDG_CACHE_HOME:-$HOME/.cache}/robot
         mkdir -p "$cache"
         binary=$cache/player
         if [[ ! -x $binary || $source -nt $binary ]]; then
@@ -65,6 +68,27 @@ REMOTE
     fi
 }
 
+# Deploy the ARM mask-owner binary if needed and print its remote path.
+# Only the path goes to stdout: ssh replies are consumed or sent to stderr,
+# so the caller's command substitution stays clean.
+mask_owner_remote() {
+    local binary=${ROBOT_MASK_OWNER_BIN:-} remote_dir=/tmp/mask-owner local_sha remote_sha
+    if [[ -z $binary ]]; then
+        local repo
+        repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+        binary=$repo/rust/target/armv7-unknown-linux-musleabihf/release/mask-owner
+        [[ -x $binary ]] || fail 'mask-owner binary is missing; build: (cd rust && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)'
+    fi
+    "$ssh_cmd" robot mkdir -p -- "$remote_dir" >&2
+    remote_sha=$("$ssh_cmd" robot "sha256sum $remote_dir/mask-owner 2>/dev/null | cut -d' ' -f1") || true
+    local_sha=$(sha256sum "$binary" | cut -d' ' -f1)
+    if [[ $remote_sha != "$local_sha" ]]; then
+        "$ssh_cmd" robot "cat > $remote_dir/mask-owner.tmp && chmod 700 $remote_dir/mask-owner.tmp && mv $remote_dir/mask-owner.tmp $remote_dir/mask-owner" <"$binary" >&2 \
+            || fail 'could not upload mask-owner'
+    fi
+    printf '%s/mask-owner\n' "$remote_dir"
+}
+
 cmd=${1:---help}
 (( $# == 0 )) || shift
 case $cmd in
@@ -82,6 +106,8 @@ case $cmd in
         player "$cmd" ;;
     snapshot)
         exec "${ROBOT_CAMERA_BIN:-$(dirname "$(realpath "$0")")/camera/snapshot}" "$@" ;;
+    bug)
+        exec "${ROBOT_BUG_BIN:-$(dirname "$(realpath "$0")")/bug}" "$@" ;;
     move)
         with_controller=0
         if [[ ${1:-} == --with-controller ]]; then with_controller=1; shift; fi
@@ -96,6 +122,34 @@ case $cmd in
             [[ $state == disabled ]] || fail 'stop RoboController first, or use --with-controller for a supervised test'
         fi
         player move "$1" "$2" ;;
+    mask)
+        remote='' timeout=5 mask=10f8ff
+        case ${1:-} in
+            hold)
+                shift
+                while [[ $# -gt 0 ]]; do
+                    case $1 in
+                        --mask)
+                            [[ $2 =~ ^[0-9a-fA-F]{6}$ ]] || fail 'mask must be exactly 6 hex digits (e.g. 10f8ff)'
+                            mask=${2,,}; shift 2 ;;
+                        --timeout)
+                            [[ $2 =~ ^[1-9][0-9]*$ ]] || fail 'timeout must be positive seconds'
+                            timeout=$2; shift 2 ;;
+                        *) fail "unknown mask hold option: $1" ;;
+                    esac
+                done
+                [[ $(( 0x$mask )) -ne 0 ]] || fail 'mask must not be zero'
+                state=$(controller_status)
+                [[ $state == disabled ]] || fail 'stop RoboController first: the mask owner must be the sole IPC party'
+                remote=$(mask_owner_remote)
+                exec "$ssh_cmd" robot "$remote" hold --mask "$mask" --timeout "$timeout" ;;
+            restore)
+                shift
+                (( $# == 0 )) || fail 'usage: robot mask restore'
+                remote=$(mask_owner_remote)
+                exec "$ssh_cmd" robot "$remote" restore ;;
+            *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
+        esac ;;
     stop)
         (( $# == 0 )) || fail 'stop takes no arguments'
         player stop ;;
