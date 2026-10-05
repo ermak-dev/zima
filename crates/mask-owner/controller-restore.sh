@@ -29,7 +29,7 @@ if grep -Fqx "$entry" "$list"; then
     if [[ -e $backup ]]; then
         cmp -s "$list" "$backup" || { log 'recovery copy differs from enabled config'; exit 1; }
         initctl restart rrwatchdoge
-        for _ in 1 2 3 4 5; do
+        for _ in $(seq 1 30); do
             if pgrep -x RoboController >/dev/null; then break; fi
             sleep 1
         done
@@ -53,8 +53,14 @@ changed=1
 mv -f "$tmp" "$list"
 tmp=
 initctl restart rrwatchdoge
+# The old WatchDoge may take seconds to die after the restart; retry the
+# readiness check instead of failing mid-respawn.
+for _ in $(seq 1 30); do
+    pgrep -x WatchDoge >/dev/null && break
+    sleep 1
+done
 pgrep -x WatchDoge >/dev/null || { log 'watchdog failed to start'; exit 1; }
-for _ in 1 2 3 4 5; do
+for _ in $(seq 1 30); do
     if pgrep -x RoboController >/dev/null; then break; fi
     sleep 1
 done
