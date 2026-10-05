@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<robot name="roborock_v1_live">
+  <!-- Live-session description for RViz's RobotModel only. Single link,
+       no joints: the player_to_ros2 bridge owns ALL TF (odom->base_link,
+       base_link->laser), so this file must not introduce a base_footprint
+       parent or a duplicate laser frame. The LDS tower is drawn as a
+       second visual at the bridge's mounting (x=-0.100 m). -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0.03" rpy="0 0 0"/>
+      <mass value="3.5"/>
+      <inertia ixx="0.0175" ixy="0" ixz="0" iyy="0.0175" iyz="0" izz="0.0300"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.048" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.1725" length="0.096"/>
+      </geometry>
+      <material name="body">
+        <color rgba="0.2 0.2 0.2 1"/>
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="-0.100 0 0.096" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.036" length="0.024"/>
+      </geometry>
+      <material name="tower">
+        <color rgba="0.03 0.03 0.03 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.048" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.1725" length="0.096"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

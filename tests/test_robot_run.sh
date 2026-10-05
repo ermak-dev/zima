@@ -96,6 +96,15 @@ run_session ROBOT_FAKE_TELEOP_SECS=1 \
 assert_log 'robot:bridge'
 assert_log 'ros2:topic echo /scan --once'
 assert_log 'rviz2:-d'
+# The live session must also serve the vacuum model to RViz: a single-link
+# URDF (visuals only — the bridge owns all TF, so no laser link and no
+# joints that would fight odom->base_link or base_link->laser).
+[[ -f $root/models/roborock_v1/roborock_v1_live.urdf ]] || fail 'live URDF missing'
+[[ $(grep -c '<link' "$root/models/roborock_v1/roborock_v1_live.urdf") == 1 ]] \
+    || fail 'live URDF must be single-link'
+grep -q '<joint' "$root/models/roborock_v1/roborock_v1_live.urdf" \
+    && fail 'live URDF must have no joints (bridge owns TF)'
+assert_log 'ros2:run robot_state_publisher robot_state_publisher'
 assert_log 'ros2:run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p speed:=0.1 -p turn:=0.4'
 assert_log 'ros2:topic pub -1 /cmd_vel geometry_msgs/msg/Twist {linear: {x: 0.0}, angular: {z: 0.0}}'
 assert_log 'robot:status'

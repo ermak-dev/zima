@@ -55,6 +55,7 @@ cleanup() {
     trap '' INT TERM EXIT
     local component=${1:-exit}
     (( session_rc )) || session_rc=$status
+    rm -f "${RSP_PARAMS:-}"
     banner "teardown ($component)"
     if [[ -n $BRIDGE_PID ]] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         timeout 5 ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist \
@@ -130,6 +131,24 @@ if (( ! scan_seen )); then
     exit 3
 fi
 banner 'lidar stream ok'
+
+# Serve the vacuum model to RViz's RobotModel display. Single-link URDF
+# via a params file (multi-line -p cannot be passed on the command line);
+# it publishes no TF that could fight the bridge.
+RSP_PARAMS=$(mktemp /tmp/robot-live-rsp.XXXXXX.yaml)
+python3 - "$repo/models/roborock_v1/roborock_v1_live.urdf" "$RSP_PARAMS" <<'PY'
+import json, sys
+urdf = open(sys.argv[1]).read()
+open(sys.argv[2], 'w').write(
+    'robot_state_publisher:\n  ros__parameters:\n'
+    '    use_sim_time: false\n'
+    '    robot_description: ' + json.dumps(urdf) + '\n'
+)
+PY
+setsid ros2 run robot_state_publisher robot_state_publisher \
+    --ros-args --params-file "$RSP_PARAMS" >>"$RUN_LOG" 2>&1 &
+RSP_PID=$!
+pids+=("$RSP_PID")
 
 banner 'starting RViz (close its window to end the session)'
 setsid rviz2 -d "$RVIZ_CONFIG" >>"$RUN_LOG" 2>&1 &
