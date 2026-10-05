@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rclrs::*;
-use ros_env::sensor_msgs::msg::LaserScan;
-use ros_env::nav_msgs::msg::Odometry;
+use ros_env::sensor_msgs::msg::LaserScan;use ros_env::nav_msgs::msg::Odometry;
 use ros_env::tf2_msgs::msg::TFMessage;
 use ros_env::geometry_msgs::msg::{Transform, TransformStamped, Vector3};
 
@@ -164,9 +163,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scan_pub = node.create_publisher::<LaserScan>("/scan")?;
     let odom_pub = node.create_publisher::<Odometry>("/odom")?;
     let tf_pub = node.create_publisher::<TFMessage>("/tf")?;
+    // Static transforms belong on /tf_static with transient_local QoS:
+    // latched for late subscribers and valid at any query time. Publishing
+    // an unstamped static transform into /tf (as before) made tf2 unable
+    // to resolve odom->laser at scan time, so RViz dropped every scan.
+    let tf_static_pub = node.create_publisher("/tf_static".transient_local())?;
 
     // Static base_link -> laser transform (mounting from the vendor config).
-    let static_tf = {
+    let clock = Clock::system();
+    let mut static_tf = {
         let mut m = TFMessage::default();
         let mut t = TransformStamped::default();
         t.header.frame_id = base_frame.clone();
@@ -178,7 +183,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         m.transforms.push(t);
         m
     };
-    let clock = Clock::system();
+    // A nonzero stamp keeps the message publishable on /tf_static without
+    // breaking tf2's static cache (which keys on the frame pair, not time).
+    if let Some(t) = static_tf.transforms.first_mut() {
+        if let Ok(stamp) = clock.now().to_ros_msg() {
+            t.header.stamp = stamp;
+        }
+    }
 
     let subscription = node.create_subscription(
         "/cmd_vel",
@@ -187,8 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let _ = tf_pub.publish(&static_tf);
-    let mut last_static_tf = std::time::Instant::now();
+    let _ = tf_static_pub.publish(&static_tf);
     let mut last_report = std::time::Instant::now();
     loop {
         loop {
@@ -263,10 +273,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         executor.spin(SpinOptions::spin_once().timeout(Duration::from_millis(10)));
-        if last_static_tf.elapsed() >= Duration::from_secs(1) {
-            let _ = tf_pub.publish(&static_tf);
-            last_static_tf = std::time::Instant::now();
-        }
         if last_report.elapsed() >= Duration::from_secs(30) {
             log_info!(node.logger(), "bridge alive (player {}:{})", host_for_log, port);
             last_report = std::time::Instant::now();
