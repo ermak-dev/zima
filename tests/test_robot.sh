@@ -238,10 +238,31 @@ assert_log 'robotctl:192.0.2.82 fan'
 printf 'robot CLI tests passed\n'
 
 # --- controller handoff internals (executed remotely by bin/robot) ---
-cat > "$tmp/bin/ssh" <<'EOF'
+# `robot enable` deploys controller-restore.sh (mkdir/sha/upload) and then
+# runs it — the same script the supervisor runs for rollback. The fake ssh
+# maps the remote path onto a per-test copy; enable/disable internals run
+# locally against it.
+fake_remote_dir=$tmp/remote
+mkdir -p "$fake_remote_dir/mask-owner"
+restore_sh=$fake_remote_dir/mask-owner/controller-restore.sh
+cat > "$tmp/bin/ssh" <<EOF
 #!/usr/bin/env bash
-[[ $1 == robot && $2 == bash && $3 == -s ]] || exit 9
-exec bash -s
+case " \$* " in
+    *' mkdir -p -- /tmp/mask-owner '*) exit 0 ;;
+    *" sha256sum /tmp/mask-owner/controller-restore.sh "*)
+        sha256sum "$restore_sh" 2>/dev/null | cut -d' ' -f1; exit 0 ;;
+    *'controller-restore.sh.tmp'*)
+        cat > "$fake_remote_dir/mask-owner/controller-restore.sh.tmp"
+        chmod 700 "$fake_remote_dir/mask-owner/controller-restore.sh.tmp"
+        mv "$fake_remote_dir/mask-owner/controller-restore.sh.tmp" "$restore_sh"
+        exit 0 ;;
+esac
+[[ \$1 == robot && \$2 == bash && \$3 == -s ]] || exit 9
+script=\$(cat)
+if [[ \$script == *ROBOT_ENABLE_CONTROLLER* ]]; then
+    exec bash "$restore_sh"
+fi
+exec bash -s <<< "\$script"
 EOF
 cat > "$tmp/bin/initctl" <<'EOF'
 #!/usr/bin/env bash
