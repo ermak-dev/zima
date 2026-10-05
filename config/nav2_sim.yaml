@@ -1,0 +1,42 @@
+# Overlay for the offline Nav2 playground (`robot run --sim`).
+# Base limits come from nav2_replay.yaml (vacuum-safe: 0.06 m/s, 0.3 rad/s);
+# this file replaces what the simulator world needs:
+# - the TB3 sandbox spawns the robot at (-2.0, -0.5), so AMCL's hardcoded
+#   initial pose from the replay config (0, 0) lands the localization in a
+#   wrong cell and every plan is rejected;
+# - the replay config stubs out collision_monitor (empty polygon, noop
+#   scan) and docking; in the playground the monitor must actually pass
+#   velocity through, so it becomes a circle-fed pass-through watching the
+#   real /scan, and docking drops to the stock no-op set.
+amcl:
+  ros__parameters:
+    initial_pose:
+      x: -2.0
+      y: -0.5
+      z: 0.0
+      yaw: 0.0
+collision_monitor:
+  ros__parameters:
+    base_frame_id: base_link
+    odom_frame_id: odom
+    # Distro ordering: controller -> cmd_vel_nav -> smoother ->
+    # cmd_vel_smoothed -> monitor -> cmd_vel (the sim robot subscribes here).
+    # The replay config had the monitor as a first-stage stub; restore the
+    # stock chain so commands actually reach the wheels.
+    cmd_vel_in_topic: cmd_vel_smoothed
+    cmd_vel_out_topic: cmd_vel
+    transform_tolerance: 0.5
+    source_timeout: 5.0
+    base_shift_correction: false
+    polygon_pub_frequency: 1.0
+    polygons: ['RobotFootprint']
+    RobotFootprint:
+      type: 'circle'
+      radius: 0.17
+      action_type: 'none'
+    observation_sources: ['scan']
+    scan:
+      type: 'scan'
+      topic: '/scan'
+      min_height: -0.2
+      max_height: 0.3

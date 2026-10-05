@@ -129,6 +129,13 @@ robot mask hold               # держать маску 0x10f8ff (LDS + кол
 robot mask hold --mask 10f0ff # своя маска; контроллер должен быть снят
 robot mask restore            # разово вернуть standby-маску
 
+robot bridge                  # надзорная ROS 2-сессия (см. «Навигация»)
+robot run                     # RViz + телеметрия + мост: одна команда;
+                              #   выход из RViz останавливает робота и
+                              #   возвращает штатный контроллер
+robot run --sim               # офлайн-плейграунд Nav2 (Gazebo TB3):
+                              #   клик-цель в RViz, лимиты как у робота
+
 robot snapshot ./frame.jpg    # кадр с OpenIPC-камеры (HTTP Basic)
 
 robot bug list                # GitLab-задачи (см. robot bug --help)
@@ -168,6 +175,41 @@ ros2 topic hz /scan     # ~5 Гц
 ros2 topic hz /odom     # ~50 Гц
 ros2 topic echo /scan --once
 ```
+
+### Ручное управление с RViz (одна команда)
+
+```sh
+robot run            # живой робот
+robot run --sim      # офлайн-плейграунд Nav2 (Gazebo TB3), робот не нужен
+```
+
+#### Плейграунд `robot run --sim`
+
+Поднимает Gazebo с **моделью самого пылесоса** (`models/roborock_v1/`:
+плоский цилиндр 0.345 м, диф-привод, LDS 360 лучей / 5 Гц на штатном
+креплении x=−0.100 м — TF-контракт совпадает с живым мостом) и полным
+Nav2 + RViz. В RViz: кнопка **2D Goal Pose** → клик по карте → робот
+едет. Скорости ограничены в физике модели проектными лимитами (0.1 м/с /
+0.4 рад/с), конфиг Нав2 — наш (`nav2_replay.yaml` + оверлей
+`config/nav2_sim.yaml`). Окна: 3D-мир Gazebo + RViz; закрытие RViz или
+Ctrl-C завершает сессию. Ручки: `ROBOT_SIM_HEADLESS`, `ROBOT_SIM_RVIZ`,
+`ROBOT_SIM_PARAMS`, `ROBOT_SIM_ROBOT_SDF`, `ROBOT_SIM_TRIES`. Лог:
+`/tmp/robot-sim.log`. Это песочница для отработки «клик — цель» и правки
+Nav2-конфигов без живого робота.
+
+#### Живой робот `robot run`
+
+`robot run` — вся сессия целиком: сам поднимает `robot bridge`, ждёт поток
+лидара, открывает окно RViz (лидар, след одометрии, TF; фрейм `odom`) и
+отдельное окно телепульта `teleop_twist_keyboard` (клавиши WASD, скорость
+ограничена лимитами проекта: 0.1 м/с и 0.4 рад/с). **Закрытие окна RViz**
+(или Ctrl-C в консоли, или гибель моста) останавливает робота: гасится вся
+инфраструктура, супервизор возвращает штатный `RoboController`, и `robot
+run` проверяет, что вернул (`robot status` → `enabled`). Закрытие одного
+окна телепульта сессию не заканчивает — Ctrl-C в нём лишь сбрасывает
+ручную скорость. Лог всех компонентов: `/tmp/robot-run.log`. Окружение:
+`ROBOT_TELEOP_SPEED`, `ROBOT_TELEOP_TURN`, `ROBOT_RVIZ_CONFIG`,
+`ROBOT_RUN_LOG`.
 
 ### Шаг 2. Карта (SLAM)
 
@@ -235,6 +277,11 @@ bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
 | `config/slam_offline.yaml` | slam_toolbox (режим mapping, фреймы) |
 | `config/amcl_replay.yaml` | AMCL + map_server для локализации |
 | `config/nav2_replay.yaml` | полный стек Nav2 (costmaps, DWB, планировщик) |
+| `scripts/run-rviz.sh` | сессия `robot run`: мост + RViz + телепульт |
+| `scripts/run-sim.sh` | плейграунд `robot run --sim`: Gazebo + Nav2 |
+| `models/roborock_v1/` | SDF/URDF-модель пылесоса для плейграунда (frames как у моста) |
+| `config/nav2_sim.yaml` | оверлей Nav2 для симуляции (точка спавна, cmd_vel-цепочка) |
+| `config/rviz_teleop.rviz` | RViz-сцена для `robot run` (лидар, одометрия, TF) |
 | `scripts/slam-from-bag.sh` | bag → карта |
 | `scripts/slam-offline.sh` | bag → SLAM с проверками по стадиям |
 | `scripts/nav2-replay.sh` | bag → Nav2 → `/cmd_vel` в файл (без робота) |
@@ -268,6 +315,8 @@ bash tests/test_robot.sh
 bash tests/test_robot_camera.sh
 python3 tests/test_robot_bug.py
 bash tests/test_robot_owner.sh
+bash tests/test_robot_run.sh
+bash tests/test_robot_sim.sh
 
 # линтер
 shellcheck bin/robot bin/camera/snapshot tests/*.sh scripts/*.sh tools/*.sh
