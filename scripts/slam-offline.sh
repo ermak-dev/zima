@@ -2,7 +2,8 @@
 # Offline SLAM pipeline with self-checks at each stage.
 # (no set -u: ROS setup scripts reference unbound vars)
 source /opt/ros/jazzy/setup.sh
-source ~/robot/ros-ws/install/setup.sh
+# shellcheck source=/dev/null
+source "$HOME/robot/ros-ws/install/setup.sh"
 LOG=/tmp/slam-run.log
 : > "$LOG"
 
@@ -40,7 +41,7 @@ BAG_RC=$?
 echo "[stage] bag done rc=$BAG_RC" >> "$LOG"
 sleep 5
 ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap \
-    "{name: {data: "${MAP_NAME:-./maps/live_session_20261004}"}}" >> "$LOG" 2>&1
+    "{name: {data: ${MAP_NAME:-./maps/live_session_20261004}}}" >> "$LOG" 2>&1
 [[ -n $REPLAY ]] && kill $REPLAY 2>/dev/null; kill $SLAM 2>/dev/null
 [[ -n $REPLAY ]] && wait $REPLAY 2>/dev/null; wait $SLAM 2>/dev/null
 echo "[stage] done" >> "$LOG"

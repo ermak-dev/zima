@@ -14,6 +14,8 @@ WS_SETUP=${ROBOT_WS_SETUP:-$HOME/robot/ros-ws/install/setup.sh}
 source "$WS_SETUP" 2>/dev/null || true
 
 repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$(realpath "$0")")/lib.sh"
 
 NAV_PARAMS=${ROBOT_SIM_PARAMS:-$repo/config/nav2_replay.yaml}
 SIM_OVERLAY=$repo/config/nav2_sim.yaml
@@ -73,20 +75,10 @@ cleanup() {
     (( sim_rc )) || sim_rc=$status
     rm -f "$merged" "${rsp_params:-}"
     banner 'teardown'
-    local pid
-    for pid in "${pids[@]}"; do
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    done
     # The gz simulator detaches from its launcher group on its own path;
     # sweep by command line so nothing lingers after the session.
     pkill -TERM -f 'gz sim' 2>/dev/null || true
-    for pid in "${pids[@]}"; do
-        local waited=0
-        while kill -0 "$pid" 2>/dev/null && (( waited < 15 )); do
-            sleep 1; waited=$((waited + 1))
-        done
-        kill -KILL "$pid" 2>/dev/null || true
-    done
+    stop_components "${pids[@]}"
     pkill -KILL -f 'gz sim' 2>/dev/null || true
     banner 'done'
     exit "$sim_rc"
@@ -108,19 +100,8 @@ pids+=("$LAUNCH_PID")
 # The distro launch hardcodes the TB3 URDF in its robot_state_publisher;
 # ours must describe the vacuum, so run our own publisher alongside (it
 # only serves RViz's RobotModel display; Nav2 uses TF from the bridge).
-# The URDF goes via a params file: a multi-line -p override cannot be
-# passed through the command line.
 rsp_params=$(mktemp /tmp/robot-rsp.XXXXXX.yaml)
-python3 - "$ROBOT_URDF" "$rsp_params" <<'PY'
-import sys
-urdf = open(sys.argv[1]).read()
-import json
-open(sys.argv[2], 'w').write(
-    'robot_state_publisher:\n  ros__parameters:\n'
-    '    use_sim_time: true\n'
-    '    robot_description: ' + json.dumps(urdf) + '\n'
-)
-PY
+rsp_params_write "$ROBOT_URDF" "$rsp_params" true
 setsid ros2 run robot_state_publisher robot_state_publisher \
     --ros-args --params-file "$rsp_params" >>/tmp/robot-sim.log 2>&1 &
 URDF_PID=$!

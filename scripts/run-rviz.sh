@@ -18,6 +18,8 @@ source "$WS_SETUP" 2>/dev/null || {
 
 repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
 robot_bin=${ROBOT_BIN:-$repo/bin/robot}
+# shellcheck source=scripts/lib.sh
+source "$(dirname "$(realpath "$0")")/lib.sh"
 
 # Same safety limits as `robot move`: they also cap the teleop keys.
 TELEOP_SPEED=${ROBOT_TELEOP_SPEED:-0.1}
@@ -64,21 +66,7 @@ cleanup() {
     # The teleop node runs under the desktop terminal server, outside any
     # process group we can address: stop it by command line.
     pkill -TERM -f 'teleop_twist_keyboard --ros-args' 2>/dev/null || true
-    local pid
-    for pid in "${pids[@]}"; do
-        # SIGTERM, not SIGINT: children backgrounded from a script inherit
-        # SIG_IGN for SIGINT, so INT would not stop them.
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    done
-    for pid in "${pids[@]}"; do
-        # Bounded reap: a wedged child (e.g. ssh over dead Wi-Fi) must not
-        # stall the teardown; `wait` cannot be timed out, so poll instead.
-        local waited=0
-        while kill -0 "$pid" 2>/dev/null && (( waited < 20 )); do
-            sleep 1; waited=$((waited + 1))
-        done
-        kill -KILL "$pid" 2>/dev/null || true
-    done
+    stop_components "${pids[@]}"
     # The robot is stopping/rolled back by now (the bridge TERM reached the
     # supervisor); what follows is only verification. A further Ctrl-C may
     # skip it, but never skips the kill above.
@@ -133,18 +121,9 @@ fi
 banner 'lidar stream ok'
 
 # Serve the vacuum model to RViz's RobotModel display. Single-link URDF
-# via a params file (multi-line -p cannot be passed on the command line);
-# it publishes no TF that could fight the bridge.
+# via a params file; it publishes no TF that could fight the bridge.
 RSP_PARAMS=$(mktemp /tmp/robot-live-rsp.XXXXXX.yaml)
-python3 - "$repo/models/roborock_v1/roborock_v1_live.urdf" "$RSP_PARAMS" <<'PY'
-import json, sys
-urdf = open(sys.argv[1]).read()
-open(sys.argv[2], 'w').write(
-    'robot_state_publisher:\n  ros__parameters:\n'
-    '    use_sim_time: false\n'
-    '    robot_description: ' + json.dumps(urdf) + '\n'
-)
-PY
+rsp_params_write "$repo/models/roborock_v1/roborock_v1_live.urdf" "$RSP_PARAMS" false
 setsid ros2 run robot_state_publisher robot_state_publisher \
     --ros-args --params-file "$RSP_PARAMS" >>"$RUN_LOG" 2>&1 &
 RSP_PID=$!
