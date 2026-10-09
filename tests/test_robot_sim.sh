@@ -44,6 +44,13 @@ case $1 in
             fi
             exit 0
         fi
+        # A scan message arrives only while the simulator itself runs;
+        # ROBOT_SIM_DEAD_GZ keeps the topics listed but silent (the gz
+        # server died while the bridge and Nav2 stayed up).
+        if [[ $2 == echo && $3 == /scan ]]; then
+            [[ -e $ROBOT_TEST_DIR/sim-up && ${ROBOT_SIM_DEAD_GZ:-0} != 1 ]]
+            exit
+        fi
         ;;
 esac
 exit 0
@@ -290,5 +297,18 @@ run_sim ROBOT_SIM_NEVER_UP=1 \
     bash "$root/scripts/run-sim.sh" >"$tmp/out" 2>&1 || status=$?
 [[ $status == 3 ]] || fail "never-up session exited $status, want 3"
 grep -q 'did not come up' "$tmp/out" || fail 'failure banner missing'
+assert_log 'launch:term'
+
+# --- Gazebo died at startup (observed: the distro launch raced xacro for
+# the world file): topics stay listed by the bridge and Nav2, but no scan
+# ever arrives. The wrapper must not announce a playground. ---
+: > "$ROBOT_TEST_LOG"; rm -f "$tmp/launch-args"
+touch "$tmp/sim-up"
+status=0
+run_sim ROBOT_SIM_DEAD_GZ=1 ROBOT_SIM_LAUNCH_SECS=30 \
+    bash "$root/scripts/run-sim.sh" >"$tmp/out" 2>&1 || status=$?
+[[ $status == 3 ]] || fail "dead-gz session exited $status, want 3"
+if grep -q 'playground up' "$tmp/out"; then fail 'playground announced without a scan'; fi
+grep -q 'did not come up' "$tmp/out" || fail 'dead-gz failure banner missing'
 assert_log 'launch:term'
 printf 'robot sim session tests passed\n'

@@ -125,8 +125,10 @@ pids+=("$URDF_PID")
 banner 'waiting for the simulator (/cmd_vel publishers, /scan stream)'
 up=0
 for _ in $(seq 1 "${ROBOT_SIM_TRIES:-45}"); do
+    # A listed /scan proves nothing: the bridge and Nav2 declare it even
+    # when the gz server died at startup. Only a scan message does.
     if ros2 topic list 2>/dev/null | grep -q '^/cmd_vel$' \
-        && ros2 topic list 2>/dev/null | grep -q '^/scan$'; then
+        && timeout 3 ros2 topic echo /scan --once >/dev/null 2>&1; then
         up=1; break
     fi
     kill -0 "$LAUNCH_PID" 2>/dev/null || break
