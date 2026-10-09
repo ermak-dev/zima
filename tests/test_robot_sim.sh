@@ -91,6 +91,46 @@ for joint in sdf.findall('joint'):
     assert pose is None or xyz(pose.text) == [0, 0, 0], \
         f'{joint.get("name")}: joint <pose> does not place the child link'
 PY
+# The robot must stand on its wheels and caster: an SDF cylinder's axis is
+# its local z, so a wheel needs a roll to turn about its joint axis (the
+# URDF visuals carry rpy 1.5708 0 0). Without it the "wheels" were flat
+# pucks flipping like coins, the body slid on the floor, and the wheel
+# odometry overstated every turn — SLAM smeared the map. The body must
+# clear the floor so the wheels carry the weight.
+python3 - "$root/models/roborock_v1/model.sdf" <<'PY' || fail 'SDF robot does not stand on its wheels'
+import math, sys, xml.etree.ElementTree as ET
+sdf = ET.parse(sys.argv[1]).getroot().find('model')
+links = {l.get('name'): l for l in sdf.findall('link')}
+def pose6(el):
+    p = el.find('pose')
+    return [float(v) for v in (p.text if p is not None else '0 0 0 0 0 0').split()]
+def collision(link):
+    c = link.find('collision')
+    return c, pose6(c)
+supports = []
+for joint in sdf.findall('joint'):
+    child = links[joint.find('child').text]
+    lz = pose6(child)[2]
+    col, (cx, cy, cz, roll, pitch, yaw) = collision(child)
+    if joint.get('type') == 'revolute':
+        axis = [float(v) for v in joint.find('axis/xyz').text.split()]
+        # Local z of the collision after roll/pitch/yaw (the cylinder axis).
+        z = [math.cos(yaw) * math.sin(pitch) * math.cos(roll) + math.sin(yaw) * math.sin(roll),
+             math.sin(yaw) * math.sin(pitch) * math.cos(roll) - math.cos(yaw) * math.sin(roll),
+             math.cos(pitch) * math.cos(roll)]
+        dot = abs(sum(a * b for a, b in zip(axis, z)))
+        assert dot > 0.99, f'{child.get("name")}: wheel cylinder axis {z} is not the joint axis {axis}'
+        supports.append(lz + cz - float(col.find('geometry/cylinder/radius').text))
+    sphere = col.find('geometry/sphere/radius')
+    if sphere is not None:
+        supports.append(lz + cz - float(sphere.text))
+assert supports, 'no wheels or caster found'
+ground = min(supports)
+assert max(supports) - ground < 0.002, f'supports do not share the floor: {supports}'
+body, (_, _, bz, _, _, _) = collision(links['base_link'])
+bottom = pose6(links['base_link'])[2] + bz - float(body.find('geometry/cylinder/length').text) / 2
+assert bottom - ground >= 0.005, f'body bottom {bottom:.3f} m does not clear the floor at {ground:.3f} m'
+PY
 : > "$tmp/launch-args"
 
 # --- normal session: launcher exits by itself (RViz closed) ---

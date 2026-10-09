@@ -22,12 +22,14 @@
         <mass>3.5</mass>
       </inertial>
 
+      <!-- Collision body clears the floor by 10 mm so the wheels and the
+           caster carry the weight (the visual keeps the full height). -->
       <collision name="base_collision">
-        <pose>0 0 0.048 0 0 0</pose>
+        <pose>0 0 0.053 0 0 0</pose>
         <geometry>
           <cylinder>
             <radius>0.1725</radius>
-            <length>0.096</length>
+            <length>0.086</length>
           </cylinder>
         </geometry>
         <surface>
@@ -136,6 +138,7 @@
         </inertia>
       </inertial>
       <collision name="wheel_left_collision">
+        <pose>0 0 0 1.5708 0 0</pose>
         <geometry>
           <cylinder><radius>0.035</radius><length>0.02</length></cylinder>
         </geometry>
@@ -146,6 +149,7 @@
         </surface>
       </collision>
       <visual name="wheel_left_visual">
+        <pose>0 0 0 1.5708 0 0</pose>
         <geometry>
           <cylinder><radius>0.035</radius><length>0.02</length></cylinder>
         </geometry>
@@ -166,6 +170,7 @@
         </inertia>
       </inertial>
       <collision name="wheel_right_collision">
+        <pose>0 0 0 1.5708 0 0</pose>
         <geometry>
           <cylinder><radius>0.035</radius><length>0.02</length></cylinder>
         </geometry>
@@ -176,6 +181,7 @@
         </surface>
       </collision>
       <visual name="wheel_right_visual">
+        <pose>0 0 0 1.5708 0 0</pose>
         <geometry>
           <cylinder><radius>0.035</radius><length>0.02</length></cylinder>
         </geometry>
