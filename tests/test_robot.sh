@@ -191,6 +191,20 @@ ROBOT_SSH="$tmp/bin/hang-ssh" ROBOT_SSH_TIMEOUT_S=3 expect_failure "$root/bin/ro
 elapsed=$((SECONDS - start))
 (( elapsed < 30 )) || fail "status hung for ${elapsed}s on an unreachable robot"
 : > "$tmp/log"
+# The bridge refuses to start next to the simulator (it would forward the
+# sim's Nav2 /cmd_vel to the real wheels) or a second bridge, before it
+# contacts the robot at all.
+for stray_cmd in 'ros2 launch nav2_bringup tb3_simulation_launch.py' 'player_to_ros2'; do
+    : > "$tmp/log"
+    setsid bash -c "exec -a '$stray_cmd' sleep 600" >/dev/null 2>&1 &
+    stray=$!
+    ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
+    kill -TERM "$stray" 2>/dev/null || true
+    wait "$stray" 2>/dev/null || true
+    grep -q 'already running' "$tmp/out" || fail "bridge next to '$stray_cmd' not refused: $(cat "$tmp/out")"
+    [[ ! -s $tmp/log ]] || fail "bridge next to '$stray_cmd' contacted the robot"
+done
+: > "$tmp/log"
 for args in 'bridge extra' 'bridge --heartbeat-port' 'bridge --timeout-ms x'; do
     read -r -a argv <<< "$args"
     expect_failure "$root/bin/robot" "${argv[@]}"

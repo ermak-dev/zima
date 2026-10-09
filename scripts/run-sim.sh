@@ -29,6 +29,10 @@ source "$(dirname "$(realpath "$0")")/lib.sh"
 banner() { printf '\n[robot sim] %s\n' "$*"; }
 die() { echo "robot sim: $*" >&2; exit 2; }
 
+if other=$(running_ros_session); then
+    die "$other is already running on this host; end it first"
+fi
+
 NAV_PARAMS=${ROBOT_SIM_PARAMS:-$repo/config/nav2_replay.yaml}
 OVERLAYS=("$repo/config/nav2_sim.yaml")
 [[ $SLAM == True ]] && OVERLAYS+=("$repo/config/slam_online.yaml")

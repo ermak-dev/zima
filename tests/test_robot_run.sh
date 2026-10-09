@@ -283,6 +283,19 @@ wait "$stray" 2>/dev/null || true
 [[ $status == 2 ]] || fail "bridge-running session exited $status, want 2"
 if grep -Fq 'robot:bridge' "$ROBOT_TEST_LOG"; then fail 'second bridge started on top of an existing one'; fi
 
+# --- refuses to start while the simulator runs: the bridge would forward
+# the sim's Nav2 /cmd_vel to the real wheels ---
+: > "$ROBOT_TEST_LOG"
+setsid bash -c 'exec -a "ros2 launch nav2_bringup tb3_simulation_launch.py" sleep 600' >/dev/null 2>&1 &
+stray=$!
+status=0
+run_session ROBOT_FAKE_TELEOP_SECS=1 \
+    bash "$root/scripts/run-rviz.sh" >"$tmp/out" 2>&1 || status=$?
+kill -TERM "$stray" 2>/dev/null || true
+wait "$stray" 2>/dev/null || true
+[[ $status == 2 ]] || fail "sim-running session exited $status, want 2"
+if grep -Fq 'robot:bridge' "$ROBOT_TEST_LOG"; then fail 'bridge started next to the simulator'; fi
+
 # --- double Ctrl-C during teardown must not abort the cleanup ---
 # The teardown takes time (status polls, robot enable); a second Ctrl-C
 # must not leave the wrapper before the bridge is stopped and the stock

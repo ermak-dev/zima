@@ -19,6 +19,21 @@ open(sys.argv[2], 'w').write(
 PY
 }
 
+# Name the ROS session already running on this host, if any; returns 1
+# when there is none. Only one may run: two simulators fight over /clock
+# and node names, and next to the live bridge a simulator's Nav2 /cmd_vel
+# would be forwarded to the real wheels. The [x] brackets keep pgrep from
+# matching a command line that carries this very pattern (a `bash -c`).
+running_ros_session() {
+    if pgrep -f '[p]layer_to_ros2' >/dev/null; then
+        echo 'a live bridge session (player_to_ros2)'
+    elif pgrep -f '[t]b3_simulation_launch' >/dev/null; then
+        echo 'a simulator session (robot run --sim)'
+    else
+        return 1
+    fi
+}
+
 # Stop a list of session components started with setsid (each $! is a
 # group leader): TERM to the group, bounded reap, then KILL. Wedged
 # children (ssh over dead Wi-Fi) cannot stall the teardown.

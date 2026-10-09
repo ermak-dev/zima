@@ -146,6 +146,25 @@ assert d['planner_server']['ros__parameters']['GridBased']['allow_unknown'] is T
 PY
 grep -q 'map_saver_cli' "$tmp/out" || fail 'slam banner does not tell how to save the map'
 
+# --- refuses to start next to another ROS session on this host: a second
+# simulator fights over /clock and node names (observed: both crashed),
+# and next to the live bridge the sim's Nav2 /cmd_vel would reach the
+# real wheels. Fakes match by command line, as pgrep -f sees them. ---
+for stray_cmd in 'ros2 launch nav2_bringup tb3_simulation_launch.py' 'player_to_ros2'; do
+    : > "$ROBOT_TEST_LOG"
+    setsid bash -c "exec -a '$stray_cmd' sleep 600" >/dev/null 2>&1 &
+    stray=$!
+    status=0
+    # A short fake launch: a missing guard fails the asserts, not a hang.
+    run_sim ROBOT_SIM_LAUNCH_SECS=2 \
+        bash "$root/scripts/run-sim.sh" --slam >"$tmp/out" 2>&1 || status=$?
+    kill -TERM "$stray" 2>/dev/null || true
+    wait "$stray" 2>/dev/null || true
+    [[ $status == 2 ]] || fail "sim next to '$stray_cmd' exited $status, want 2"
+    if grep -q '^ros2:launch' "$ROBOT_TEST_LOG"; then fail "sim launched next to '$stray_cmd'"; fi
+    grep -q 'already running' "$tmp/out" || fail "refusal does not say why: $(cat "$tmp/out")"
+done
+
 # --- unknown option: refuse before launching anything ---
 : > "$ROBOT_TEST_LOG"
 status=0

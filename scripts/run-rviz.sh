@@ -35,9 +35,10 @@ die() { echo "robot run: $*" >&2; exit 2; }
 command -v rviz2 >/dev/null || die 'rviz2 is not in PATH'
 command -v ros2 >/dev/null || die 'ros2 is not in PATH'
 # A second bridge would fight the running supervisor for the heartbeat
-# port and disable an already-disabled controller; refuse instead.
-if pgrep -f '[p]layer_to_ros2' >/dev/null; then
-    die 'a bridge session is already running (player_to_ros2 found); end it first'
+# port and disable an already-disabled controller; next to the simulator
+# the bridge would drive the real wheels with the sim's Nav2 /cmd_vel.
+if other=$(running_ros_session); then
+    die "$other is already running on this host; end it first"
 fi
 
 pids=()

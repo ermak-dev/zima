@@ -321,6 +321,13 @@ case $cmd in
         done
         repo=$(repo_root)
         [[ -d $repo/crates ]] || fail 'crates/ not found'
+        # 0. only one ROS session per host: next to the simulator this
+        #    bridge would forward the sim's Nav2 /cmd_vel to the wheels.
+        # shellcheck source=/dev/null
+        source "$repo/scripts/lib.sh"
+        if other=$(running_ros_session); then
+            fail "$other is already running on this host; end it first"
+        fi
         # 1. supervisor first (it must never be missing while masked)
         supervisor_start "$heartbeat_port" "$timeout_ms"
         # 2. hand over controller supervision
