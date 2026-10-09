@@ -135,6 +135,8 @@ robot run                     # RViz + телеметрия + мост: одна
                               #   возвращает штатный контроллер
 robot run --sim               # офлайн-плейграунд Nav2 (Gazebo TB3):
                               #   клик-цель в RViz, лимиты как у робота
+robot run --sim --slam        # то же, но карта строится по ходу езды
+                              #   (SLAM Toolbox вместо готовой карты)
 
 robot snapshot ./frame.jpg    # кадр с OpenIPC-камеры (HTTP Basic)
 
@@ -196,6 +198,21 @@ Ctrl-C завершает сессию. Ручки: `ROBOT_SIM_HEADLESS`, `ROBOT
 `ROBOT_SIM_PARAMS`, `ROBOT_SIM_ROBOT_SDF`, `ROBOT_SIM_TRIES`. Лог:
 `/tmp/robot-sim.log`. Это песочница для отработки «клик — цель» и правки
 Nav2-конфигов без живого робота.
+
+С флагом `--slam` вместо готовой карты и AMCL запускается онлайн
+**SLAM Toolbox** (`nav2_bringup … slam:=True`, конфиг
+`config/slam_online.yaml`): он публикует `/map` и `map → odom`, а карта
+растёт по мере езды к кликнутым целям. Планировщик прокладывает путь и в
+ещё не открытое пространство (`allow_unknown`). Сохранить карту до выхода:
+
+```sh
+ros2 run nav2_map_server map_saver_cli -f ~/robot/maps/<имя> \
+    --ros-args -p use_sim_time:=true
+```
+
+На живом роботе `robot run --slam` пока отказывает: сначала нужен допуск
+привода (этап 4 `PLAN.md`: ограничение скорости и срок действия команды в
+мосте).
 
 #### Живой робот `robot run`
 
@@ -275,6 +292,7 @@ bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
 | `crates/player_to_ros2/` | ROS 2-узел: `/scan`, `/odom`, `/cmd_vel`, `/tf` |
 | `crates/mask-owner/` | владелец маски (`mask-owner`) и `robot-supervisor` |
 | `config/slam_offline.yaml` | slam_toolbox (режим mapping, фреймы) |
+| `config/slam_online.yaml` | slam_toolbox для езды с картографией (`--slam`) |
 | `config/amcl_replay.yaml` | AMCL + map_server для локализации |
 | `config/nav2_replay.yaml` | полный стек Nav2 (costmaps, DWB, планировщик) |
 | `scripts/run-rviz.sh` | сессия `robot run`: мост + RViz + телепульт |

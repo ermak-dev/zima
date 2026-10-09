@@ -9,6 +9,7 @@
 #        robot bridge            # full supervised session (needs sourced ROS 2)
 #        robot run               # live RViz + teleop session (bridge + supervisor)
 #        robot run --sim         # offline Nav2 playground (Gazebo TB3 simulation)
+#        robot run --sim --slam  # playground + online SLAM: the map grows as you drive
 #        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
 set -euo pipefail
 
@@ -26,7 +27,7 @@ ssh_wrap() {
     esac
 }
 
-usage() { sed -n '2,11s/^# //p' "$0"; }
+usage() { sed -n '2,12s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
 
@@ -342,8 +343,19 @@ case $cmd in
         exit "$status" ;;
     run)
         mode=live
-        [[ ${1:-} == --sim ]] && { mode=sim; shift; }
-        (( $# == 0 )) || fail "usage: robot run [--sim]"
+        script_args=()
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --sim) mode=sim; shift ;;
+                --slam) script_args+=(--slam); shift ;;
+                *) fail 'usage: robot run [--sim [--slam]]' ;;
+            esac
+        done
+        # Nav2 on the real wheels waits for drive admission (PLAN.md
+        # stage 4: velocity clamp and command lease in the bridge).
+        if [[ $mode == live && ${#script_args[@]} -gt 0 ]]; then
+            fail 'live mapping by click is not available yet; try it in the simulator: robot run --sim --slam'
+        fi
         repo=$(repo_root)
         if [[ $mode == sim ]]; then
             script=${ROBOT_SIM_SCRIPT:-$repo/scripts/run-sim.sh}
@@ -351,7 +363,7 @@ case $cmd in
             script=${ROBOT_RUN_SCRIPT:-$repo/scripts/run-rviz.sh}
         fi
         [[ -f $script ]] || fail "run wrapper not found: $script"
-        exec bash "$script" ;;
+        exec bash "$script" "${script_args[@]}" ;;
     stop)
         (( $# == 0 )) || fail 'stop takes no arguments'
         robotctl stop ;;

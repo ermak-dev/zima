@@ -1,0 +1,35 @@
+# Online SLAM Toolbox for click-to-goal mapping (`robot run --sim --slam`).
+# Merged into the Nav2 params; nav2_bringup's slam:=True starts
+# slam_toolbox with this section instead of map_server + AMCL.
+# Same frames and scan matching as slam_offline.yaml (proven on the live
+# drive bag); what differs for online use:
+# - transform_publish_period > 0: SLAM itself publishes map->odom (the
+#   offline replay ran with 0, i.e. no TF from SLAM);
+# - map_update_interval 1.0: the map in RViz keeps up with a slow robot;
+# - max_laser_range 6.0: the real LDS range_max (the sim lidar sees 12 m),
+#   so the sim builds maps the way the robot will.
+slam_toolbox:
+  ros__parameters:
+    scan_topic: /scan
+    odom_frame: odom
+    base_frame: base_link
+    map_frame: map
+    mode: mapping
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+    resolution: 0.05
+    max_laser_range: 6.0
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.3
+    minimum_time_interval: 0.5
+    map_update_interval: 1.0
+    transform_publish_period: 0.02
+    use_scan_matching: true
+    use_scan_barycenter: true
+    throttle_scans: 1
+    map_start_at_dock: false
+    debug_logging: false

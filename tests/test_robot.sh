@@ -213,17 +213,30 @@ chmod +x "$tmp/fake-run.sh" "$tmp/fake-sim.sh"
 "$root/bin/robot" --help >"$tmp/out"
 grep -q 'robot run' "$tmp/out" || fail 'help is missing robot run'
 grep -q -- '--sim' "$tmp/out" || fail 'help is missing --sim'
+grep -q -- '--slam' "$tmp/out" || fail 'help is missing --slam'
 : > "$tmp/log"
 ROBOT_RUN_SCRIPT="$tmp/fake-run.sh" "$root/bin/robot" run
 assert_log 'run-script:'
 ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" "$root/bin/robot" run --sim
 assert_log 'sim-script:'
+# --slam rides on the sim wrapper (map grows while driving), either order.
+: > "$tmp/log"
+ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" "$root/bin/robot" run --sim --slam
+assert_log 'sim-script:--slam'
+: > "$tmp/log"
+ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" "$root/bin/robot" run --slam --sim
+assert_log 'sim-script:--slam'
 [[ -f $root/scripts/run-sim.sh ]] || fail 'default sim wrapper scripts/run-sim.sh is missing'
 : > "$tmp/log"
 ROBOT_RUN_SCRIPT="$tmp/fake-run.sh" ROBOT_RUN_FAIL=1 expect_failure "$root/bin/robot" run
 ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" ROBOT_SIM_FAIL=1 expect_failure "$root/bin/robot" run --sim
 : > "$tmp/log"
 expect_failure "$root/bin/robot" run extra
+expect_failure "$root/bin/robot" run --sim extra
+# Live SLAM needs the drive admission work first: refuse, never start.
+ROBOT_RUN_SCRIPT="$tmp/fake-run.sh" ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" \
+    expect_failure "$root/bin/robot" run --slam
+grep -q 'sim' "$tmp/out" || fail 'live --slam refusal does not point to --sim'
 ROBOT_RUN_SCRIPT="$tmp/nonexistent.sh" expect_failure "$root/bin/robot" run
 ROBOT_SIM_SCRIPT="$tmp/nonexistent.sh" expect_failure "$root/bin/robot" run --sim
 [[ ! -s $tmp/log ]] || fail 'invalid run command started a session'

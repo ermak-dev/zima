@@ -2,8 +2,17 @@
 # Offline Nav2 playground: Gazebo TB3 simulation with the full Nav2 stack
 # and RViz (click-to-goal). Started by `robot run --sim`. Never touches
 # the real robot — no ssh, no bridge, no supervisor.
+# --slam: online SLAM Toolbox replaces the prebuilt map + AMCL, so the
+# map grows as the robot drives to clicked goals.
 # (no set -u: ROS setup scripts reference unbound vars)
 set -eo pipefail
+SLAM=False
+for arg in "$@"; do
+    case $arg in
+        --slam) SLAM=True ;;
+        *) echo "robot sim: unknown option: $arg (usage: run-sim.sh [--slam])" >&2; exit 2 ;;
+    esac
+done
 ROS_SETUP=${ROBOT_ROS_SETUP:-/opt/ros/jazzy/setup.sh}
 # shellcheck source=/dev/null
 source "$ROS_SETUP"
@@ -17,8 +26,12 @@ repo=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$(realpath "$0")")/lib.sh"
 
+banner() { printf '\n[robot sim] %s\n' "$*"; }
+die() { echo "robot sim: $*" >&2; exit 2; }
+
 NAV_PARAMS=${ROBOT_SIM_PARAMS:-$repo/config/nav2_replay.yaml}
-SIM_OVERLAY=$repo/config/nav2_sim.yaml
+OVERLAYS=("$repo/config/nav2_sim.yaml")
+[[ $SLAM == True ]] && OVERLAYS+=("$repo/config/slam_online.yaml")
 RVIZ=${ROBOT_SIM_RVIZ:-True}
 # Headless (no 3D window) for scripted/offline checks; RViz still opens
 # unless ROBOT_SIM_RVIZ:=False.
@@ -29,38 +42,36 @@ ROBOT_SDF=${ROBOT_SIM_ROBOT_SDF:-$repo/models/roborock_v1/model.sdf}
 ROBOT_URDF=$repo/models/roborock_v1/roborock_v1.urdf
 ROBOT_NAME=${ROBOT_SIM_ROBOT_NAME:-roborock_v1}
 
-# Merge the sim overlay into the base params (the launch takes one file):
-# PyYAML is in the ROS desktop install; if absent, plain-text concat of the
-# two files also works because the overlay redefines whole top-level
+# Merge the overlays, in order, into the base params (the launch takes one
+# file): PyYAML is in the ROS desktop install; if absent, plain-text concat
+# of the files also works because the overlays redefine whole top-level
 # sections only.
 merged=$(mktemp /tmp/robot-nav2-sim.XXXXXX.yaml)
-if python3 - "$NAV_PARAMS" "$SIM_OVERLAY" "$merged" <<'PY'
+if python3 - "$merged" "$NAV_PARAMS" "${OVERLAYS[@]}" <<'PY'
 import sys
 try:
     import yaml
 except ImportError:
     sys.exit(10)
-base, overlay, out = sys.argv[1:4]
+out, base, overlays = sys.argv[1], sys.argv[2], sys.argv[3:]
 b = yaml.safe_load(open(base)) or {}
-o = yaml.safe_load(open(overlay)) or {}
-for k, v in o.items():
-    if k in b and isinstance(b.get(k), dict) and isinstance(v, dict):
-        for k2, v2 in v.items():
-            if isinstance(v2, dict) and isinstance(b[k].get(k2), dict):
-                b[k][k2].update(v2)
-            else:
-                b[k][k2] = v2
-    else:
-        b[k] = v
+for overlay in overlays:
+    o = yaml.safe_load(open(overlay)) or {}
+    for k, v in o.items():
+        if k in b and isinstance(b.get(k), dict) and isinstance(v, dict):
+            for k2, v2 in v.items():
+                if isinstance(v2, dict) and isinstance(b[k].get(k2), dict):
+                    b[k][k2].update(v2)
+                else:
+                    b[k][k2] = v2
+        else:
+            b[k] = v
 yaml.safe_dump(b, open(out, 'w'), sort_keys=False)
 PY
 then :; else
-    cat "$NAV_PARAMS" "$SIM_OVERLAY" >"$merged"
+    cat "$NAV_PARAMS" "${OVERLAYS[@]}" >"$merged"
 fi
 NAV_PARAMS=$merged
-
-banner() { printf '\n[robot sim] %s\n' "$*"; }
-die() { echo "robot sim: $*" >&2; exit 2; }
 
 command -v ros2 >/dev/null || die 'ros2 is not in PATH; source ROS 2 Jazzy'
 [[ -f $NAV_PARAMS ]] || die "nav2 params not found: $NAV_PARAMS"
@@ -86,10 +97,10 @@ cleanup() {
 trap 'cleanup interrupt' INT TERM
 trap 'cleanup exit' EXIT
 
-banner "starting Gazebo + Nav2 with the roborock_v1 model (headless:=$HEADLESS, rviz:=$RVIZ)"
+banner "starting Gazebo + Nav2 with the roborock_v1 model (headless:=$HEADLESS, rviz:=$RVIZ, slam:=$SLAM)"
 : >/tmp/robot-sim.log
 setsid ros2 launch nav2_bringup tb3_simulation_launch.py \
-    headless:="$HEADLESS" use_rviz:="$RVIZ" \
+    headless:="$HEADLESS" use_rviz:="$RVIZ" slam:="$SLAM" \
     params_file:="$NAV_PARAMS" \
     robot_sdf:="$ROBOT_SDF" robot_name:="$ROBOT_NAME" \
     use_robot_state_pub:=False \
@@ -122,6 +133,10 @@ if (( ! up )); then
     exit 3
 fi
 banner 'playground up: RViz is open — use 2D Goal Pose to send the robot; Ctrl-C here to end'
+if [[ $SLAM == True ]]; then
+    banner 'mapping: the map grows as the robot drives; save it before ending with:'
+    printf '    ros2 run nav2_map_server map_saver_cli -f <path/name> --ros-args -p use_sim_time:=true\n'
+fi
 
 # End on the launcher dying (RViz window close kills the launch) or Ctrl-C.
 wait "$LAUNCH_PID" || true

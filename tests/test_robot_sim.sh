@@ -118,6 +118,40 @@ grep -q -- "robot_sdf:=$root/models/roborock_v1/model.sdf" "$tmp/launch-args" \
 grep -q 'robot_name:=roborock_v1' "$tmp/launch-args" || fail 'robot_name not set'
 grep -q 'playground up' "$tmp/out" || fail 'playground-ready banner missing'
 grep -q '\[robot sim\] done' "$tmp/out" || fail 'teardown banner missing'
+grep -q 'slam:=False' "$tmp/launch-args" || fail 'mapping must be off by default (prebuilt map + AMCL)'
+
+# --- --slam: online SLAM Toolbox instead of the prebuilt map + AMCL;
+# click goals in RViz and the map grows as the robot drives ---
+: > "$ROBOT_TEST_LOG"; rm -f "$tmp/launch-args" "$tmp/params-snapshot.yaml" "$tmp/out"
+run_sim ROBOT_SIM_LAUNCH_SECS=2 \
+    bash "$root/scripts/run-sim.sh" --slam >"$tmp/out" 2>&1 \
+    || fail "slam session exited nonzero: $(cat "$tmp/out")"
+grep -q 'slam:=True' "$tmp/launch-args" || fail "slam not enabled: $(cat "$tmp/launch-args")"
+[[ -f $tmp/params-snapshot.yaml ]] || fail 'params snapshot missing (slam run)'
+python3 - "$tmp/params-snapshot.yaml" <<'PY' || fail 'merged params lack the online SLAM section'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+s = d['slam_toolbox']['ros__parameters']
+# Frames of the bridge contract: the slam_toolbox default base_footprint
+# silently broke the first offline map.
+assert (s['base_frame'], s['odom_frame'], s['map_frame']) == ('base_link', 'odom', 'map')
+assert s['mode'] == 'mapping'
+# Online, SLAM itself publishes map->odom; a zero period disables it.
+assert s['transform_publish_period'] > 0
+# Base limits and the sim cmd_vel chain survive the extra overlay.
+assert d['controller_server']['ros__parameters']['FollowPath']['max_vel_x'] == 0.06
+assert d['collision_monitor']['ros__parameters']['cmd_vel_out_topic'] == 'cmd_vel'
+# Goals in not-yet-mapped space must stay plannable while mapping.
+assert d['planner_server']['ros__parameters']['GridBased']['allow_unknown'] is True
+PY
+grep -q 'map_saver_cli' "$tmp/out" || fail 'slam banner does not tell how to save the map'
+
+# --- unknown option: refuse before launching anything ---
+: > "$ROBOT_TEST_LOG"
+status=0
+run_sim bash "$root/scripts/run-sim.sh" --bogus >"$tmp/out" 2>&1 || status=$?
+[[ $status == 2 ]] || fail "unknown option exited $status, want 2"
+if grep -q '^ros2:launch' "$ROBOT_TEST_LOG"; then fail 'unknown option still launched the simulator'; fi
 
 # --- Ctrl-C path: a terminal SIGINT/TERM goes to the whole foreground
 # group; emulate that faithfully (setsid wrapper, signal to the group).
