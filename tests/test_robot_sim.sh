@@ -168,9 +168,25 @@ PY
 # --- normal session: launcher exits by itself (RViz closed) ---
 touch "$tmp/sim-up"
 : > "$ROBOT_TEST_LOG"
+# The teardown sweeps the detached gz simulator by command line. It must
+# hit processes that are the simulator, not ones whose arguments merely
+# mention it (the old substring sweep killed shells and test runners
+# whose command text contained the words).
+setsid bash -c "exec -a 'gz sim -r -s /tmp/nav2_fake.sdf' sleep 600" >/dev/null 2>&1 &
+fake_gz=$!
+setsid bash -c "exec -a 'editor notes-on-gz sim-setup' sleep 600" >/dev/null 2>&1 &
+bystander=$!
+running() { ps -o stat= -p "$1" 2>/dev/null | grep -qv '^Z'; }
 run_sim ROBOT_SIM_LAUNCH_SECS=3 \
     bash "$root/scripts/run-sim.sh" >"$tmp/out" 2>&1 \
     || fail "sim session exited nonzero: $(cat "$tmp/out")"
+gz_left=0 bystander_gone=0
+running "$fake_gz" && gz_left=1
+running "$bystander" || bystander_gone=1
+kill -KILL "$fake_gz" "$bystander" 2>/dev/null || true
+wait "$fake_gz" "$bystander" 2>/dev/null || true
+(( ! gz_left )) || fail 'teardown left the gz simulator running'
+(( ! bystander_gone )) || fail 'teardown killed a process that only mentions the simulator'
 grep -q 'tb3_simulation_launch.py' "$tmp/launch-args" || fail 'tb3 launch not used'
 # The launch takes ONE params file: a merged temp one that must carry the
 # base config's limits and the sim overlay's spawn-point initial pose

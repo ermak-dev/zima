@@ -91,10 +91,13 @@ cleanup() {
     rm -f "$merged" "${rsp_params:-}"
     banner 'teardown'
     # The gz simulator detaches from its launcher group on its own path;
-    # sweep by command line so nothing lingers after the session.
-    pkill -TERM -f 'gz sim' 2>/dev/null || true
+    # sweep by command line so nothing lingers after the session. Anchored
+    # to the start: the server (`gz sim ...`) and the GUI (`ruby .../gz
+    # sim -g`), never a shell or editor whose arguments mention them.
+    local gz_cmd='^(ruby [^ ]*/)?gz sim( |$)'
+    pkill -TERM -f "$gz_cmd" 2>/dev/null || true
     stop_components "${pids[@]}"
-    pkill -KILL -f 'gz sim' 2>/dev/null || true
+    pkill -KILL -f "$gz_cmd" 2>/dev/null || true
     banner 'done'
     exit "$sim_rc"
 }
