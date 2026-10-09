@@ -68,6 +68,9 @@
     <!-- LDS tower: 360-beam planar lidar, 5 Hz like the live vacuum,
          mounted at x=-0.100 per the vendor config the bridge uses. -->
     <link name="laser">
+      <!-- SDF places a link by its own pose (a joint pose would only move
+           the joint frame): same mount as the URDF laser_joint origin. -->
+      <pose>-0.100 0 0.096 0 0 0</pose>
       <inertial>
         <pose>0 0 0 0 0 0</pose>
         <mass>0.1</mass>
@@ -251,7 +254,6 @@
     <joint name="laser_joint" type="fixed">
       <parent>base_link</parent>
       <child>laser</child>
-      <pose>-0.100 0 0.096 0 0 0</pose>
     </joint>
 
     <plugin

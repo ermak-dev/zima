@@ -66,6 +66,31 @@ run_sim() {
 [[ -f $root/models/roborock_v1/model.sdf ]] || fail 'roborock SDF model missing'
 grep -q 'gz-sim-diff-drive-system' "$root/models/roborock_v1/model.sdf" || fail 'SDF lacks diff drive'
 grep -q 'gz-sim-sensors-lidar-system\|gpu_lidar' "$root/models/roborock_v1/model.sdf" || fail 'SDF lacks a lidar'
+# Every simulated link must sit where the URDF (the TF that ROS publishes)
+# says. SDF places a link by the link's own <pose>; a joint <pose> only
+# moves the joint frame relative to the child. A mount copied from a URDF
+# joint origin into the SDF joint left the lidar at the body center on the
+# floor: scans grazed the ground, missed the pillars and broke SLAM.
+python3 - "$root/models/roborock_v1/model.sdf" "$root/models/roborock_v1/roborock_v1.urdf" <<'PY' \
+    || fail 'SDF link placement differs from the URDF joint origins'
+import sys, xml.etree.ElementTree as ET
+sdf = ET.parse(sys.argv[1]).getroot().find('model')
+urdf = ET.parse(sys.argv[2]).getroot()
+def xyz(text):
+    return [round(float(v), 4) for v in (text or '0 0 0').split()[:3]]
+links = {l.get('name'): l for l in sdf.findall('link')}
+for joint in urdf.findall('joint'):
+    child = joint.find('child').get('link')
+    origin = joint.find('origin')
+    want = xyz(origin.get('xyz') if origin is not None else None)
+    pose = links[child].find('pose')
+    got = xyz(pose.text if pose is not None else None)
+    assert got == want, f'{child}: SDF link pose {got}, URDF origin {want}'
+for joint in sdf.findall('joint'):
+    pose = joint.find('pose')
+    assert pose is None or xyz(pose.text) == [0, 0, 0], \
+        f'{joint.get("name")}: joint <pose> does not place the child link'
+PY
 : > "$tmp/launch-args"
 
 # --- normal session: launcher exits by itself (RViz closed) ---
