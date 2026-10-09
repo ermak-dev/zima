@@ -131,6 +131,31 @@ body, (_, _, bz, _, _, _) = collision(links['base_link'])
 bottom = pose6(links['base_link'])[2] + bz - float(body.find('geometry/cylinder/length').text) / 2
 assert bottom - ground >= 0.005, f'body bottom {bottom:.3f} m does not clear the floor at {ground:.3f} m'
 PY
+
+# Nav2 drive limits (base config, shared by the sim and the replay).
+# Every Nav2 velocity source — the controller and the recovery behaviors
+# (the stock tree backs up at 0.15 m/s) — goes through the velocity
+# smoother, so its bounds are the stack's ceiling and must sit within
+# the project limits (0.1 m/s, 0.4 rad/s). The controller is Regulated
+# Pure Pursuit inside those bounds: DWB with the gentle acceleration
+# limits never left its dynamic window and stalled 0.24 m short of every
+# goal in the sandbox. Turning in place must count as progress, or a
+# U-turn toward a goal aborts as "failed to make progress".
+python3 - "$root/config/nav2_replay.yaml" <<'PY' || fail 'Nav2 drive limits or controller setup wrong'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+vs = d['velocity_smoother']['ros__parameters']
+assert vs['max_velocity'][0] <= 0.1 and vs['max_velocity'][2] <= 0.4, vs['max_velocity']
+assert vs['min_velocity'][0] >= -0.1 and vs['min_velocity'][2] >= -0.4, vs['min_velocity']
+c = d['controller_server']['ros__parameters']
+fp = c['FollowPath']
+assert fp['plugin'] == 'nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController', fp['plugin']
+assert fp['desired_linear_vel'] <= vs['max_velocity'][0]
+assert fp['rotate_to_heading_angular_vel'] <= vs['max_velocity'][2]
+assert not fp.get('allow_reversing', False)
+assert c['progress_checker']['plugin'] == 'nav2_controller::PoseProgressChecker'
+assert c['progress_checker']['required_movement_angle'] > 0
+PY
 : > "$tmp/launch-args"
 
 # --- normal session: launcher exits by itself (RViz closed) ---
@@ -147,7 +172,7 @@ grep -q 'tb3_simulation_launch.py' "$tmp/launch-args" || fail 'tb3 launch not us
 python3 - "$tmp/params-snapshot.yaml" <<'PY' || fail 'merged params lack base limits or sim overlay'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
-assert d['controller_server']['ros__parameters']['FollowPath']['max_vel_x'] == 0.06
+assert d['controller_server']['ros__parameters']['FollowPath']['desired_linear_vel'] == 0.06
 assert d['amcl']['ros__parameters']['initial_pose']['x'] == -2.0
 assert d['collision_monitor']['ros__parameters']['cmd_vel_out_topic'] == 'cmd_vel'
 PY
@@ -179,7 +204,7 @@ assert s['mode'] == 'mapping'
 # Online, SLAM itself publishes map->odom; a zero period disables it.
 assert s['transform_publish_period'] > 0
 # Base limits and the sim cmd_vel chain survive the extra overlay.
-assert d['controller_server']['ros__parameters']['FollowPath']['max_vel_x'] == 0.06
+assert d['controller_server']['ros__parameters']['FollowPath']['desired_linear_vel'] == 0.06
 assert d['collision_monitor']['ros__parameters']['cmd_vel_out_topic'] == 'cmd_vel'
 # Goals in not-yet-mapped space must stay plannable while mapping.
 assert d['planner_server']['ros__parameters']['GridBased']['allow_unknown'] is True
@@ -239,7 +264,7 @@ cat > "$tmp/custom-nav.yaml" <<'Y'
 controller_server:
   ros__parameters:
     FollowPath:
-      max_vel_x: 0.03
+      desired_linear_vel: 0.03
 amcl:
   ros__parameters:
     initial_pose:
@@ -254,7 +279,7 @@ run_sim ROBOT_SIM_LAUNCH_SECS=2 ROBOT_SIM_PARAMS="$tmp/custom-nav.yaml" \
 python3 - "$tmp/params-snapshot.yaml" <<'PY' || fail 'custom base not honored through the merge'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
-assert d['controller_server']['ros__parameters']['FollowPath']['max_vel_x'] == 0.03
+assert d['controller_server']['ros__parameters']['FollowPath']['desired_linear_vel'] == 0.03
 assert d['amcl']['ros__parameters']['initial_pose']['x'] == -2.0
 PY
 

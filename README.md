@@ -294,7 +294,7 @@ bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
 | `config/slam_offline.yaml` | slam_toolbox (режим mapping, фреймы) |
 | `config/slam_online.yaml` | slam_toolbox для езды с картографией (`--slam`) |
 | `config/amcl_replay.yaml` | AMCL + map_server для локализации |
-| `config/nav2_replay.yaml` | полный стек Nav2 (costmaps, DWB, планировщик) |
+| `config/nav2_replay.yaml` | полный стек Nav2 (costmaps, контроллер RPP, сглаживатель скоростей, планировщик) |
 | `scripts/run-rviz.sh` | сессия `robot run`: мост + RViz + телепульт |
 | `scripts/run-sim.sh` | плейграунд `robot run --sim`: Gazebo + Nav2 |
 | `models/roborock_v1/` | SDF/URDF-модель пылесоса для плейграунда (frames как у моста) |
