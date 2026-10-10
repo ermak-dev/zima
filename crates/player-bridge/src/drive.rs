@@ -34,6 +34,122 @@ pub fn clamp_velocity(vx: f64, vyaw: f64) -> (f64, f64) {
     (limit(vx, MAX_LINEAR), limit(vyaw, MAX_ANGULAR))
 }
 
+/// Watch for a blocked drive: velocity commands flow, the wheels do not.
+///
+/// After the first live SLAM drive the vacuum sat pressed against a wall
+/// with Nav2 commanding 0.06 m/s for a minute: Player accepts the command,
+/// odometry reports zero, and nothing signals the deadlock (the MCU had
+/// latched an error that only a mask cycle clears). The detector compares
+/// commanded speed with the odometry twist the bridge itself relays:
+/// sustained nonzero commands with a stalled twist mean the drive is
+/// blocked — publishing more commands just pushes the wall.
+pub struct StallDetector {
+    /// Command magnitude that counts as "trying to move".
+    cmd_threshold: f64,
+    /// Twist magnitude below which the robot counts as stationary.
+    odom_threshold: f64,
+    /// How long the mismatch must persist.
+    window: Duration,
+    commanded_since: Option<Instant>,
+    latched: bool,
+}
+
+impl StallDetector {
+    /// Defaults tuned for this project: commands at 0.03 m/s or 0.15 rad/s
+    /// and up, twist under a quarter of that counts as stationary, and the
+    /// mismatch must hold for 3 s (wheel spin-up takes under a second).
+    pub fn new() -> Self {
+        StallDetector {
+            cmd_threshold: 0.03,
+            odom_threshold: 0.01,
+            window: Duration::from_secs(3),
+            commanded_since: None,
+            latched: false,
+        }
+    }
+
+    /// Feed the current commanded velocity (pre-clamp is fine) and the
+    /// latest odometry twist; returns true once per stall episode.
+    pub fn update(&mut self, cmd: (f64, f64), odom: (f64, f64), now: Instant) -> bool {
+        if self.latched {
+            // Reset when commands stop (the caller reacts by zeroing).
+            if cmd.0.abs() < self.cmd_threshold && cmd.1.abs() < self.cmd_threshold {
+                self.latched = false;
+                self.commanded_since = None;
+            }
+            return false;
+        }
+        let commanding = cmd.0.abs() >= self.cmd_threshold || cmd.1.abs() >= self.cmd_threshold;
+        let stationary = odom.0.abs() < self.odom_threshold && odom.1.abs() < self.odom_threshold;
+        if commanding && stationary {
+            if let Some(t0) = self.commanded_since {
+                if now.saturating_duration_since(t0) >= self.window {
+                    self.latched = true;
+                    return true;
+                }
+            } else {
+                self.commanded_since = Some(now);
+            }
+        } else {
+            self.commanded_since = None;
+        }
+        false
+    }
+}
+
+impl Default for StallDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The bumper-triggered back-off manoeuvre.
+///
+/// Mirrors the stock `StateHandleBumperError -> MoveBack` path: on bumper
+/// contact, drive straight back for a short distance **immediately** —
+/// before the MCU latches a wheel error (measured live: once latched, only
+/// a mask cycle recovers the drive). The bridge owns this manoeuvre; Nav2
+/// commands are ignored while it runs.
+pub struct BackOff {
+    /// Back-off speed, m/s (negative = reverse).
+    speed: f64,
+    /// Manoeuvre duration.
+    duration: Duration,
+    until: Option<Instant>,
+}
+
+impl BackOff {
+    /// Stock-tuned: ~0.1 m back at a gentle reverse speed.
+    pub fn new() -> Self {
+        BackOff {
+            speed: -MAX_LINEAR,
+            duration: Duration::from_millis(1200),
+            until: None,
+        }
+    }
+
+    /// Trigger a back-off (bumper pressed).
+    pub fn trigger(&mut self, now: Instant) {
+        self.until = Some(now + self.duration);
+    }
+
+    /// Velocity to enforce right now: Some(reverse) while the manoeuvre
+    /// runs, None otherwise.
+    pub fn active(&self, now: Instant) -> Option<(f64, f64)> {
+        self.until.filter(|&u| now < u).map(|_| (self.speed, 0.0))
+    }
+
+    pub fn is_running(&self, now: Instant) -> bool {
+        self.active(now).is_some()
+    }
+}
+
+impl Default for BackOff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The latest velocity command and its lease.
 pub struct DriveCommand {
     timeout: Duration,
@@ -167,6 +283,79 @@ mod tests {
         d.set(0.08, 0.0, ms(t0, 2500));
         assert_eq!(d.next(ms(t0, 3600)), Some((0.0, 0.0)));
         assert_eq!(d.next(ms(t0, 3700)), None);
+    }
+
+    #[test]
+    fn stall_fires_after_sustained_push_and_resets() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new();
+        // Commands flowing, robot stationary: silence until the window
+        // elapses, then exactly one alarm.
+        for at in [0, 500, 1000, 2000, 2900] {
+            assert!(
+                !d.update((0.06, 0.0), (0.0, 0.0), ms(t0, at)),
+                "fired at {at} ms"
+            );
+        }
+        assert!(d.update((0.06, 0.0), (0.0, 0.0), ms(t0, 3000)));
+        assert!(
+            !d.update((0.06, 0.0), (0.0, 0.0), ms(t0, 4000)),
+            "alarm repeats"
+        );
+        // Commands stop: the detector rearms (commands flow at 20 Hz again
+        // and the fresh window must elapse before the next alarm).
+        assert!(!d.update((0.0, 0.0), (0.0, 0.0), ms(t0, 5000)));
+        for at in [5000, 6000, 7000, 7900] {
+            assert!(
+                !d.update((0.05, 0.0), (0.0, 0.0), ms(t0, at)),
+                "fired at {at}"
+            );
+        }
+        assert!(d.update((0.05, 0.0), (0.0, 0.0), ms(t0, 8000)), "rearmed");
+    }
+
+    #[test]
+    fn moving_robot_or_idle_commands_do_not_stall() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new();
+        for at in (0..6000).step_by(500) {
+            // Robot actually moves.
+            assert!(!d.update((0.06, 0.0), (0.05, 0.0), ms(t0, at)));
+            // No commands.
+            assert!(!d.update((0.0, 0.0), (0.0, 0.0), ms(t0, at)));
+        }
+        // Rotation commanded and happening.
+        assert!(!d.update((0.0, 0.3), (0.0, 0.28), ms(t0, 7000)));
+        // Brief mismatch (a start transient) does not fire.
+        let mut d2 = StallDetector::new();
+        assert!(!d2.update((0.06, 0.0), (0.0, 0.0), ms(t0, 0)));
+        assert!(
+            !d2.update((0.06, 0.0), (0.06, 0.0), ms(t0, 1500)),
+            "wheels spun up"
+        );
+        assert!(
+            !d2.update((0.06, 0.0), (0.0, 0.0), ms(t0, 2500)),
+            "window restarted"
+        );
+    }
+
+    #[test]
+    fn backoff_runs_once_for_twelve_hundred_ms() {
+        let t0 = Instant::now();
+        let mut b = BackOff::new();
+        assert!(!b.is_running(t0));
+        b.trigger(t0);
+        assert_eq!(b.active(t0), Some((-0.1, 0.0)));
+        assert_eq!(b.active(ms(t0, 1199)), Some((-0.1, 0.0)));
+        assert_eq!(b.active(ms(t0, 1200)), None, "manoeuvre is over");
+        assert!(!b.is_running(ms(t0, 1300)));
+        // Re-trigger works after expiry.
+        b.trigger(ms(t0, 1400));
+        assert!(b.is_running(ms(t0, 1500)));
+        // A trigger mid-manoeuvre extends it (bumper still pressed).
+        b.trigger(ms(t0, 2000));
+        assert!(b.is_running(ms(t0, 2500)));
+        assert!(!b.is_running(ms(t0, 3201)));
     }
 
     #[test]

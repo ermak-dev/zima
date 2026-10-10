@@ -28,7 +28,7 @@ use ros_env::nav_msgs::msg::Odometry;
 use ros_env::sensor_msgs::msg::LaserScan;
 use ros_env::tf2_msgs::msg::TFMessage;
 
-use player_bridge::drive::{DriveCommand, MAX_ANGULAR, MAX_LINEAR};
+use player_bridge::drive::{BackOff, DriveCommand, StallDetector, MAX_ANGULAR, MAX_LINEAR};
 use player_bridge::scan::uniform_scan;
 use player_bridge::{
     decode_bumper, decode_laser_scanangle, decode_position2d, Client, Error as PlayerError,
@@ -96,6 +96,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lease = Duration::from_secs_f64(cmd_vel_timeout_s.get().clamp(0.05, 5.0));
     let drive = Arc::new(Mutex::new(DriveCommand::new(lease)));
     let drive_reader = drive.clone();
+    // For the ROS loop: the reader thread owns drive_reader.
+    let drive_ros = drive.clone();
+    // Blocked-drive detection: commands flow but the wheels do not turn
+    // (first live drive: pressed against a wall for a minute). Once
+    // latched, /cmd_vel is swallowed until it goes quiet — pushing the
+    // wall harder only deepens the MCU error latch.
+    let stall = Arc::new(Mutex::new(StallDetector::new()));
+    let stall_reader = stall.clone();
+    let stall_hold = Arc::new(Mutex::new(None::<Instant>));
+    let stall_hold_reader = stall_hold.clone();
+    let stall_hold_ros = stall_hold.clone();
+    // Bumper back-off: on contact the bridge drives straight back at once
+    // (stock MoveBack), before the MCU latches a wheel error.
+    let backoff = Arc::new(Mutex::new(BackOff::new()));
+    let backoff_ros = backoff.clone();
+    let backoff_reader = backoff.clone();
+    // Latest commanded velocity (pre-clamp) for the detector.
+    let latest_cmd = Arc::new(Mutex::new((0.0, 0.0)));
+    let latest_cmd_sub = latest_cmd.clone();
+    let latest_cmd_reader = latest_cmd.clone();
     let host = host.get().to_string();
     let port = u16::try_from(port.get()).unwrap_or(6665);
     let laser_frame: String = laser_frame.get().to_string();
@@ -147,9 +167,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             client.subscribe(POSITION2D_CODE, 0)?;
             client.subscribe(BUMPER_CODE, 0)?;
             loop {
-                // Between reads (Player streams odometry at 20+ Hz): the
-                // latest command, or the stop once its lease lapsed.
-                let next = drive_reader.lock().unwrap().next(Instant::now());
+                // Between reads (Player streams odometry at 20+ Hz). The
+                // bumper back-off owns the drive while it runs; otherwise
+                // the latest command, or the stop once its lease lapsed.
+                let next = backoff_reader
+                    .lock()
+                    .unwrap()
+                    .active(Instant::now())
+                    .or_else(|| drive_reader.lock().unwrap().next(Instant::now()));
                 if let Some((vx, vyaw)) = next {
                     client.send_velocity(0, vx, vyaw, 1)?;
                 }
@@ -179,6 +204,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Publish on change only: the vendor driver streams
                         // the same frame; consumers care about transitions.
                         let pressed = decode_bumper(&msg.payload)?.pressed;
+                        let any = pressed.iter().any(|&p| p);
+                        if any {
+                            // Trigger the back-off here, in the reader, so
+                            // the first reverse command goes out on the very
+                            // next tick — before any queued Nav2 command.
+                            backoff_reader.lock().unwrap().trigger(Instant::now());
+                        }
                         let mut last = bumper_state_reader.lock().unwrap();
                         if last.as_ref() != Some(&pressed) {
                             *last = Some(pressed.clone());
@@ -238,6 +270,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscription = node.create_subscription(
         "/cmd_vel",
         move |msg: ros_env::geometry_msgs::msg::Twist| {
+            *latest_cmd_sub.lock().unwrap() = (msg.linear.x, msg.angular.z);
+            // While a bumper back-off runs, Nav2 commands do not reach the
+            // wheels — the manoeuvre owns the drive.
+            if backoff_ros.lock().unwrap().is_running(Instant::now()) {
+                return;
+            }
+            let mut hold = stall_hold.lock().unwrap();
+            if hold.is_some_and(|until| Instant::now() < until) {
+                return; // stalled: swallow commands until the hold expires
+            }
+            *hold = None;
+            drop(hold);
             drive
                 .lock()
                 .unwrap()
@@ -281,11 +325,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = scan_pub.publish(&ros_scan);
                 }
                 Ok(BridgeEvent::Bumper(pressed)) => {
+                    let any = pressed.iter().any(|&p| p);
+                    if any {
+                        // Bumper contact: back off now, and count this as a
+                        // stall trigger too (Nav2 keeps commanding forward).
+                        backoff.lock().unwrap().trigger(Instant::now());
+                        stall_hold_ros.lock().unwrap().take();
+                    }
                     let mut msg = ros_env::std_msgs::msg::Bool::default();
-                    msg.data = pressed.iter().any(|&p| p);
+                    msg.data = any;
                     let _ = bumper_pub.publish(&msg);
                 }
                 Ok(BridgeEvent::Odom(state)) => {
+                    let stalled = {
+                        let mut sd = stall_reader.lock().unwrap();
+                        sd.update(
+                            *latest_cmd_reader.lock().unwrap(),
+                            (state.vx, state.vyaw),
+                            Instant::now(),
+                        )
+                    };
+                    if stalled {
+                        eprintln!(
+                            "player_to_ros2: DRIVE STALLED — commands flow but the wheels \
+                             do not turn (pushed against an obstacle?); holding /cmd_vel 10 s"
+                        );
+                        *stall_hold_reader.lock().unwrap() =
+                            Some(Instant::now() + Duration::from_secs(10));
+                        drive_ros.lock().unwrap().set(0.0, 0.0, Instant::now());
+                    }
                     let mut odom = Odometry::default();
                     odom.header.frame_id = odom_frame.clone();
                     odom.child_frame_id = "base_link".into();
