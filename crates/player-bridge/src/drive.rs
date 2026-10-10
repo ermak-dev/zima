@@ -118,6 +118,11 @@ pub struct BackOff {
     until: Option<Instant>,
     /// Bumper state as of the last frame (edge detection).
     was_pressed: bool,
+    /// The reverse command was sent and the manoeuvre has ended: Player
+    /// keeps executing the last velocity until replaced, so exactly one
+    /// stop must follow (observed live: the robot kept reversing after
+    /// the manoeuvre because nothing replaced the -0.1 m/s).
+    stop_pending: bool,
 }
 
 impl BackOff {
@@ -128,6 +133,7 @@ impl BackOff {
             duration: Duration::from_millis(1200),
             until: None,
             was_pressed: false,
+            stop_pending: false,
         }
     }
 
@@ -139,18 +145,29 @@ impl BackOff {
     pub fn observe(&mut self, pressed: bool, now: Instant) {
         if pressed && !self.was_pressed {
             self.until = Some(now + self.duration);
+            self.stop_pending = false;
         }
         self.was_pressed = pressed;
     }
 
-    /// Velocity to enforce right now: Some(reverse) while the manoeuvre
-    /// runs, None otherwise.
-    pub fn active(&self, now: Instant) -> Option<(f64, f64)> {
-        self.until.filter(|&u| now < u).map(|_| (self.speed, 0.0))
+    /// Velocity to enforce right now: the reverse while the manoeuvre
+    /// runs, then exactly one stop, then None.
+    pub fn active(&mut self, now: Instant) -> Option<(f64, f64)> {
+        if let Some(u) = self.until {
+            if now < u {
+                return Some((self.speed, 0.0));
+            }
+            // Manoeuvre just ended: replace the reverse with a stop once.
+            if !self.stop_pending {
+                self.stop_pending = true;
+                return Some((0.0, 0.0));
+            }
+        }
+        None
     }
 
     pub fn is_running(&self, now: Instant) -> bool {
-        self.active(now).is_some()
+        self.until.is_some_and(|u| now < u)
     }
 }
 
@@ -363,7 +380,12 @@ mod tests {
             b.observe(true, ms(t0, at));
         }
         assert_eq!(b.active(ms(t0, 1199)), Some((-0.1, 0.0)));
-        assert_eq!(b.active(ms(t0, 1200)), None, "manoeuvre is over at 1.2 s");
+        assert_eq!(
+            b.active(ms(t0, 1200)),
+            Some((0.0, 0.0)),
+            "one stop after the manoeuvre"
+        );
+        assert_eq!(b.active(ms(t0, 1300)), None, "then quiet");
         assert!(
             !b.is_running(ms(t0, 1300)),
             "still pressed, still no reverse"
@@ -376,6 +398,26 @@ mod tests {
         // A hold-press across the manoeuvre end stays stopped.
         b.observe(true, ms(t0, 3000));
         assert!(!b.is_running(ms(t0, 3100)), "no second window while held");
+    }
+
+    #[test]
+    fn backoff_sends_exactly_one_stop_after_the_reverse() {
+        let t0 = Instant::now();
+        let mut b = BackOff::new();
+        b.observe(true, t0);
+        assert_eq!(b.active(t0), Some((-0.1, 0.0)));
+        assert_eq!(b.active(ms(t0, 1199)), Some((-0.1, 0.0)));
+        // The manoeuvre ends: one stop replaces the reverse (Player keeps
+        // the last velocity until replaced — the live bug).
+        assert_eq!(
+            b.active(ms(t0, 1200)),
+            Some((0.0, 0.0)),
+            "stop after reverse"
+        );
+        assert_eq!(b.active(ms(t0, 1250)), None, "stop is sent once");
+        assert_eq!(b.active(ms(t0, 5000)), None);
+        // is_running is false already at the stop stage.
+        assert!(!b.is_running(ms(t0, 1200)));
     }
 
     #[test]

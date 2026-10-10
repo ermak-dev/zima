@@ -146,7 +146,7 @@ from geometry_msgs.msg import Twist
 rclpy.init()
 n = Node('nav2_stub')
 pub = n.create_publisher(Twist, '/cmd_vel', 10)
-end = time.time() + 8
+end = time.time() + 5.5
 while time.time() < end:
     t = Twist(); t.linear.x = 0.06   # insists on driving forward
     pub.publish(t)
@@ -227,6 +227,16 @@ fn bumper_contact_drives_back_despite_forward_commands() {
             .map(|(t, v, w)| (t, *v, *w))
             .take(5)
             .collect::<Vec<_>>()
+    );
+    // The last command the bridge sent must be a stop: Player keeps the
+    // last velocity until replaced, so a trailing reverse means the robot
+    // keeps rolling after the test (the second live bug).
+    let last_cmd = log[log.len() - 1];
+    assert!(
+        last_cmd.1 == 0.0 && last_cmd.2 == 0.0,
+        "the bridge's last command was ({}, {}), not a stop",
+        last_cmd.1,
+        last_cmd.2
     );
     // The manoeuvre is one-shot and bounded: reverse spans about the
     // configured 1.2 s (never endless — the live bug), and while it runs
