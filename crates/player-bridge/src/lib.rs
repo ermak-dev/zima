@@ -16,6 +16,7 @@
 //! runs against that real server (see tests/against_server.rs).
 
 pub mod drive;
+pub mod scan;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

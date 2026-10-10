@@ -27,6 +27,7 @@ use ros_env::tf2_msgs::msg::TFMessage;
 use ros_env::geometry_msgs::msg::{Transform, TransformStamped, Vector3};
 
 use player_bridge::drive::{DriveCommand, MAX_ANGULAR, MAX_LINEAR};
+use player_bridge::scan::uniform_scan;
 use player_bridge::{
     decode_position2d, decode_laser_scanangle, Client, Error as PlayerError, LaserScanAngle,
     Position2dState, LASER_CODE, LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE,
@@ -221,21 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match rx.try_recv() {
                 Ok(BridgeEvent::Scan(scan)) => {
-                    // Normalize the vendor scan: unwrap the circular
-                    // order, sort ascending, and derive a uniform grid
-                    // (start, step, count) for sensor_msgs/LaserScan.
-                    let mut beams: Vec<(f32, f32)> =
-                        scan.angles.iter().copied().zip(scan.ranges.iter().copied()).collect();
-                    // unwrap: rotate so the array starts at the smallest
-                    // angle after adding 2*pi to wrapped negatives
-                    let min_a = beams.iter().map(|b| b.0).fold(f32::INFINITY, f32::min);
-                    for b in beams.iter_mut() {
-                        while b.0 < min_a {
-                            b.0 += std::f32::consts::TAU;
-                        }
-                    }
-                    beams.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
-                    let n = beams.len();
+                    // Vendor per-beam bearings -> uniform ascending grid,
+                    // with range_min that marks empty (0.0) and turret
+                    // beams invalid (see player_bridge::scan).
+                    let grid = uniform_scan(&scan);
                     let mut ros_scan = LaserScan::default();
                     // Stamp at local receive time: the Player scan carries
                     // no portable timestamp, and an unstamped message is
@@ -245,14 +235,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ros_scan.header.stamp = stamp;
                     }
                     ros_scan.header.frame_id = laser_frame.clone();
-                    if n >= 2 {
-                        ros_scan.angle_min = beams[0].0;
-                        ros_scan.angle_max = beams[n - 1].0;
-                        ros_scan.angle_increment = (beams[n - 1].0 - beams[0].0) / (n - 1) as f32;
-                    }
-                    ros_scan.range_max = scan.max_range;
-                    ros_scan.ranges = beams.iter().map(|b| b.1).collect();
-                    ros_scan.intensities = scan.intensities.iter().map(|&i| i as f32).collect();
+                    ros_scan.angle_min = grid.angle_min;
+                    ros_scan.angle_max = grid.angle_max;
+                    ros_scan.angle_increment = grid.angle_increment;
+                    ros_scan.range_min = grid.range_min;
+                    ros_scan.range_max = grid.range_max;
+                    ros_scan.ranges = grid.ranges;
+                    ros_scan.intensities = grid.intensities;
                     let _ = scan_pub.publish(&ros_scan);
                 }
                 Ok(BridgeEvent::Odom(state)) => {
