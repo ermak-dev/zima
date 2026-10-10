@@ -115,6 +115,21 @@ fn over_limit_command_is_clamped_and_lapses_to_zero() {
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    if std::env::var("ROS_DISTRO").is_err() {
+        eprintln!("skipping: no sourced ROS 2 environment");
+        return;
+    }
+    // Needs the ros2 CLI on PATH: not the case under a bare colcon test
+    // environment. Like the other e2e tests of this repo: skip, don't fail.
+    if Command::new("ros2")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping: the ros2 CLI is not on PATH");
+        return;
+    }
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let server = {
