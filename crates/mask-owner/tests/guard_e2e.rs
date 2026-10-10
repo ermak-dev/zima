@@ -4,8 +4,8 @@
 //! measured live on 2026-10-03, now kept as a regression test.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -82,7 +82,12 @@ fn spawn_fake_mc(tag: &str) -> FakeMc {
             }
         }
     });
-    FakeMc { dir, applied, stop, peer: Some(peer) }
+    FakeMc {
+        dir,
+        applied,
+        stop,
+        peer: Some(peer),
+    }
 }
 
 impl Drop for FakeMc {
@@ -163,7 +168,10 @@ fn hold_restores_standby_on_sigterm() {
     assert!(status.success(), "owner exited with {status}");
 
     let applied = mc.applied.lock().unwrap().clone();
-    assert_eq!(applied, vec![mask_owner::MASK_NO_BRUSHES, mask_owner::MASK_STANDBY]);
+    assert_eq!(
+        applied,
+        vec![mask_owner::MASK_NO_BRUSHES, mask_owner::MASK_STANDBY]
+    );
 }
 
 /// Live regression (2026-10-03, second): the guard inherited the owner's

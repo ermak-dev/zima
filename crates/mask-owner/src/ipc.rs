@@ -79,7 +79,9 @@ impl Channel {
     /// Send one request and wait for its ack until the deadline.
     pub fn exchange(&mut self, seq: u32, bitmap: u32, timeout: Duration) -> Result<(), OwnerError> {
         let pkt = build_request(seq, bitmap)?;
-        self.send.write_all(&pkt).map_err(|_| OwnerError::WriteFailed)?;
+        self.send
+            .write_all(&pkt)
+            .map_err(|_| OwnerError::WriteFailed)?;
         self.send.flush().map_err(|_| OwnerError::WriteFailed)?;
 
         let deadline = Instant::now() + timeout;
@@ -180,8 +182,7 @@ impl Owner {
         recv_path: &str,
         spawn_guard: bool,
     ) -> Result<Self, OwnerError> {
-        let marker =
-            std::env::temp_dir().join(format!("mask-owner-standdown-{}", process::id()));
+        let marker = std::env::temp_dir().join(format!("mask-owner-standdown-{}", process::id()));
         let _ = std::fs::remove_file(&marker);
 
         if spawn_guard {
@@ -200,12 +201,22 @@ impl Owner {
         channel.drain().ok();
         channel.exchange(process::id() & 0xffff, mask, timeout)?;
         eprintln!("mask 0x{mask:08x} applied (ack)");
-        Ok(Owner { marker, channel, restored: false })
+        Ok(Owner {
+            marker,
+            channel,
+            restored: false,
+        })
     }
 
     /// Production start: env-configured paths, guard enabled.
     pub fn start(mask: u32, timeout: Duration) -> Result<Self, OwnerError> {
-        Self::start_with(mask, timeout, &default_send_fifo(), &default_recv_fifo(), true)
+        Self::start_with(
+            mask,
+            timeout,
+            &default_send_fifo(),
+            &default_recv_fifo(),
+            true,
+        )
     }
 
     /// Restore standby and stand the guard down. Idempotent: a second

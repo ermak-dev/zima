@@ -22,14 +22,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rclrs::*;
-use ros_env::sensor_msgs::msg::LaserScan;use ros_env::nav_msgs::msg::Odometry;
-use ros_env::tf2_msgs::msg::TFMessage;
 use ros_env::geometry_msgs::msg::{Transform, TransformStamped, Vector3};
+use ros_env::nav_msgs::msg::Odometry;
+use ros_env::sensor_msgs::msg::LaserScan;
+use ros_env::tf2_msgs::msg::TFMessage;
 
 use player_bridge::drive::{DriveCommand, MAX_ANGULAR, MAX_LINEAR};
 use player_bridge::scan::uniform_scan;
 use player_bridge::{
-    decode_position2d, decode_laser_scanangle, Client, Error as PlayerError, LaserScanAngle,
+    decode_laser_scanangle, decode_position2d, Client, Error as PlayerError, LaserScanAngle,
     Position2dState, LASER_CODE, LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE,
     POSITION2D_DATA_STATE,
 };
@@ -73,10 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .declare_parameter("laser_x")
         .default(-0.100)
         .mandatory()?;
-    let laser_y: rclrs::MandatoryParameter<f64> = node
-        .declare_parameter("laser_y")
-        .default(0.0)
-        .mandatory()?;
+    let laser_y: rclrs::MandatoryParameter<f64> =
+        node.declare_parameter("laser_y").default(0.0).mandatory()?;
     // Command lease: how long one /cmd_vel keeps the wheels turning. Nav2
     // publishes at 20 Hz; teleop key autorepeat starts after ~0.5 s.
     let cmd_vel_timeout_s: rclrs::MandatoryParameter<f64> = node
@@ -100,8 +99,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let laser_frame: String = laser_frame.get().to_string();
     let odom_frame: String = odom_frame.get().to_string();
     let base_frame: String = base_frame.get().to_string();
-    let (laser_x, laser_y, laser_yaw) =
-        (laser_x.get(), laser_y.get(), laser_yaw_deg.get().to_radians());
+    let (laser_x, laser_y, laser_yaw) = (
+        laser_x.get(),
+        laser_y.get(),
+        laser_yaw_deg.get().to_radians(),
+    );
 
     let host_for_log = host.clone();
 
@@ -145,7 +147,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     client.send_velocity(0, vx, vyaw, 1)?;
                 }
                 let msg = client.read_message()?;
-                match (msg.header.msg_type, msg.header.addr.interf, msg.header.subtype) {
+                match (
+                    msg.header.msg_type,
+                    msg.header.addr.interf,
+                    msg.header.subtype,
+                ) {
                     (MSGTYPE_DATA, LASER_CODE, LASER_DATA_SCANANGLE) => {
                         // The vendor driver publishes per-beam angles
                         // (subtype 3) in a wrapped, descending order; the
@@ -188,7 +194,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t.header.frame_id = base_frame.clone();
         t.child_frame_id = laser_frame.clone();
         t.transform = Transform {
-            translation: Vector3 { x: laser_x, y: laser_y, z: 0.0 },
+            translation: Vector3 {
+                x: laser_x,
+                y: laser_y,
+                z: 0.0,
+            },
             rotation: yaw_to_quat(laser_yaw),
         };
         m.transforms.push(t);
@@ -205,7 +215,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscription = node.create_subscription(
         "/cmd_vel",
         move |msg: ros_env::geometry_msgs::msg::Twist| {
-            drive.lock().unwrap().set(msg.linear.x, msg.angular.z, Instant::now());
+            drive
+                .lock()
+                .unwrap()
+                .set(msg.linear.x, msg.angular.z, Instant::now());
         },
     )?;
     log_info!(
@@ -265,7 +278,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     t.child_frame_id = base_frame.clone();
                     t.header.stamp = odom.header.stamp;
                     t.transform = Transform {
-                        translation: Vector3 { x: state.x, y: state.y, z: 0.0 },
+                        translation: Vector3 {
+                            x: state.x,
+                            y: state.y,
+                            z: 0.0,
+                        },
                         rotation: yaw_to_quat(state.yaw),
                     };
                     tf.transforms.push(t);
@@ -280,7 +297,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         executor.spin(SpinOptions::spin_once().timeout(Duration::from_millis(10)));
         if last_report.elapsed() >= Duration::from_secs(30) {
-            log_info!(node.logger(), "bridge alive (player {}:{})", host_for_log, port);
+            log_info!(
+                node.logger(),
+                "bridge alive (player {}:{})",
+                host_for_log,
+                port
+            );
             last_report = std::time::Instant::now();
         }
     }

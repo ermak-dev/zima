@@ -71,7 +71,9 @@ fn start_server() -> Option<(Server, u16)> {
 
 #[test]
 fn subscribes_and_reads_laser_from_real_server() {
-    let Some((_server, port)) = start_server() else { return };
+    let Some((_server, port)) = start_server() else {
+        return;
+    };
 
     let mut client = Client::connect("127.0.0.1", port).expect("connect");
     let granted = client.subscribe(LASER_CODE, 0).expect("subscribe laser");
@@ -87,7 +89,10 @@ fn subscribes_and_reads_laser_from_real_server() {
         {
             break decode_laser_scan(&msg.payload).expect("decode scan");
         }
-        assert!(std::time::Instant::now() < deadline, "no laser data arrived");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no laser data arrived"
+        );
     };
     // dummy laser defaults: 180 beams?? — assert what the driver actually
     // sends: nonempty scan with sane geometry
@@ -97,10 +102,14 @@ fn subscribes_and_reads_laser_from_real_server() {
 
 #[test]
 fn subscribes_and_reads_position2d_from_real_server() {
-    let Some((_server, port)) = start_server() else { return };
+    let Some((_server, port)) = start_server() else {
+        return;
+    };
 
     let mut client = Client::connect("127.0.0.1", port).expect("connect");
-    let granted = client.subscribe(POSITION2D_CODE, 0).expect("subscribe position2d");
+    let granted = client
+        .subscribe(POSITION2D_CODE, 0)
+        .expect("subscribe position2d");
     assert_eq!(granted, OPEN_MODE);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -112,14 +121,19 @@ fn subscribes_and_reads_position2d_from_real_server() {
         {
             break decode_position2d(&msg.payload).expect("decode position2d");
         }
-        assert!(std::time::Instant::now() < deadline, "no position data arrived");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no position data arrived"
+        );
     };
     assert!(state.x.is_finite() && state.y.is_finite() && state.yaw.is_finite());
 }
 
 #[test]
 fn velocity_command_is_accepted_by_real_server() {
-    let Some((_server, port)) = start_server() else { return };
+    let Some((_server, port)) = start_server() else {
+        return;
+    };
 
     let mut client = Client::connect("127.0.0.1", port).expect("connect");
     client.subscribe(POSITION2D_CODE, 0).expect("subscribe");

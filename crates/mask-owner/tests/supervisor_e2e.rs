@@ -90,7 +90,12 @@ fn spawn_rig(tag: &str) -> Rig {
         }
     });
 
-    Rig { dir, applied, stop, peer: Some(peer) }
+    Rig {
+        dir,
+        applied,
+        stop,
+        peer: Some(peer),
+    }
 }
 
 impl Rig {
@@ -103,7 +108,6 @@ impl Rig {
         drop(l);
         p
     }
-
 
     fn restore_script(&self) -> (PathBuf, PathBuf) {
         let script = self.dir.join("restore.sh");
@@ -127,7 +131,10 @@ impl Rig {
             .env("MASK_OWNER_SEND", self.dir.join("RcMc"))
             .env("MASK_OWNER_RECV", self.dir.join("McRc"))
             .env("ROBOT_SUPERVISOR_PLAYER", "127.0.0.1:1") // unreachable is fine: zero-vel logs an error but rollback continues
-            .env("ROBOT_SUPERVISOR_RESTORE", format!("{} {}", script.display(), calls.display()))
+            .env(
+                "ROBOT_SUPERVISOR_RESTORE",
+                format!("{} {}", script.display(), calls.display()),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -150,7 +157,6 @@ impl Rig {
         std::fs::remove_dir_all(&self.dir).ok();
     }
 }
-
 
 fn connect_with_retry(port: u16) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -182,7 +188,10 @@ fn supervisor_applies_mask_on_activate_and_rolls_back_on_eof() {
         if applied == vec![mask_owner::MASK_NO_BRUSHES, mask_owner::MASK_STANDBY] {
             break;
         }
-        assert!(Instant::now() < deadline, "no rollback after EOF; applied {applied:?}");
+        assert!(
+            Instant::now() < deadline,
+            "no rollback after EOF; applied {applied:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = sup.wait();
@@ -207,7 +216,10 @@ fn supervisor_rolls_back_on_silent_heartbeat() {
             assert_eq!(applied[1], mask_owner::MASK_STANDBY, "wrong rollback mask");
             break;
         }
-        assert!(Instant::now() < deadline, "no rollback after silence; applied {applied:?}");
+        assert!(
+            Instant::now() < deadline,
+            "no rollback after silence; applied {applied:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(hb);

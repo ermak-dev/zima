@@ -68,14 +68,18 @@ fn start_server() -> Option<(Server, u16)> {
 
 #[test]
 fn static_laser_tf_is_latched_and_resolves_at_scan_time() {
-    let Some((_server, port)) = start_server() else { return };
+    let Some((_server, port)) = start_server() else {
+        return;
+    };
     eprintln!("player server on port {port}");
 
     // Run the bridge node against the local server and capture its log.
     let repo = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let bridge = format!("{repo}/../target/debug/player_to_ros2");
     if !std::path::Path::new(&bridge).exists() {
-        eprintln!("skipping: bridge binary not built ({bridge}); run: cargo build -p player_to_ros2");
+        eprintln!(
+            "skipping: bridge binary not built ({bridge}); run: cargo build -p player_to_ros2"
+        );
         return;
     }
     let log = std::env::temp_dir().join("player_to_ros2_it.log");

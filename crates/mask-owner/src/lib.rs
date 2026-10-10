@@ -154,8 +154,8 @@ mod tests {
         assert_eq!(
             &pkt[..16],
             &[
-                0x45, 0x00, 0x01, 0x04, 0x36, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff,
-                0xfe, 0x10, 0x00
+                0x45, 0x00, 0x01, 0x04, 0x36, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff, 0xfe,
+                0x10, 0x00
             ]
         );
         assert_eq!(pkt.len(), 76);
@@ -169,7 +169,10 @@ mod tests {
         assert_eq!(h.src, MODULE_RC);
         assert_eq!(h.dst, MODULE_MC);
         assert_eq!(h.seq, 0x42);
-        assert_eq!(u32::from_le_bytes(pkt[12..16].try_into().unwrap()), MASK_NO_BRUSHES);
+        assert_eq!(
+            u32::from_le_bytes(pkt[12..16].try_into().unwrap()),
+            MASK_NO_BRUSHES
+        );
     }
 
     #[test]

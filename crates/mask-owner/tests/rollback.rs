@@ -78,7 +78,8 @@ fn spawn_rig(tag: &str) -> Rig {
             std::thread::sleep(Duration::from_millis(5));
         };
         conn.set_nonblocking(true).ok();
-        conn.write_all(b"Player v.3.1.1-test\0\0\0\0\0\0\0\0\0\0\0\0\0").ok();
+        conn.write_all(b"Player v.3.1.1-test\0\0\0\0\0\0\0\0\0\0\0\0\0")
+            .ok();
         let mut buf = [0u8; 4096];
         loop {
             if stop_t.load(Ordering::SeqCst) {
@@ -94,10 +95,13 @@ fn spawn_rig(tag: &str) -> Rig {
                         let interf = u32::from_be_bytes(buf[off + 8..off + 12].try_into().unwrap());
                         let mtype = u32::from_be_bytes(buf[off + 16..off + 20].try_into().unwrap());
                         let sub = u32::from_be_bytes(buf[off + 20..off + 24].try_into().unwrap());
-                        let size = u32::from_be_bytes(buf[off + 36..off + 40].try_into().unwrap()) as usize;
+                        let size = u32::from_be_bytes(buf[off + 36..off + 40].try_into().unwrap())
+                            as usize;
                         if mtype == 2 && sub == 1 && interf == 4 && off + 40 + 28 <= n {
-                            let vx = f64::from_be_bytes(buf[off + 40..off + 48].try_into().unwrap());
-                            let vyaw = f64::from_be_bytes(buf[off + 56..off + 64].try_into().unwrap());
+                            let vx =
+                                f64::from_be_bytes(buf[off + 40..off + 48].try_into().unwrap());
+                            let vyaw =
+                                f64::from_be_bytes(buf[off + 56..off + 64].try_into().unwrap());
                             vel_t.lock().unwrap().push((vx, vyaw));
                         }
                         off += 40 + size;
@@ -112,7 +116,8 @@ fn spawn_rig(tag: &str) -> Rig {
     });
 
     // Fake Mc peer on the FIFOs (reuses the shape of fifo.rs peer).
-    let (applied_t, stop_r, send_t, recv_t) = (applied.clone(), stop.clone(), send.clone(), recv.clone());
+    let (applied_t, stop_r, send_t, recv_t) =
+        (applied.clone(), stop.clone(), send.clone(), recv.clone());
     let peer = std::thread::spawn(move || {
         let mut from_rc = open_rw_nb(&send_t);
         let mut to_rc = open_rw_nb(&recv_t);
@@ -144,7 +149,14 @@ fn spawn_rig(tag: &str) -> Rig {
         }
     });
 
-    Rig { dir, applied, player: None, stop, peer: Some(peer), restore_calls }
+    Rig {
+        dir,
+        applied,
+        player: None,
+        stop,
+        peer: Some(peer),
+        restore_calls,
+    }
 }
 
 impl Rig {
@@ -193,17 +205,24 @@ fn full_rollback_sends_zero_velocity_then_standby_then_restore() {
         )
         .unwrap();
         ch.drain().ok();
-        ch.exchange(1, MASK_NO_BRUSHES, Duration::from_secs(2)).unwrap();
+        ch.exchange(1, MASK_NO_BRUSHES, Duration::from_secs(2))
+            .unwrap();
     }
     assert_eq!(*rig.applied.lock().unwrap(), vec![MASK_NO_BRUSHES]);
 
     full_rollback(&rollback, Duration::from_secs(3)).unwrap();
 
     // Standby mask reached the FIFO peer.
-    assert_eq!(*rig.applied.lock().unwrap(), vec![MASK_NO_BRUSHES, MASK_STANDBY]);
+    assert_eq!(
+        *rig.applied.lock().unwrap(),
+        vec![MASK_NO_BRUSHES, MASK_STANDBY]
+    );
     // Restore command ran exactly once.
     let called = std::fs::read_to_string(&calls).unwrap();
-    assert!(called.trim().contains("called"), "restore not invoked: {called:?}");
+    assert!(
+        called.trim().contains("called"),
+        "restore not invoked: {called:?}"
+    );
 
     rig.finish();
 }

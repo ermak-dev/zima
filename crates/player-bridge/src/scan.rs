@@ -38,7 +38,17 @@ pub fn uniform_scan(scan: &LaserScanAngle) -> UniformScan {
         .iter()
         .zip(&scan.ranges)
         .enumerate()
-        .map(|(i, (&a, &r))| (a, r, if with_intensity { scan.intensities[i] as f32 } else { 0.0 }))
+        .map(|(i, (&a, &r))| {
+            (
+                a,
+                r,
+                if with_intensity {
+                    scan.intensities[i] as f32
+                } else {
+                    0.0
+                },
+            )
+        })
         .collect();
     beams.sort_by(|x, y| x.0.total_cmp(&y.0));
     let n = beams.len();
@@ -55,7 +65,11 @@ pub fn uniform_scan(scan: &LaserScanAngle) -> UniformScan {
         range_min: LDS_RANGE_MIN,
         range_max: scan.max_range,
         ranges: beams.iter().map(|b| b.1).collect(),
-        intensities: if with_intensity { beams.iter().map(|b| b.2).collect() } else { Vec::new() },
+        intensities: if with_intensity {
+            beams.iter().map(|b| b.2).collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -76,7 +90,11 @@ mod tests {
     #[test]
     fn wrapped_descending_bearings_become_an_ascending_grid() {
         // As the driver sends them: descending, wrapping past -pi to +pi.
-        let s = uniform_scan(&vendor(&[-1.0, -2.0, -3.0, 3.0, 2.0], &[1.0, 2.0, 3.0, 4.0, 5.0], &[]));
+        let s = uniform_scan(&vendor(
+            &[-1.0, -2.0, -3.0, 3.0, 2.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[],
+        ));
         assert_eq!(s.angle_min, -3.0);
         assert_eq!(s.angle_max, 3.0);
         assert!((s.angle_increment - 1.5).abs() < 1e-6);
@@ -108,7 +126,10 @@ mod tests {
     #[test]
     fn degenerate_scans_have_no_grid() {
         let s = uniform_scan(&vendor(&[0.3], &[1.0], &[]));
-        assert_eq!((s.angle_min, s.angle_max, s.angle_increment), (0.0, 0.0, 0.0));
+        assert_eq!(
+            (s.angle_min, s.angle_max, s.angle_increment),
+            (0.0, 0.0, 0.0)
+        );
         assert_eq!(s.ranges, vec![1.0]);
     }
 }

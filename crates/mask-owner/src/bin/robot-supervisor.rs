@@ -55,13 +55,19 @@ fn main() {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--heartbeat-port" => {
-                heartbeat_port = it.next().and_then(|v| v.parse().ok()).unwrap_or(heartbeat_port);
+                heartbeat_port = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(heartbeat_port);
             }
             "--timeout-ms" => {
                 timeout_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(timeout_ms);
             }
             "--activate-timeout-ms" => {
-                activate_timeout_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(activate_timeout_ms);
+                activate_timeout_ms = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(activate_timeout_ms);
             }
             "--mask" => {
                 mask = it
@@ -94,7 +100,8 @@ fn main() {
             std::process::exit(3);
         }
     };
-    conn.set_read_timeout(Some(Duration::from_millis(activate_timeout_ms))).ok();
+    conn.set_read_timeout(Some(Duration::from_millis(activate_timeout_ms)))
+        .ok();
     let mut buf = [0u8; 64];
     let activated = match conn.read(&mut buf) {
         Ok(n) if n >= 8 && buf.starts_with(b"ACTIVATE") => true,
@@ -114,26 +121,31 @@ fn main() {
     let _ = conn.write_all(b"ACTIVATED\n");
     eprintln!("[supervisor] activated");
 
-    let (player_host, player_port) = parse_player_addr(&env_or("ROBOT_SUPERVISOR_PLAYER", "127.0.0.1:6665"));
+    let (player_host, player_port) =
+        parse_player_addr(&env_or("ROBOT_SUPERVISOR_PLAYER", "127.0.0.1:6665"));
     let rollback = Rollback {
         player_host,
         player_port,
         send_fifo: env_or("MASK_OWNER_SEND", "/tmp/RcMc"),
         recv_fifo: env_or("MASK_OWNER_RECV", "/tmp/McRc"),
-        restore_command: env_or("ROBOT_SUPERVISOR_RESTORE", "/tmp/mask-owner/controller-restore.sh"),
+        restore_command: env_or(
+            "ROBOT_SUPERVISOR_RESTORE",
+            "/tmp/mask-owner/controller-restore.sh",
+        ),
     };
 
     // Apply the session mask. A failure here means the robot state is
     // unknown: roll back immediately and exit nonzero.
     let timeout = Duration::from_millis(timeout_ms.max(1000));
     {
-        let mut channel = match mask_owner::ipc::Channel::open_with(&rollback.send_fifo, &rollback.recv_fifo) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[supervisor] cannot open FIFOs: {e}");
-                std::process::exit(4);
-            }
-        };
+        let mut channel =
+            match mask_owner::ipc::Channel::open_with(&rollback.send_fifo, &rollback.recv_fifo) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[supervisor] cannot open FIFOs: {e}");
+                    std::process::exit(4);
+                }
+            };
         channel.drain().ok();
         match channel.exchange(std::process::id() & 0xffff, mask, Duration::from_secs(5)) {
             Ok(()) => eprintln!("[supervisor] session mask 0x{mask:08x} applied"),
@@ -150,9 +162,15 @@ fn main() {
         // Graceful path: the bridge said GOODBYE (or died — EOF is
         // handled the same way). Restore standby ourselves.
         let _ = channel.drain();
-        match channel.exchange((std::process::id() + 1) & 0xffff, MASK_STANDBY, Duration::from_secs(5)) {
+        match channel.exchange(
+            (std::process::id() + 1) & 0xffff,
+            MASK_STANDBY,
+            Duration::from_secs(5),
+        ) {
             Ok(()) => eprintln!("[supervisor] graceful standby restore done"),
-            Err(e) => eprintln!("[supervisor] graceful restore failed ({e}); full rollback follows"),
+            Err(e) => {
+                eprintln!("[supervisor] graceful restore failed ({e}); full rollback follows")
+            }
         }
     }
 

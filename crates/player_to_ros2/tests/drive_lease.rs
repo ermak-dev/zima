@@ -45,7 +45,12 @@ fn fake_player(listener: TcpListener, log: Log, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while !data_stop.load(Ordering::Relaxed) {
             let header = MsgHeader {
-                addr: DevAddr { host: 0, robot: 0, interf: POSITION2D_CODE, index: 0 },
+                addr: DevAddr {
+                    host: 0,
+                    robot: 0,
+                    interf: POSITION2D_CODE,
+                    index: 0,
+                },
                 msg_type: MSGTYPE_DATA,
                 subtype: POSITION2D_DATA_STATE,
                 timestamp: 0.0,
@@ -60,25 +65,37 @@ fn fake_player(listener: TcpListener, log: Log, stop: Arc<AtomicBool>) {
     });
 
     let mut input = stream;
-    input.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    input
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     while !stop.load(Ordering::Relaxed) {
         let mut hdr = [0u8; MSGHDR_SIZE];
         match input.read_exact(&mut hdr) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(_) => return,
         }
         let header = decode_header(&hdr).expect("valid header");
         let mut payload = vec![0u8; header.size as usize];
         input.set_read_timeout(None).unwrap();
         input.read_exact(&mut payload).unwrap();
-        input.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        input
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         match (header.msg_type, header.addr.interf, header.subtype) {
             (MSGTYPE_REQ, _, _) => {
                 let mut ack = [0u8; 28];
                 ack[19] = 1; // granted access
-                let reply = MsgHeader { msg_type: MSGTYPE_RESP_ACK, size: 28, ..header };
+                let reply = MsgHeader {
+                    msg_type: MSGTYPE_RESP_ACK,
+                    size: 28,
+                    ..header
+                };
                 send(&out, reply, &ack).unwrap();
             }
             (MSGTYPE_CMD, POSITION2D_CODE, POSITION2D_CMD_VEL) => {
@@ -120,7 +137,15 @@ fn over_limit_command_is_clamped_and_lapses_to_zero() {
 
     // One command, far over the limits, then silence.
     let published = Command::new("ros2")
-        .args(["topic", "pub", "--once", "-w", "1", "/cmd_vel", "geometry_msgs/msg/Twist"])
+        .args([
+            "topic",
+            "pub",
+            "--once",
+            "-w",
+            "1",
+            "/cmd_vel",
+            "geometry_msgs/msg/Twist",
+        ])
         .arg("{linear: {x: 0.5}, angular: {z: -1.0}}")
         .env("ROS_DOMAIN_ID", &domain)
         .env("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
@@ -136,9 +161,16 @@ fn over_limit_command_is_clamped_and_lapses_to_zero() {
     assert!(published.success(), "ros2 topic pub failed");
 
     let log = log.lock().unwrap().clone();
-    let first = log.iter().position(|&(_, vx, _)| vx != 0.0).expect("a motion command reached Player");
+    let first = log
+        .iter()
+        .position(|&(_, vx, _)| vx != 0.0)
+        .expect("a motion command reached Player");
     let (t_move, vx, vyaw) = log[first];
-    assert_eq!((vx, vyaw), (0.1, -0.4), "command not clamped to the project limits: {log:?}");
+    assert_eq!(
+        (vx, vyaw),
+        (0.1, -0.4),
+        "command not clamped to the project limits: {log:?}"
+    );
     let stop_cmd = log[first + 1..]
         .iter()
         .find(|&&(_, vx, vyaw)| vx == 0.0 && vyaw == 0.0)
@@ -149,7 +181,9 @@ fn over_limit_command_is_clamped_and_lapses_to_zero() {
         "zero came {after:?} after the command (lease 0.5 s)"
     );
     assert!(
-        log[first + 1..].iter().all(|&(_, vx, vyaw)| vx == 0.0 && vyaw == 0.0),
+        log[first + 1..]
+            .iter()
+            .all(|&(_, vx, vyaw)| vx == 0.0 && vyaw == 0.0),
         "motion resumed without a new command: {log:?}"
     );
 }

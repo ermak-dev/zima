@@ -8,8 +8,14 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_robotctl");
 
 fn run(args: &[&str]) -> (i32, String) {
-    let out = Command::new(BIN).args(args).output().expect("spawn robotctl");
-    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
+    let out = Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("spawn robotctl");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 #[test]
@@ -41,7 +47,10 @@ fn move_directions_are_within_limits() {
     // an unroutable TEST-NET address that waits for a timeout).
     for dir in ["forward", "backward", "left", "right"] {
         let (code, stderr) = run(&["127.0.0.1", "move", dir, "1"]);
-        assert!(stderr.contains("connect") || stderr.contains("io"), "dir {dir}: {stderr}");
+        assert!(
+            stderr.contains("connect") || stderr.contains("io"),
+            "dir {dir}: {stderr}"
+        );
         assert_eq!(code, 1, "dir {dir}");
     }
 }

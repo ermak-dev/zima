@@ -98,7 +98,12 @@ fn spawn_rig(tag: &str, foreign_burst: usize) -> Rig {
         }
     });
 
-    Rig { dir, applied, stop, peer: Some(peer) }
+    Rig {
+        dir,
+        applied,
+        stop,
+        peer: Some(peer),
+    }
 }
 
 impl Rig {
@@ -200,8 +205,7 @@ fn channel_drain_drops_stale_packets() {
         mc_writer.write_all(&stale).unwrap();
     }
 
-    let mut channel =
-        Channel::open_with(send.to_str().unwrap(), recv.to_str().unwrap()).unwrap();
+    let mut channel = Channel::open_with(send.to_str().unwrap(), recv.to_str().unwrap()).unwrap();
     assert_eq!(channel.drain().unwrap(), 2);
     assert_eq!(channel.drain().unwrap(), 0);
     drop(mc_writer);

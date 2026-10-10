@@ -96,8 +96,14 @@ pub enum Error {
     Io(std::io::Error),
     BadBanner,
     Nak,
-    UnexpectedReply { msg_type: u8, subtype: u8 },
-    ShortPayload { need: usize, got: usize },
+    UnexpectedReply {
+        msg_type: u8,
+        subtype: u8,
+    },
+    ShortPayload {
+        need: usize,
+        got: usize,
+    },
     /// A payload's internal length fields disagree: XDR framing is broken.
     CorruptChannel,
 }
@@ -176,7 +182,14 @@ pub fn decode_header(buf: &[u8]) -> Option<MsgHeader> {
     let timestamp = bef64(buf, 24);
     let seq = be32(buf, 32);
     let size = be32(buf, 36);
-    Some(MsgHeader { addr, msg_type, subtype, timestamp, seq, size })
+    Some(MsgHeader {
+        addr,
+        msg_type,
+        subtype,
+        timestamp,
+        seq,
+        size,
+    })
 }
 
 /// Encode a 40-byte XDR message header.
@@ -209,7 +222,10 @@ pub fn encode_header(hdr: &MsgHeader) -> [u8; MSGHDR_SIZE] {
 /// field and the array encoder serialize their own length.
 pub fn decode_laser_scan(payload: &[u8]) -> Result<LaserScan, Error> {
     if payload.len() < 24 {
-        return Err(Error::ShortPayload { need: 24, got: payload.len() });
+        return Err(Error::ShortPayload {
+            need: 24,
+            got: payload.len(),
+        });
     }
     let min_angle = bef32(payload, 0);
     let max_angle = bef32(payload, 4);
@@ -218,7 +234,10 @@ pub fn decode_laser_scan(payload: &[u8]) -> Result<LaserScan, Error> {
     let ranges_count = be32(payload, 16) as usize;
     let mut off = 20;
     if off + 4 > payload.len() {
-        return Err(Error::ShortPayload { need: off + 4, got: payload.len() });
+        return Err(Error::ShortPayload {
+            need: off + 4,
+            got: payload.len(),
+        });
     }
     let array_count = be32(payload, off) as usize;
     if array_count != ranges_count {
@@ -228,18 +247,27 @@ pub fn decode_laser_scan(payload: &[u8]) -> Result<LaserScan, Error> {
     let mut ranges = Vec::with_capacity(ranges_count);
     for _ in 0..ranges_count {
         if off + 4 > payload.len() {
-            return Err(Error::ShortPayload { need: off + 4, got: payload.len() });
+            return Err(Error::ShortPayload {
+                need: off + 4,
+                got: payload.len(),
+            });
         }
         ranges.push(bef32(payload, off));
         off += 4;
     }
     if off + 4 > payload.len() {
-        return Err(Error::ShortPayload { need: off + 4, got: payload.len() });
+        return Err(Error::ShortPayload {
+            need: off + 4,
+            got: payload.len(),
+        });
     }
     let intensity_count = be32(payload, off) as usize;
     off += 4;
     if off + 4 > payload.len() {
-        return Err(Error::ShortPayload { need: off + 4, got: payload.len() });
+        return Err(Error::ShortPayload {
+            need: off + 4,
+            got: payload.len(),
+        });
     }
     let bytes_count = be32(payload, off) as usize;
     if bytes_count != intensity_count {
@@ -249,23 +277,40 @@ pub fn decode_laser_scan(payload: &[u8]) -> Result<LaserScan, Error> {
     let mut intensities = Vec::with_capacity(intensity_count);
     for i in 0..intensity_count {
         if off + i >= payload.len() {
-            return Err(Error::ShortPayload { need: off + i + 1, got: payload.len() });
+            return Err(Error::ShortPayload {
+                need: off + i + 1,
+                got: payload.len(),
+            });
         }
         intensities.push(payload[off + i]);
     }
     off += intensity_count + ((4 - intensity_count % 4) % 4);
     if off + 4 > payload.len() {
-        return Err(Error::ShortPayload { need: off + 4, got: payload.len() });
+        return Err(Error::ShortPayload {
+            need: off + 4,
+            got: payload.len(),
+        });
     }
     let id = be32(payload, off);
-    Ok(LaserScan { min_angle, max_angle, resolution, max_range, ranges, intensities, id })
+    Ok(LaserScan {
+        min_angle,
+        max_angle,
+        resolution,
+        max_range,
+        ranges,
+        intensities,
+        id,
+    })
 }
 
 /// Decode a player_position2d_data_t payload (XDR).
 pub fn decode_position2d(payload: &[u8]) -> Result<Position2dState, Error> {
     // pose: 3 f64; vel: 3 f64; stall u8 (padded)
     if payload.len() < 49 {
-        return Err(Error::ShortPayload { need: 49, got: payload.len() });
+        return Err(Error::ShortPayload {
+            need: 49,
+            got: payload.len(),
+        });
     }
     Ok(Position2dState {
         x: bef64(payload, 0),
@@ -335,7 +380,12 @@ impl Client {
         put32(&mut req, 24, 0); // xdr_bytes inline count
 
         let header = MsgHeader {
-            addr: DevAddr { host: 0, robot: 0, interf: PLAYER_CODE, index: 0 },
+            addr: DevAddr {
+                host: 0,
+                robot: 0,
+                interf: PLAYER_CODE,
+                index: 0,
+            },
             msg_type: MSGTYPE_REQ,
             subtype: REQ_DEV,
             timestamp: 0.0,
@@ -356,12 +406,21 @@ impl Client {
         match reply.header.msg_type {
             MSGTYPE_RESP_ACK => Ok(reply.payload.get(19).copied().unwrap_or(0)),
             MSGTYPE_RESP_NACK => Err(Error::Nak),
-            t => Err(Error::UnexpectedReply { msg_type: t, subtype: reply.header.subtype }),
+            t => Err(Error::UnexpectedReply {
+                msg_type: t,
+                subtype: reply.header.subtype,
+            }),
         }
     }
 
     /// Send a position2d velocity command (player_position2d_cmd_vel_t).
-    pub fn send_velocity(&mut self, index: u16, vx: f64, vyaw: f64, state: u8) -> Result<(), Error> {
+    pub fn send_velocity(
+        &mut self,
+        index: u16,
+        vx: f64,
+        vyaw: f64,
+        state: u8,
+    ) -> Result<(), Error> {
         // pose: 3 f64; state u8 padded to 4
         let mut cmd = [0u8; 28];
         putf64(&mut cmd, 0, vx);
@@ -369,7 +428,12 @@ impl Client {
         putf64(&mut cmd, 16, vyaw);
         cmd[24] = state;
         let header = MsgHeader {
-            addr: DevAddr { host: 0, robot: 0, interf: POSITION2D_CODE, index },
+            addr: DevAddr {
+                host: 0,
+                robot: 0,
+                interf: POSITION2D_CODE,
+                index,
+            },
             msg_type: 2, // PLAYER_MSGTYPE_CMD
             subtype: 1,  // PLAYER_POSITION2D_CMD_VEL
             timestamp: 0.0,
@@ -418,13 +482,19 @@ pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
         payload
             .get(off..off + 4)
             .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
-            .ok_or(Error::ShortPayload { need: off + 4, got: payload.len() })
+            .ok_or(Error::ShortPayload {
+                need: off + 4,
+                got: payload.len(),
+            })
     };
     let rd_f32 = |off: usize| -> Result<f32, Error> {
         payload
             .get(off..off + 4)
             .map(|b| f32::from_be_bytes(b.try_into().unwrap()))
-            .ok_or(Error::ShortPayload { need: off + 4, got: payload.len() })
+            .ok_or(Error::ShortPayload {
+                need: off + 4,
+                got: payload.len(),
+            })
     };
     let mut off = 0;
     let max_range = rd_f32(off)?;
@@ -460,10 +530,21 @@ pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
     for i in 0..intensity_count {
         match payload.get(off + i) {
             Some(&b) => intensities.push(b),
-            None => return Err(Error::ShortPayload { need: off + i + 1, got: payload.len() }),
+            None => {
+                return Err(Error::ShortPayload {
+                    need: off + i + 1,
+                    got: payload.len(),
+                })
+            }
         }
     }
     off += intensity_count + ((4 - intensity_count % 4) % 4);
     let id = rd_u32(off)?;
-    Ok(LaserScanAngle { max_range, ranges, angles, intensities, id })
+    Ok(LaserScanAngle {
+        max_range,
+        ranges,
+        angles,
+        intensities,
+        id,
+    })
 }

@@ -25,7 +25,11 @@ pub const MAX_ANGULAR: f64 = 0.4;
 /// Clamp a command to the project limits; non-finite values become zero.
 pub fn clamp_velocity(vx: f64, vyaw: f64) -> (f64, f64) {
     fn limit(v: f64, max: f64) -> f64 {
-        if v.is_finite() { v.clamp(-max, max) } else { 0.0 }
+        if v.is_finite() {
+            v.clamp(-max, max)
+        } else {
+            0.0
+        }
     }
     (limit(vx, MAX_LINEAR), limit(vyaw, MAX_ANGULAR))
 }
@@ -43,7 +47,12 @@ pub struct DriveCommand {
 
 impl DriveCommand {
     pub fn new(timeout: Duration) -> Self {
-        DriveCommand { timeout, pending: None, last: None, moving: false }
+        DriveCommand {
+            timeout,
+            pending: None,
+            last: None,
+            moving: false,
+        }
     }
 
     /// Record a command from ROS (clamped); the latest one wins.

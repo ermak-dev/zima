@@ -32,11 +32,19 @@ fn main() {
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--mask" => {
-                        mask = u32::from_str_radix(it.next().expect("--mask HEX").trim_start_matches("0x"), 16)
-                            .expect("mask must be hex");
+                        mask = u32::from_str_radix(
+                            it.next().expect("--mask HEX").trim_start_matches("0x"),
+                            16,
+                        )
+                        .expect("mask must be hex");
                     }
                     "--timeout" => {
-                        timeout = Duration::from_secs(it.next().expect("--timeout SECS").parse().expect("timeout must be seconds"));
+                        timeout = Duration::from_secs(
+                            it.next()
+                                .expect("--timeout SECS")
+                                .parse()
+                                .expect("timeout must be seconds"),
+                        );
                     }
                     other => {
                         eprintln!("mask-owner: unknown argument {other}");
@@ -74,7 +82,11 @@ fn main() {
                 }
             };
             channel.drain().ok();
-            match channel.exchange(std::process::id() & 0xffff, MASK_STANDBY, Duration::from_secs(5)) {
+            match channel.exchange(
+                std::process::id() & 0xffff,
+                MASK_STANDBY,
+                Duration::from_secs(5),
+            ) {
                 Ok(()) => println!("mask-owner: standby restored"),
                 Err(e) => {
                     eprintln!("mask-owner: restore failed: {e}");
@@ -164,7 +176,9 @@ mod signal_handler {
         let rd = open(devnull.as_ptr(), 0);
         if rd >= 0 {
             dup2(rd, 0);
-            if rd != 0 { close(rd); }
+            if rd != 0 {
+                close(rd);
+            }
         }
         let mut wr = open(logpath.as_ptr(), 1 | 0o100 | 0o2000);
         if wr < 0 {
@@ -173,7 +187,9 @@ mod signal_handler {
         if wr >= 0 {
             dup2(wr, 1);
             dup2(wr, 2);
-            if wr > 2 { close(wr); }
+            if wr > 2 {
+                close(wr);
+            }
         }
     }
 }

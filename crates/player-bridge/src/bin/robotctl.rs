@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use player_bridge::{Client, Error, POSITION2D_CODE, POSITION2D_DATA_STATE, MSGTYPE_DATA};
+use player_bridge::{Client, Error, MSGTYPE_DATA, POSITION2D_CODE, POSITION2D_DATA_STATE};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -44,7 +44,10 @@ fn parse_duration(s: &str) -> f64 {
 }
 
 /// Wait up to `timeout` for one fresh position2d DATA message.
-fn read_position(client: &mut Client, timeout: Duration) -> Result<player_bridge::Position2dState, Error> {
+fn read_position(
+    client: &mut Client,
+    timeout: Duration,
+) -> Result<player_bridge::Position2dState, Error> {
     let deadline = Instant::now() + timeout;
     loop {
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
