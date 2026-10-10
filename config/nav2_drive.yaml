@@ -1,0 +1,46 @@
+# Overlay for Nav2 that actually drives: the playground (`robot run
+# --sim`) and the live vacuum (`robot run --slam`) use the same file, so
+# the sim route check (scripts/sim-route.sh) exercises the safety layer
+# that runs on the robot.
+#
+# The base config (nav2_replay.yaml) stubs the collision monitor out for
+# the offline replay. Here it takes its distro place, last in the chain:
+#   controller -> cmd_vel_nav -> velocity_smoother -> cmd_vel_smoothed
+#   -> collision_monitor -> cmd_vel (the bridge, or the sim robot)
+#
+# Approach, not stop: the monitor simulates the circular footprint along
+# the commanded velocity and slows the robot so a contact stays at least
+# time_before_collision away; it stops only right before one. A plain
+# stop circle would also forbid turning away from a wall the robot ended
+# up next to; a circle turning in place never sweeps into anything.
+# Beams nearer than the scan's range_min (0.15 m: empty beams, the LDS
+# turret) never count. min_points rejects a lone noisy beam.
+collision_monitor:
+  ros__parameters:
+    base_frame_id: base_link
+    odom_frame_id: odom
+    cmd_vel_in_topic: cmd_vel_smoothed
+    cmd_vel_out_topic: cmd_vel
+    state_topic: collision_monitor_state
+    transform_tolerance: 0.5
+    # LDS at 5 Hz: a scan older than a second counts as lost (the robot
+    # stops rather than drive on stale data).
+    source_timeout: 1.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    polygons: ['FootprintApproach']
+    FootprintApproach:
+      type: 'circle'
+      radius: 0.18
+      action_type: 'approach'
+      time_before_collision: 1.5
+      simulation_time_step: 0.1
+      min_points: 3
+      visualize: true
+      polygon_pub_topic: 'footprint_approach'
+      enabled: true
+    observation_sources: ['scan']
+    scan:
+      type: 'scan'
+      topic: '/scan'
+      enabled: true

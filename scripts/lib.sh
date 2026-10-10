@@ -19,6 +19,37 @@ open(sys.argv[2], 'w').write(
 PY
 }
 
+# Merge Nav2 params overlays, in order, into a base file (launches take a
+# single params file). Within each node, an overlay replaces whole keys of
+# ros__parameters. PyYAML is in the ROS desktop install; without it a
+# plain concatenation still works because overlays redefine whole
+# top-level sections only. <out> <base> <overlay>...
+nav2_params_merge() {
+    local out=$1 base=$2
+    shift 2
+    python3 - "$out" "$base" "$@" <<'PY' || cat "$base" "$@" >"$out"
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(10)
+out, base, overlays = sys.argv[1], sys.argv[2], sys.argv[3:]
+b = yaml.safe_load(open(base)) or {}
+for overlay in overlays:
+    o = yaml.safe_load(open(overlay)) or {}
+    for k, v in o.items():
+        if k in b and isinstance(b.get(k), dict) and isinstance(v, dict):
+            for k2, v2 in v.items():
+                if isinstance(v2, dict) and isinstance(b[k].get(k2), dict):
+                    b[k][k2].update(v2)
+                else:
+                    b[k][k2] = v2
+        else:
+            b[k] = v
+yaml.safe_dump(b, open(out, 'w'), sort_keys=False)
+PY
+}
+
 # Name the ROS session already running on this host, if any; returns 1
 # when there is none. Only one may run: two simulators fight over /clock
 # and node names, and next to the live bridge a simulator's Nav2 /cmd_vel

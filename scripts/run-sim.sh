@@ -34,7 +34,7 @@ if other=$(running_ros_session); then
 fi
 
 NAV_PARAMS=${ROBOT_SIM_PARAMS:-$repo/config/nav2_replay.yaml}
-OVERLAYS=("$repo/config/nav2_sim.yaml")
+OVERLAYS=("$repo/config/nav2_drive.yaml" "$repo/config/nav2_sim.yaml")
 [[ $SLAM == True ]] && OVERLAYS+=("$repo/config/slam_online.yaml")
 RVIZ=${ROBOT_SIM_RVIZ:-True}
 # Headless (no 3D window) for scripted/offline checks; RViz still opens
@@ -46,35 +46,9 @@ ROBOT_SDF=${ROBOT_SIM_ROBOT_SDF:-$repo/models/roborock_v1/model.sdf}
 ROBOT_URDF=$repo/models/roborock_v1/roborock_v1.urdf
 ROBOT_NAME=${ROBOT_SIM_ROBOT_NAME:-roborock_v1}
 
-# Merge the overlays, in order, into the base params (the launch takes one
-# file): PyYAML is in the ROS desktop install; if absent, plain-text concat
-# of the files also works because the overlays redefine whole top-level
-# sections only.
+# The launch takes one params file: merge the overlays into the base.
 merged=$(mktemp /tmp/robot-nav2-sim.XXXXXX.yaml)
-if python3 - "$merged" "$NAV_PARAMS" "${OVERLAYS[@]}" <<'PY'
-import sys
-try:
-    import yaml
-except ImportError:
-    sys.exit(10)
-out, base, overlays = sys.argv[1], sys.argv[2], sys.argv[3:]
-b = yaml.safe_load(open(base)) or {}
-for overlay in overlays:
-    o = yaml.safe_load(open(overlay)) or {}
-    for k, v in o.items():
-        if k in b and isinstance(b.get(k), dict) and isinstance(v, dict):
-            for k2, v2 in v.items():
-                if isinstance(v2, dict) and isinstance(b[k].get(k2), dict):
-                    b[k][k2].update(v2)
-                else:
-                    b[k][k2] = v2
-        else:
-            b[k] = v
-yaml.safe_dump(b, open(out, 'w'), sort_keys=False)
-PY
-then :; else
-    cat "$NAV_PARAMS" "${OVERLAYS[@]}" >"$merged"
-fi
+nav2_params_merge "$merged" "$NAV_PARAMS" "${OVERLAYS[@]}"
 NAV_PARAMS=$merged
 
 command -v ros2 >/dev/null || die 'ros2 is not in PATH; source ROS 2 Jazzy'
@@ -83,6 +57,7 @@ command -v ros2 >/dev/null || die 'ros2 is not in PATH; source ROS 2 Jazzy'
 pids=()
 sim_rc=0
 
+# shellcheck disable=SC2317  # runs from the traps below
 cleanup() {
     local status=$?
     # Swallow further Ctrl-C while tearing down; every step is bounded.

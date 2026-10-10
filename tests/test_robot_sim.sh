@@ -197,7 +197,18 @@ import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
 assert d['controller_server']['ros__parameters']['FollowPath']['desired_linear_vel'] == 0.06
 assert d['amcl']['ros__parameters']['initial_pose']['x'] == -2.0
-assert d['collision_monitor']['ros__parameters']['cmd_vel_out_topic'] == 'cmd_vel'
+# The drive overlay (shared with the live robot): the collision monitor
+# sits last in the distro chain and slows the robot down to stop before
+# a predicted contact of its circular footprint — a plain stop zone would
+# also forbid turning away from a wall it ended up next to. A scan older
+# than a second (LDS at 5 Hz) must count as lost.
+cm = d['collision_monitor']['ros__parameters']
+assert (cm['cmd_vel_in_topic'], cm['cmd_vel_out_topic']) == ('cmd_vel_smoothed', 'cmd_vel')
+zones = [cm[name] for name in cm['polygons']]
+assert any(z['action_type'] == 'approach' and z['type'] == 'circle' and z['radius'] >= 0.1725
+           and z['time_before_collision'] > 0 and z.get('enabled', True) for z in zones), zones
+assert cm['observation_sources'] == ['scan'] and cm['scan']['topic'] == '/scan'
+assert cm['source_timeout'] <= 1.0
 PY
 grep -q 'headless:=False' "$tmp/launch-args" || fail '3D world disabled by default'
 # The launch must be told to spawn the Roborock model and name it.
