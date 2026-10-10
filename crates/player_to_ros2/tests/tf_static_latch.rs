@@ -159,11 +159,21 @@ if stamp is None:
 # The odom->base_link TF carries the latest odometry time; resolving
 # odom->laser at that stamp requires the latched static transform to be
 # in the buffer — exactly what RViz's message filter needs at scan time.
-try:
-    buf.lookup_transform('odom', 'laser', rclpy.time.Time.from_msg(stamp))
-    print('LOOKUP OK')
-except Exception as e:
-    print(f'FAIL: odom->laser lookup failed: {e}'); sys.exit(1)
+# The probe's own /tf subscription can see that message before the
+# TransformListener stores it ("extrapolation into the future"), so keep
+# spinning until the buffer catches up with the very same stamp.
+error = None
+retry_until = node.get_clock().now() + rclpy.duration.Duration(seconds=2)
+while True:
+    try:
+        buf.lookup_transform('odom', 'laser', rclpy.time.Time.from_msg(stamp))
+        print('LOOKUP OK')
+        break
+    except Exception as e:
+        error = e
+    if node.get_clock().now() > retry_until:
+        print(f'FAIL: odom->laser lookup failed: {error}'); sys.exit(1)
+    rclpy.spin_once(node, timeout_sec=0.05)
 "#;
     {
         use std::io::Write;
