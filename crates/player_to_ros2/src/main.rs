@@ -4,6 +4,12 @@
 //!   position2d:0  -> /odom   (nav_msgs/Odometry)
 //!   /cmd_vel      -> velocity commands to position2d:0
 //!
+//! Drive safety (player_bridge::drive): every /cmd_vel is clamped to the
+//! project limits (0.1 m/s, 0.4 rad/s), only the latest command is sent,
+//! and a command holds for `cmd_vel_timeout_s` (default 1 s): when the
+//! sender goes quiet, the wheels get one zero. Player alone would keep
+//! the last velocity forever.
+//!
 //! Safety notes carried over from the platform survey:
 //! - The Player odometry frame is unknown until verified live; frame_ids
 //!   default to "odom"/"laser" and are ROS parameters.
@@ -13,13 +19,14 @@
 use std::io::Write;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rclrs::*;
 use ros_env::sensor_msgs::msg::LaserScan;use ros_env::nav_msgs::msg::Odometry;
 use ros_env::tf2_msgs::msg::TFMessage;
 use ros_env::geometry_msgs::msg::{Transform, TransformStamped, Vector3};
 
+use player_bridge::drive::{DriveCommand, MAX_ANGULAR, MAX_LINEAR};
 use player_bridge::{
     decode_position2d, decode_laser_scanangle, Client, Error as PlayerError, LaserScanAngle,
     Position2dState, LASER_CODE, LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE,
@@ -69,6 +76,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .declare_parameter("laser_y")
         .default(0.0)
         .mandatory()?;
+    // Command lease: how long one /cmd_vel keeps the wheels turning. Nav2
+    // publishes at 20 Hz; teleop key autorepeat starts after ~0.5 s.
+    let cmd_vel_timeout_s: rclrs::MandatoryParameter<f64> = node
+        .declare_parameter("cmd_vel_timeout_s")
+        .default(1.0)
+        .mandatory()?;
     let laser_yaw_deg: rclrs::MandatoryParameter<f64> = node
         .declare_parameter("laser_yaw_deg")
         .default(97.6)
@@ -77,8 +90,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Player reader thread: decodes wire messages, forwards them, and
     // flushes outgoing velocity commands between reads.
     let (tx, rx): (_, Receiver<BridgeEvent>) = std::sync::mpsc::channel();
-    let cmd_queue: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
-    let cmd_queue_reader = cmd_queue.clone();
+    let lease = Duration::from_secs_f64(cmd_vel_timeout_s.get().clamp(0.05, 5.0));
+    let drive = Arc::new(Mutex::new(DriveCommand::new(lease)));
+    let drive_reader = drive.clone();
 
     let host = host.get().to_string();
     let port = u16::try_from(port.get()).unwrap_or(6665);
@@ -123,15 +137,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             client.subscribe(LASER_CODE, 0)?;
             client.subscribe(POSITION2D_CODE, 0)?;
             loop {
-                loop {
-                    let next = {
-                        let mut q = cmd_queue_reader.lock().unwrap();
-                        if q.is_empty() { None } else { Some(q.remove(0)) }
-                    };
-                    match next {
-                        Some((vx, vyaw)) => client.send_velocity(0, vx, vyaw, 1)?,
-                        None => break,
-                    }
+                // Between reads (Player streams odometry at 20+ Hz): the
+                // latest command, or the stop once its lease lapsed.
+                let next = drive_reader.lock().unwrap().next(Instant::now());
+                if let Some((vx, vyaw)) = next {
+                    client.send_velocity(0, vx, vyaw, 1)?;
                 }
                 let msg = client.read_message()?;
                 match (msg.header.msg_type, msg.header.addr.interf, msg.header.subtype) {
@@ -194,9 +204,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscription = node.create_subscription(
         "/cmd_vel",
         move |msg: ros_env::geometry_msgs::msg::Twist| {
-            cmd_queue.lock().unwrap().push((msg.linear.x, msg.angular.z));
+            drive.lock().unwrap().set(msg.linear.x, msg.angular.z, Instant::now());
         },
     )?;
+    log_info!(
+        node.logger(),
+        "cmd_vel clamped to {} m/s, {} rad/s; lease {:?}",
+        MAX_LINEAR,
+        MAX_ANGULAR,
+        lease
+    );
 
     let _ = tf_static_pub.publish(&static_tf);
     let mut last_report = std::time::Instant::now();

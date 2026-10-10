@@ -15,6 +15,8 @@
 //! client.c of the locally built Player 3.1 tree; the integration test
 //! runs against that real server (see tests/against_server.rs).
 
+pub mod drive;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
