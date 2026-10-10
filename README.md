@@ -137,6 +137,9 @@ robot run --sim               # офлайн-плейграунд Nav2 (Gazebo T
                               #   клик-цель в RViz, лимиты как у робота
 robot run --sim --slam        # то же, но карта строится по ходу езды
                               #   (SLAM Toolbox вместо готовой карты)
+robot run --slam              # живой робот: клик-цель в RViz, Nav2 едет,
+                              #   SLAM строит карту; карта сохраняется
+                              #   при выходе (см. «Шаг 3»)
 
 robot snapshot ./frame.jpg    # кадр с OpenIPC-камеры (HTTP Basic)
 
@@ -213,9 +216,7 @@ ros2 run nav2_map_server map_saver_cli -f ~/robot/maps/<имя> \
     --ros-args -p use_sim_time:=true
 ```
 
-На живом роботе `robot run --slam` пока отказывает: сначала нужен допуск
-привода (этап 4 `PLAN.md`: ограничение скорости и срок действия команды в
-мосте).
+То же на живом роботе — `robot run --slam` (см. «Шаг 3»).
 
 #### Живой робот `robot run`
 
@@ -256,34 +257,37 @@ bash ~/robot/scripts/slam-from-bag.sh     # пишет в ~/robot/maps/
 > Если запись сделана мостом до фикса штампов времени, прогоните
 > `python3 scripts/stamp_bag.py <bag>` — он проставит корректные метки.
 
-### Шаг 3. Поездка в точку (Nav2)
-
-При живой сессии `robot bridge` поднимаем стек навигации:
+### Шаг 3. Поездка в точку с картографией (`robot run --slam`)
 
 ```sh
-ros2 launch nav2_bringup bringup_launch.py \
-    map:=$HOME/robot/maps/mapping_drive_20261004.yaml \
-    params_file:=$HOME/robot/config/nav2_replay.yaml \
-    use_sim_time:=false autostart:=true
+robot run --slam
 ```
 
-Затем — цель:
+Одна команда поднимает надзорный мост (`robot bridge`), затем SLAM Toolbox
+и Nav2 (`navigation_launch.py`, без симуляционного времени) с параметрами
+`nav2_replay.yaml` + `nav2_drive.yaml` + `slam_online.yaml` и открывает
+RViz со сценой Nav2 (фрейм `map`). Кнопка **2D Goal Pose** → клик по
+карте → робот едет, карта растёт. Телепульта в этом режиме нет: он
+перебивал бы Nav2 на `/cmd_vel`.
 
-```sh
-ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
-  "{pose: {header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0}, \
-   orientation: {w: 1.0}}}}"
-```
+Скорость до колёс проходит четыре слоя: контроллер RPP (0.06 м/с,
+0.3 рад/с) → сглаживатель скоростей (потолок для всех источников Nav2,
+включая поведения восстановления) → монитор столкновений (режим
+`approach`: замедляет так, чтобы до контакта круглого следа оставалось
+≥ 1.5 с; скан старше 1 с — остановка) → мост (лимит 0.1 м/с и 0.4 рад/с,
+срок команды 1 с). Гибель моста или сети по-прежнему ловит супервизор на
+роботе (~5 с).
 
-Наблюдение в RViz:
+**Закрытие RViz** (или Ctrl-C, или гибель моста) завершает сессию в
+порядке: Nav2 → нулевая скорость → сохранение карты в
+`maps/live-<дата-время>.{yaml,pgm}` → SLAM и мост → проверка, что вернулся
+`RoboController`. Окружение: `ROBOT_MAP_OUT` (путь карты без расширения),
+`ROBOT_SLAM_RVIZ_CONFIG`, `ROBOT_NAV_TRIES`, `ROBOT_RUN_LOG`.
 
-```sh
-ros2 run rviz2 rviz2     # топики /map, /scan, costmaps, TF-дерево
-```
-
-> **Сейчас `/cmd_vel` от Nav2 на реальные колёса не подаётся** — это
-> следующий барьер плана. Стек проверяется офлайн на записи, где команды
-> уходят в приёмник, а не на робота:
+Ограничения: LDS стоит сверху и **не видит низкие препятствия**, датчики
+края (cliff) и бампер в ROS не проброшены — у лестниц и порогов не
+отпускайте робота без присмотра. Поездка по готовой карте с AMCL одной
+командой пока не оформлена; офлайн-проверка стека на записи:
 
 ```sh
 bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
@@ -303,11 +307,14 @@ bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
 | `scripts/run-rviz.sh` | сессия `robot run`: мост + RViz + телепульт |
 | `scripts/run-sim.sh` | плейграунд `robot run --sim`: Gazebo + Nav2 |
 | `models/roborock_v1/` | SDF/URDF-модель пылесоса для плейграунда (frames как у моста) |
-| `config/nav2_sim.yaml` | оверлей Nav2 для симуляции (точка спавна, cmd_vel-цепочка) |
+| `config/nav2_drive.yaml` | оверлей «Nav2 едет»: цепочка до `/cmd_vel` и монитор столкновений (симуляция и живой робот) |
+| `config/nav2_sim.yaml` | оверлей Nav2 для симуляции (точка спавна AMCL) |
 | `config/rviz_teleop.rviz` | RViz-сцена для `robot run` (лидар, одометрия, TF) |
 | `scripts/slam-from-bag.sh` | bag → карта |
 | `scripts/slam-offline.sh` | bag → SLAM с проверками по стадиям |
 | `scripts/nav2-replay.sh` | bag → Nav2 → `/cmd_vel` в файл (без робота) |
+| `scripts/sim-route.sh` | проверка Nav2 в симуляции: маршрут из 4 целей, вердикт |
+| `ros2/route_check.py` | клиент маршрута (NavigateToPose, отчёт, снимки карт) |
 | `scripts/amcl-replay.sh` | локализация на карте против bag'а |
 | `scripts/stamp_bag.py` | проставить нулевые метки времени в старых bag'ах |
 | `ros2/odom_tf_replay.py` | odom → TF для записей без `/tf` |
@@ -344,6 +351,12 @@ python3 tests/test_robot_bug.py
 bash tests/test_robot_owner.sh
 bash tests/test_robot_run.sh
 bash tests/test_robot_sim.sh
+bash tests/test_robot_route.sh
+
+# проверка Nav2 в headless-симуляции (Gazebo, ~3 мин на режим): маршрут
+# из 4 целей; код 0 — все цели достигнуты, снимки карт в /tmp/robot-route
+bash scripts/sim-route.sh            # готовая карта + AMCL
+bash scripts/sim-route.sh --slam     # онлайн-SLAM
 
 # линтер
 shellcheck bin/robot bin/camera/snapshot tests/*.sh scripts/*.sh tools/*.sh
@@ -356,6 +369,11 @@ shellcheck bin/robot bin/camera/snapshot tests/*.sh scripts/*.sh tools/*.sh
 * **Не отправляйте движение, не снимайте контроллер и не меняйте робота без
   явной необходимости.** Для рутинной проверки используйте локальные фейки.
 * Робот ездит **не быстрее 0.1 м/с / 0.4 рад/с** и не дольше 2 с за команду.
+  Мост сам ограничивает этими лимитами любой `/cmd_vel` и держит команду не
+  дольше 1 с; Nav2 дополнительно ограничен 0.06 м/с / 0.3 рад/с.
+* `robot run --slam` — автономная езда по клику. Монитор столкновений
+  видит только то, что видит LDS: низкие препятствия, ступеньки и обрывы
+  он не замечает. Первые поездки — в свободной зоне и под присмотром.
 * `robot move` дополнительно взводит на роботе 10-секундный guard: если
   команда не завершилась штатно, Player принудительно перезапускается.
   **Это не гарантия мгновенной остановки** — держите робота в свободной зоне
