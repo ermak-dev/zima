@@ -15,8 +15,11 @@
 //! client.c of the locally built Player 3.1 tree; the integration test
 //! runs against that real server (see tests/against_server.rs).
 
+pub mod bumper;
 pub mod drive;
 pub mod scan;
+
+pub use bumper::{decode_bumper, BumperState, BUMPER_CODE, BUMPER_DATA_STATE};
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

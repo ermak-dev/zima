@@ -1,6 +1,7 @@
 //! player_to_ros2: bridge the vacuum's Player server into ROS 2.
 //!
 //!   laser:0       -> /scan   (sensor_msgs/LaserScan)
+//!   bumper:0      -> /bumper (std_msgs/Bool, any segment pressed)
 //!   position2d:0  -> /odom   (nav_msgs/Odometry)
 //!   /cmd_vel      -> velocity commands to position2d:0
 //!
@@ -30,15 +31,17 @@ use ros_env::tf2_msgs::msg::TFMessage;
 use player_bridge::drive::{DriveCommand, MAX_ANGULAR, MAX_LINEAR};
 use player_bridge::scan::uniform_scan;
 use player_bridge::{
-    decode_laser_scanangle, decode_position2d, Client, Error as PlayerError, LaserScanAngle,
-    Position2dState, LASER_CODE, LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE,
-    POSITION2D_DATA_STATE,
+    decode_bumper, decode_laser_scanangle, decode_position2d, Client, Error as PlayerError,
+    LaserScanAngle, Position2dState, BUMPER_CODE, BUMPER_DATA_STATE, LASER_CODE,
+    LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE, POSITION2D_DATA_STATE,
 };
 
 /// A decoded Player message handed from the reader thread to the ROS loop.
 enum BridgeEvent {
     Scan(LaserScanAngle),
     Odom(Position2dState),
+    /// Bumper segments pressed, on change only.
+    Bumper(Vec<bool>),
     ProtocolError(String),
 }
 
@@ -93,7 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lease = Duration::from_secs_f64(cmd_vel_timeout_s.get().clamp(0.05, 5.0));
     let drive = Arc::new(Mutex::new(DriveCommand::new(lease)));
     let drive_reader = drive.clone();
-
     let host = host.get().to_string();
     let port = u16::try_from(port.get()).unwrap_or(6665);
     let laser_frame: String = laser_frame.get().to_string();
@@ -134,11 +136,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     });
 
+    // Latest bumper state, shared with the reader thread for change detection.
+    let bumper_state = Arc::new(Mutex::new(None));
+    let bumper_state_reader = bumper_state.clone();
+
     let reader = std::thread::spawn(move || {
         let run = || -> Result<(), PlayerError> {
             let mut client = Client::connect(&host, port)?;
             client.subscribe(LASER_CODE, 0)?;
             client.subscribe(POSITION2D_CODE, 0)?;
+            client.subscribe(BUMPER_CODE, 0)?;
             loop {
                 // Between reads (Player streams odometry at 20+ Hz): the
                 // latest command, or the stop once its lease lapsed.
@@ -168,6 +175,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return Ok(());
                         }
                     }
+                    (MSGTYPE_DATA, BUMPER_CODE, BUMPER_DATA_STATE) => {
+                        // Publish on change only: the vendor driver streams
+                        // the same frame; consumers care about transitions.
+                        let pressed = decode_bumper(&msg.payload)?.pressed;
+                        let mut last = bumper_state_reader.lock().unwrap();
+                        if last.as_ref() != Some(&pressed) {
+                            *last = Some(pressed.clone());
+                            drop(last);
+                            if tx.send(BridgeEvent::Bumper(pressed)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
                     _ => {} // other interfaces: ignore
                 }
             }
@@ -177,6 +197,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Latched: a late subscriber (RViz opened later, a recovery node
+    // starting up) immediately learns the current bumper state.
+    let bumper_pub = node.create_publisher("/bumper".transient_local())?;
     let scan_pub = node.create_publisher::<LaserScan>("/scan")?;
     let odom_pub = node.create_publisher::<Odometry>("/odom")?;
     let tf_pub = node.create_publisher::<TFMessage>("/tf")?;
@@ -256,6 +279,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ros_scan.ranges = grid.ranges;
                     ros_scan.intensities = grid.intensities;
                     let _ = scan_pub.publish(&ros_scan);
+                }
+                Ok(BridgeEvent::Bumper(pressed)) => {
+                    let mut msg = ros_env::std_msgs::msg::Bool::default();
+                    msg.data = pressed.iter().any(|&p| p);
+                    let _ = bumper_pub.publish(&msg);
                 }
                 Ok(BridgeEvent::Odom(state)) => {
                     let mut odom = Odometry::default();
