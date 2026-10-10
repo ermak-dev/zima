@@ -28,7 +28,19 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: true
     stop_pub_timeout: 2.0
-    polygons: ['FootprintApproach']
+    # Hard stop: any beam inside the 0.175 m circle stops the robot from
+    # any direction. Approach alone slows only along the simulated motion
+    # path — beams meeting the circle at a shallow angle while driving
+    # forward were not enough to prevent the first live bumper contact.
+    polygons: ['PolygonStop', 'FootprintApproach']
+    PolygonStop:
+      type: 'circle'
+      radius: 0.175
+      action_type: 'stop'
+      min_points: 3
+      visualize: true
+      polygon_pub_topic: 'polygon_stop'
+      enabled: true
     FootprintApproach:
       type: 'circle'
       radius: 0.18
