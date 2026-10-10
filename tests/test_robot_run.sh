@@ -335,4 +335,107 @@ wait "$subshell" 2>/dev/null || true
 assert_log 'robot-bridge:term'
 grep -q '\[robot run\] done' "$tmp/out" || fail 'teardown aborted by second Ctrl-C'
 
+# --- --slam: drive by clicked goals while mapping (live Nav2 + SLAM) ---
+# Bridge, then SLAM Toolbox and Nav2 (wall clock, merged live params),
+# then RViz with the Nav2 view; no teleop (it would fight Nav2 for
+# /cmd_vel). Teardown: Nav2 first (no new commands), zero /cmd_vel, save
+# the map while SLAM still runs, then SLAM and the bridge.
+cat > "$tmp/fake-bin/robot" <<'EOF'
+#!/usr/bin/env bash
+printf 'robot:%s %s\n' "$1" "${*:2}" >> "$ROBOT_TEST_LOG"
+case $1 in
+    bridge)
+        touch "$ROBOT_TEST_DIR/scan-ready"
+        trap 'printf "robot-bridge:term\n" >> "$ROBOT_TEST_LOG"; exit 0' TERM
+        sleep 600 &
+        wait $!
+        ;;
+    status) printf 'enabled\n' ;;
+esac
+EOF
+cat > "$tmp/fake-bin/ros2" <<'EOF'
+#!/usr/bin/env bash
+printf 'ros2:%s\n' "$*" >> "$ROBOT_TEST_LOG"
+snapshot() {  # the wrapper deletes its merged params on teardown
+    local a
+    for a in "$@"; do
+        case $a in *params_file:=*) cp "${a#*params_file:=}" "$ROBOT_TEST_DIR/$1-params.yaml" ;; esac
+    done
+}
+case "$1 $2" in
+    'topic echo') [[ -e $ROBOT_TEST_DIR/scan-ready ]] || exit 1 ;;
+    'launch slam_toolbox')
+        snapshot slam "$@"
+        trap 'printf "slam:term\n" >> "$ROBOT_TEST_LOG"; rm -f "$ROBOT_TEST_DIR/slam-up"; exit 0' TERM
+        touch "$ROBOT_TEST_DIR/slam-up"
+        sleep 600 & wait $! ;;
+    'launch nav2_bringup')
+        snapshot nav "$@"
+        trap 'printf "nav:term\n" >> "$ROBOT_TEST_LOG"; exit 0' TERM
+        sleep 600 & wait $! ;;
+    'lifecycle get') printf '%s\n' "${ROBOT_FAKE_NAV_STATE:-active [3]}" ;;
+    'run nav2_map_server')
+        if [[ -e $ROBOT_TEST_DIR/slam-up ]]; then printf 'map-saved:slam-alive\n' >> "$ROBOT_TEST_LOG"; fi ;;
+    'run robot_state_publisher')
+        trap 'exit 0' TERM
+        sleep 600 & wait $! ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/fake-bin/robot" "$tmp/fake-bin/ros2"
+: > "$tmp/slam.rviz"
+: > "$ROBOT_TEST_LOG"; rm -f "$tmp/scan-ready" "$tmp/slam-up" "$tmp/"*-params.yaml
+run_session DISPLAY=:99 ROBOT_FAKE_RVIZ_SECS=2 ROBOT_SLAM_RVIZ_CONFIG="$tmp/slam.rviz" \
+    ROBOT_MAP_OUT="$tmp/maps/live" \
+    bash "$root/scripts/run-rviz.sh" --slam >"$tmp/out" 2>&1 \
+    || fail "slam session exited nonzero: $(cat "$tmp/out")"
+assert_log 'ros2:launch slam_toolbox online_sync_launch.py'
+assert_log 'ros2:launch nav2_bringup navigation_launch.py'
+grep -F 'ros2:launch nav2_bringup' "$ROBOT_TEST_LOG" | grep -q 'use_sim_time:=false' || fail 'Nav2 on sim time'
+grep -F 'ros2:launch slam_toolbox' "$ROBOT_TEST_LOG" | grep -q 'use_sim_time:=false' || fail 'SLAM on sim time'
+assert_log "rviz2:-d $tmp/slam.rviz"
+if grep -Fq 'teleop' "$ROBOT_TEST_LOG"; then fail 'teleop started next to Nav2'; fi
+if grep -Fq 'gnome-terminal' "$ROBOT_TEST_LOG"; then fail 'teleop window opened next to Nav2'; fi
+cmp -s "$tmp/nav-params.yaml" "$tmp/slam-params.yaml" || fail 'SLAM and Nav2 got different params'
+python3 - "$tmp/nav-params.yaml" <<'PY' || fail 'live params are not base + drive + online SLAM'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+assert d['controller_server']['ros__parameters']['FollowPath']['plugin'].endswith('RegulatedPurePursuitController')
+cm = d['collision_monitor']['ros__parameters']
+assert cm['cmd_vel_out_topic'] == 'cmd_vel'
+assert cm[cm['polygons'][0]]['action_type'] == 'approach'
+s = d['slam_toolbox']['ros__parameters']
+assert s['base_frame'] == 'base_link' and s['mode'] == 'mapping'
+# No simulator overlay on the robot.
+assert d['amcl']['ros__parameters']['initial_pose']['x'] != -2.0
+PY
+for step in 'rviz2:-d' 'nav:term' 'ros2:topic pub -1 /cmd_vel' 'map-saved:slam-alive' 'robot-bridge:term' 'robot:status'; do
+    n=$(line_of "$step")
+    [[ -n $n ]] || fail "slam session never reached: $step"
+    (( n > ${prev:-0} )) || fail "slam teardown out of order at: $step"
+    prev=$n
+done
+unset prev
+(( $(line_of 'map-saved:slam-alive') < $(line_of 'slam:term') )) || fail 'SLAM stopped before the map was saved'
+assert_log "ros2:run nav2_map_server map_saver_cli -f $tmp/maps/live"
+grep -q "map saved" "$tmp/out" || fail 'map save not reported'
+
+# --- --slam: Nav2 never comes up: no RViz, the robot is handed back ---
+: > "$ROBOT_TEST_LOG"; rm -f "$tmp/scan-ready" "$tmp/slam-up"
+status=0
+run_session DISPLAY=:99 ROBOT_SLAM_RVIZ_CONFIG="$tmp/slam.rviz" ROBOT_MAP_OUT="$tmp/maps/live" \
+    ROBOT_FAKE_NAV_STATE='inactive [2]' ROBOT_NAV_TRIES=2 \
+    bash "$root/scripts/run-rviz.sh" --slam >"$tmp/out" 2>&1 || status=$?
+[[ $status == 3 ]] || fail "nav-down session exited $status, want 3"
+if grep -Fq 'rviz2:' "$ROBOT_TEST_LOG"; then fail 'RViz opened without Nav2'; fi
+assert_log 'robot-bridge:term'
+grep -q 'Nav2 did not come up' "$tmp/out" || fail 'nav-down message missing'
+
+# --- unknown option: refuse before the bridge starts ---
+: > "$ROBOT_TEST_LOG"
+status=0
+run_session bash "$root/scripts/run-rviz.sh" --bogus >"$tmp/out" 2>&1 || status=$?
+[[ $status == 2 ]] || fail "unknown option exited $status, want 2"
+if grep -Fq 'robot:bridge' "$ROBOT_TEST_LOG"; then fail 'bridge started on a bad option'; fi
+
 printf 'robot run session tests passed\n'

@@ -4,8 +4,19 @@
 # Closing the RViz window (or Ctrl-C here, or the bridge dying) stops the
 # robot and hands the vacuum back to its stock controller via the on-robot
 # supervisor. Closing the teleop window alone does not end the session.
+# --slam: instead of teleop, SLAM Toolbox and Nav2 run on the live robot:
+# click goals in RViz and the map grows as it drives; the map is saved on
+# exit. Velocity reaches the wheels through the drive overlay's collision
+# monitor and the bridge's clamp and command lease.
 # (no set -u: ROS setup scripts reference unbound vars)
 set -eo pipefail
+SLAM=0
+for arg in "$@"; do
+    case $arg in
+        --slam) SLAM=1 ;;
+        *) echo "robot run: unknown option: $arg (usage: run-rviz.sh [--slam])" >&2; exit 2 ;;
+    esac
+done
 ROS_SETUP=${ROBOT_ROS_SETUP:-/opt/ros/jazzy/setup.sh}
 WS_SETUP=${ROBOT_WS_SETUP:-$HOME/robot/ros-ws/install/setup.sh}
 # shellcheck source=/dev/null
@@ -26,6 +37,12 @@ TELEOP_SPEED=${ROBOT_TELEOP_SPEED:-0.1}
 TELEOP_TURN=${ROBOT_TELEOP_TURN:-0.4}
 RVIZ_CONFIG=${ROBOT_RVIZ_CONFIG:-$repo/config/rviz_teleop.rviz}
 RUN_LOG=${ROBOT_RUN_LOG:-/tmp/robot-run.log}
+# --slam: the Nav2 view (fixed frame map, goal tool, costmaps) and where
+# the map lands on exit (.yaml + .pgm).
+if (( SLAM )); then
+    RVIZ_CONFIG=${ROBOT_SLAM_RVIZ_CONFIG:-$(dirname "$ROS_SETUP")/share/nav2_bringup/rviz/nav2_default_view.rviz}
+fi
+MAP_OUT=${ROBOT_MAP_OUT:-$repo/maps/live-$(date +%Y%m%d-%H%M%S)}
 
 banner() { printf '\n[robot run] %s\n' "$*"; }
 die() { echo "robot run: $*" >&2; exit 2; }
@@ -43,12 +60,28 @@ fi
 
 pids=()
 BRIDGE_PID=
+NAV_PID=
+SLAM_PID=
 session_rc=0
 
-# Teardown order: zero /cmd_vel while the bridge still forwards it (the
-# last Player velocity command persists until replaced), stop every
-# component, then wait for the on-robot supervisor to restore the stock
-# controller and verify it did.
+# shellcheck disable=SC2317  # runs from cleanup (the traps)
+save_map() {
+    banner "saving the map to $MAP_OUT.yaml"
+    mkdir -p "$(dirname "$MAP_OUT")"
+    if timeout 30 ros2 run nav2_map_server map_saver_cli -f "$MAP_OUT" \
+        --ros-args -p use_sim_time:=false >>"$RUN_LOG" 2>&1; then
+        banner "map saved: $MAP_OUT.yaml"
+    else
+        echo "robot run: WARNING: the map was not saved; see $RUN_LOG" >&2
+    fi
+}
+
+# Teardown order: Nav2 first (nothing issues new velocity commands after
+# it), zero /cmd_vel while the bridge still forwards it (the bridge lease
+# would zero the wheels within a second anyway), save the SLAM map while
+# SLAM still runs, stop every component, then wait for the on-robot
+# supervisor to restore the stock controller and verify it did.
+# shellcheck disable=SC2317  # runs from the traps below
 cleanup() {
     local status=$?
     # Swallow further Ctrl-C while tearing down: every step here is
@@ -60,14 +93,17 @@ cleanup() {
     (( session_rc )) || session_rc=$status
     rm -f "${RSP_PARAMS:-}"
     banner "teardown ($component)"
+    if [[ -n $NAV_PID ]]; then stop_components "$NAV_PID"; fi
     if [[ -n $BRIDGE_PID ]] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         timeout 5 ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist \
             '{linear: {x: 0.0}, angular: {z: 0.0}}' >/dev/null 2>&1 || true
     fi
+    if [[ -n $SLAM_PID ]] && kill -0 "$SLAM_PID" 2>/dev/null; then save_map; fi
     # The teleop node runs under the desktop terminal server, outside any
     # process group we can address: stop it by command line.
     pkill -TERM -f 'teleop_twist_keyboard --ros-args' 2>/dev/null || true
     stop_components "${pids[@]}"
+    rm -f "${NAV_PARAMS:-}"
     # The robot is stopping/rolled back by now (the bridge TERM reached the
     # supervisor); what follows is only verification. A further Ctrl-C may
     # skip it, but never skips the kill above.
@@ -121,6 +157,36 @@ if (( ! scan_seen )); then
 fi
 banner 'lidar stream ok'
 
+if (( SLAM )); then
+    # One params file for both: the base, the drive overlay (driving chain,
+    # collision monitor) and online SLAM. No simulator overlay.
+    NAV_PARAMS=$(mktemp /tmp/robot-live-nav2.XXXXXX.yaml)
+    nav2_params_merge "$NAV_PARAMS" "$repo/config/nav2_replay.yaml" \
+        "$repo/config/nav2_drive.yaml" "$repo/config/slam_online.yaml"
+    banner 'starting SLAM Toolbox and Nav2'
+    setsid ros2 launch slam_toolbox online_sync_launch.py \
+        slam_params_file:="$NAV_PARAMS" use_sim_time:=false >>"$RUN_LOG" 2>&1 &
+    SLAM_PID=$!
+    pids+=("$SLAM_PID")
+    setsid ros2 launch nav2_bringup navigation_launch.py \
+        params_file:="$NAV_PARAMS" use_sim_time:=false autostart:=true >>"$RUN_LOG" 2>&1 &
+    NAV_PID=$!
+    pids+=("$NAV_PID")
+    nav_up=0
+    for _ in $(seq 1 "${ROBOT_NAV_TRIES:-45}"); do
+        if [[ $(timeout 5 ros2 lifecycle get /bt_navigator 2>/dev/null) == active* ]]; then
+            nav_up=1; break
+        fi
+        kill -0 "$NAV_PID" 2>/dev/null || break
+        sleep 2
+    done
+    if (( ! nav_up )); then
+        echo "robot run: Nav2 did not come up; see $RUN_LOG" >&2
+        exit 3
+    fi
+    banner 'Nav2 active'
+fi
+
 # Serve the vacuum model to RViz's RobotModel display. Single-link URDF
 # via a params file; it publishes no TF that could fight the bridge.
 RSP_PARAMS=$(mktemp /tmp/robot-live-rsp.XXXXXX.yaml)
@@ -147,7 +213,11 @@ teleop_cmd() {
     printf '\n'
 }
 
-if [[ -n ${DISPLAY:-} ]] && command -v gnome-terminal >/dev/null; then
+if (( SLAM )); then
+    # No teleop: it would fight Nav2 for /cmd_vel.
+    banner "click \"2D Goal Pose\" in RViz to drive; the map grows as the robot moves and is saved to $MAP_OUT.yaml on exit"
+    wait -n "$BRIDGE_PID" "$RVIZ_PID" || true
+elif [[ -n ${DISPLAY:-} ]] && command -v gnome-terminal >/dev/null; then
     setsid gnome-terminal --wait --title='robot teleop (WASD; close RViz to end)' \
         -- bash -c "$(teleop_cmd)" >>"$RUN_LOG" 2>&1 &
     TELEOP_PID=$!
