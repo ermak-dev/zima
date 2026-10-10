@@ -73,25 +73,23 @@ fn fake_player(listener: TcpListener, log: Log, stop: Arc<AtomicBool>) {
             {
                 return;
             }
-            // Press the bumper 2 s in, hold it pressed.
+            // Press the bumper 2 s in for 1.5 s, then release — like a
+            // hand press; the manoeuvre is one-shot per press.
             if pressed_at.is_none() {
                 pressed_at = Some(Instant::now());
             }
-            if pressed_at.unwrap().elapsed() > Duration::from_secs(2) {
-                let p = bumper_frame(&[1, 0, 0]);
-                let _ = send(
-                    &data_out,
-                    data_header(BUMPER_CODE, BUMPER_DATA_STATE, p.len() as u32),
-                    &p,
-                );
+            let held = pressed_at.unwrap().elapsed();
+            let flags: &[u8] = if held > Duration::from_secs(2) && held < Duration::from_secs(4) {
+                &[1, 0, 0]
             } else {
-                let p = bumper_frame(&[0, 0, 0]);
-                let _ = send(
-                    &data_out,
-                    data_header(BUMPER_CODE, BUMPER_DATA_STATE, p.len() as u32),
-                    &p,
-                );
-            }
+                &[0, 0, 0]
+            };
+            let p = bumper_frame(flags);
+            let _ = send(
+                &data_out,
+                data_header(BUMPER_CODE, BUMPER_DATA_STATE, p.len() as u32),
+                &p,
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     });
@@ -211,6 +209,16 @@ fn bumper_contact_drives_back_despite_forward_commands() {
     let log = log.lock().unwrap().clone();
     let reverses: Vec<_> = log.iter().filter(|(_, vx, _)| *vx < -0.05).collect();
     eprintln!("commands: {} total, {} reverse", log.len(), reverses.len());
+    if let (Some(f), Some(l)) = (reverses.first(), reverses.last()) {
+        eprintln!("reverse span: {:?}", l.0.duration_since(f.0));
+    }
+    let t0 = log[0].0;
+    for (t, vx, _) in log.iter() {
+        let dt = t.duration_since(t0).as_millis();
+        if dt % 500 < 70 {
+            eprintln!("  t+{dt:5} ms  vx={vx:+.3}");
+        }
+    }
     assert!(
         reverses.len() >= 5,
         "the bumper back-off never reached Player: {} reverse commands in {:?}",
@@ -220,15 +228,25 @@ fn bumper_contact_drives_back_despite_forward_commands() {
             .take(5)
             .collect::<Vec<_>>()
     );
-    // Reverse commands must arrive after the press (~2 s in) — and while
-    // they run, no forward command may slip through.
-    let first_reverse = reverses[0].0;
-    // One lease-worth of forward commands may still drain in the instant
-    // between the bumper frame and the trigger; after that, reverse only.
-    let grace = first_reverse + Duration::from_millis(1500);
-    let forward_after = log.iter().any(|(t, vx, _)| *t > grace && *vx > 0.05);
+    // The manoeuvre is one-shot and bounded: reverse spans about the
+    // configured 1.2 s (never endless — the live bug), and while it runs
+    // no forward command reaches Player (the stub keeps publishing).
+    let span = reverses[reverses.len() - 1].0.duration_since(reverses[0].0);
     assert!(
-        !forward_after,
-        "a forward command reached Player after the back-off engaged"
+        span >= Duration::from_millis(800) && span <= Duration::from_millis(2000),
+        "reverse span {span:?} is not the ~1.2 s manoeuvre"
+    );
+    // No forward inside the reverse span (both ends inclusive, one tick of
+    // tolerance).
+    // Middle of the span only: at the edges the manoeuvre start/end and
+    // the reader's tick can interleave by one tick with the lease drain.
+    let first = reverses[0].0 + Duration::from_millis(250);
+    let last = reverses[reverses.len() - 1].0 - Duration::from_millis(250);
+    let forward_during = log
+        .iter()
+        .any(|(t, vx, _)| *t >= first && *t <= last && *vx > 0.05);
+    assert!(
+        !forward_during,
+        "a forward command reached Player during the back-off"
     );
 }

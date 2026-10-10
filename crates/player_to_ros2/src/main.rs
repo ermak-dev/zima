@@ -106,7 +106,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stall_reader = stall.clone();
     let stall_hold = Arc::new(Mutex::new(None::<Instant>));
     let stall_hold_reader = stall_hold.clone();
-    let stall_hold_ros = stall_hold.clone();
     // Bumper back-off: on contact the bridge drives straight back at once
     // (stock MoveBack), before the MCU latches a wheel error.
     let backoff = Arc::new(Mutex::new(BackOff::new()));
@@ -165,7 +164,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut client = Client::connect(&host, port)?;
             client.subscribe(LASER_CODE, 0)?;
             client.subscribe(POSITION2D_CODE, 0)?;
-            client.subscribe(BUMPER_CODE, 0)?;
+            // The bumper is optional: test Player servers (dummy.cfg) have
+            // no bumper:0 and NACK the subscription; the robot always has
+            // it. Without it the bridge runs without /bumper and without
+            // the back-off rather than not at all.
+            if client.subscribe(BUMPER_CODE, 0).is_err() {
+                eprintln!(
+                    "player_to_ros2: no bumper:0 on this Player; /bumper and back-off disabled"
+                );
+            }
             loop {
                 // Between reads (Player streams odometry at 20+ Hz). The
                 // bumper back-off owns the drive while it runs; otherwise
@@ -205,12 +212,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // the same frame; consumers care about transitions.
                         let pressed = decode_bumper(&msg.payload)?.pressed;
                         let any = pressed.iter().any(|&p| p);
-                        if any {
-                            // Trigger the back-off here, in the reader, so
-                            // the first reverse command goes out on the very
-                            // next tick — before any queued Nav2 command.
-                            backoff_reader.lock().unwrap().trigger(Instant::now());
-                        }
+                        // Edge-triggered (observe): the vendor driver
+                        // streams the pressed frame; re-triggering on every
+                        // frame made the reverse endless (seen live).
+                        backoff_reader.lock().unwrap().observe(any, Instant::now());
                         let mut last = bumper_state_reader.lock().unwrap();
                         if last.as_ref() != Some(&pressed) {
                             *last = Some(pressed.clone());
@@ -325,15 +330,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = scan_pub.publish(&ros_scan);
                 }
                 Ok(BridgeEvent::Bumper(pressed)) => {
-                    let any = pressed.iter().any(|&p| p);
-                    if any {
-                        // Bumper contact: back off now, and count this as a
-                        // stall trigger too (Nav2 keeps commanding forward).
-                        backoff.lock().unwrap().trigger(Instant::now());
-                        stall_hold_ros.lock().unwrap().take();
-                    }
+                    // The reader thread already observed the frame (edge-
+                    // triggered back-off); here only the topic follows.
                     let mut msg = ros_env::std_msgs::msg::Bool::default();
-                    msg.data = any;
+                    msg.data = pressed.iter().any(|&p| p);
                     let _ = bumper_pub.publish(&msg);
                 }
                 Ok(BridgeEvent::Odom(state)) => {

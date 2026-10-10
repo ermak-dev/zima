@@ -116,6 +116,8 @@ pub struct BackOff {
     /// Manoeuvre duration.
     duration: Duration,
     until: Option<Instant>,
+    /// Bumper state as of the last frame (edge detection).
+    was_pressed: bool,
 }
 
 impl BackOff {
@@ -125,12 +127,20 @@ impl BackOff {
             speed: -MAX_LINEAR,
             duration: Duration::from_millis(1200),
             until: None,
+            was_pressed: false,
         }
     }
 
-    /// Trigger a back-off (bumper pressed).
-    pub fn trigger(&mut self, now: Instant) {
-        self.until = Some(now + self.duration);
+    /// Feed the bumper state. A back-off starts on the released ->
+    /// pressed transition ONLY: the vendor driver streams the pressed
+    /// frame continuously while contact lasts, and re-triggering on every
+    /// frame made the manoeuvre endless (observed live: the robot kept
+    /// reversing until the session was killed by hand).
+    pub fn observe(&mut self, pressed: bool, now: Instant) {
+        if pressed && !self.was_pressed {
+            self.until = Some(now + self.duration);
+        }
+        self.was_pressed = pressed;
     }
 
     /// Velocity to enforce right now: Some(reverse) while the manoeuvre
@@ -340,22 +350,42 @@ mod tests {
     }
 
     #[test]
-    fn backoff_runs_once_for_twelve_hundred_ms() {
+    fn backoff_runs_once_per_press_regardless_of_frame_stream() {
         let t0 = Instant::now();
         let mut b = BackOff::new();
         assert!(!b.is_running(t0));
-        b.trigger(t0);
+        // The vendor driver streams the pressed frame continuously (5+ Hz).
+        // First frame starts the manoeuvre...
+        b.observe(true, t0);
         assert_eq!(b.active(t0), Some((-0.1, 0.0)));
+        // ...the stream must NOT extend it (observed live: endless reverse).
+        for at in (50..1200).step_by(50) {
+            b.observe(true, ms(t0, at));
+        }
         assert_eq!(b.active(ms(t0, 1199)), Some((-0.1, 0.0)));
-        assert_eq!(b.active(ms(t0, 1200)), None, "manoeuvre is over");
-        assert!(!b.is_running(ms(t0, 1300)));
-        // Re-trigger works after expiry.
-        b.trigger(ms(t0, 1400));
-        assert!(b.is_running(ms(t0, 1500)));
-        // A trigger mid-manoeuvre extends it (bumper still pressed).
-        b.trigger(ms(t0, 2000));
-        assert!(b.is_running(ms(t0, 2500)));
-        assert!(!b.is_running(ms(t0, 3201)));
+        assert_eq!(b.active(ms(t0, 1200)), None, "manoeuvre is over at 1.2 s");
+        assert!(
+            !b.is_running(ms(t0, 1300)),
+            "still pressed, still no reverse"
+        );
+        // Release, press again: a fresh manoeuvre.
+        b.observe(false, ms(t0, 1500));
+        b.observe(true, ms(t0, 1600));
+        assert!(b.is_running(ms(t0, 1700)));
+        assert!(!b.is_running(ms(t0, 2801)));
+        // A hold-press across the manoeuvre end stays stopped.
+        b.observe(true, ms(t0, 3000));
+        assert!(!b.is_running(ms(t0, 3100)), "no second window while held");
+    }
+
+    #[test]
+    fn released_bumper_never_triggers() {
+        let t0 = Instant::now();
+        let mut b = BackOff::new();
+        for at in (0..3000).step_by(100) {
+            b.observe(false, ms(t0, at));
+        }
+        assert!(!b.is_running(ms(t0, 2900)));
     }
 
     #[test]
