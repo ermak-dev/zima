@@ -3,6 +3,11 @@
 //!   laser:0       -> /scan   (sensor_msgs/LaserScan)
 //!   bumper:0      -> /bumper (std_msgs/Bool, any segment pressed)
 //!   position2d:0  -> /odom   (nav_msgs/Odometry)
+//!   ir:0 (wall)   -> /wall_ir + /voltages/ir0  (Range / Float32MultiArray)
+//!   ir:1 (cliff)  -> /cliff_ir_N + /voltages/ir1
+//!   ir:2 (drop)   -> /drop_ir_N + /voltages/ir2
+//!   sonar:0       -> /sonar   (sensor_msgs/Range, ULTRASOUND)
+//!   power:0       -> /battery_state (sensor_msgs/BatteryState)
 //!   /cmd_vel      -> velocity commands to position2d:0
 //!
 //! Drive safety (player_bridge::drive): every /cmd_vel is clamped to the
@@ -31,9 +36,11 @@ use ros_env::tf2_msgs::msg::TFMessage;
 use player_bridge::drive::{BackOff, DriveCommand, StallDetector, MAX_ANGULAR, MAX_LINEAR};
 use player_bridge::scan::uniform_scan;
 use player_bridge::{
-    decode_bumper, decode_laser_scanangle, decode_position2d, Client, Error as PlayerError,
-    LaserScanAngle, Position2dState, BUMPER_CODE, BUMPER_DATA_STATE, LASER_CODE,
-    LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE, POSITION2D_DATA_STATE,
+    decode_bumper, decode_ir, decode_laser_scanangle, decode_position2d, decode_power,
+    decode_sonar, Client, Error as PlayerError, IrState, LaserScanAngle, Position2dState,
+    PowerState, SonarState, BUMPER_CODE, BUMPER_DATA_STATE, IR_CODE, IR_DATA_RANGES, LASER_CODE,
+    LASER_DATA_SCANANGLE, MSGTYPE_DATA, POSITION2D_CODE, POSITION2D_DATA_STATE, POWER_CODE,
+    POWER_DATA_STATE, SONAR_CODE, SONAR_DATA_RANGES,
 };
 
 /// A decoded Player message handed from the reader thread to the ROS loop.
@@ -42,6 +49,10 @@ enum BridgeEvent {
     Odom(Position2dState),
     /// Bumper segments pressed, on change only.
     Bumper(Vec<bool>),
+    /// An ir array frame tagged with its Player index.
+    Ir(u16, IrState),
+    Sonar(SonarState),
+    Power(PowerState),
     ProtocolError(String),
 }
 
@@ -173,6 +184,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "player_to_ros2: no bumper:0 on this Player; /bumper and back-off disabled"
                 );
             }
+            // Optional sensor devices: the robot always has them, the
+            // test dummy.cfg does not. Each failure only drops its own
+            // topics. Player indexes: ir:0 wall, ir:1 cliff, ir:2 drop,
+            // sonar:0 ultrasonic, power:0 battery.
+            for (interf, index) in [
+                (IR_CODE, 0u16),
+                (IR_CODE, 1),
+                (IR_CODE, 2),
+                (SONAR_CODE, 0),
+                (POWER_CODE, 0),
+            ] {
+                if client.subscribe(interf, index).is_err() {
+                    eprintln!(
+                        "player_to_ros2: no {}:{} on this Player; its topics are disabled",
+                        interf, index
+                    );
+                }
+            }
             loop {
                 // Between reads (Player streams odometry at 20+ Hz). The
                 // bumper back-off owns the drive while it runs; otherwise
@@ -225,6 +254,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    (MSGTYPE_DATA, IR_CODE, IR_DATA_RANGES) => {
+                        let state = decode_ir(&msg.payload)?;
+                        let index = msg.header.addr.index;
+                        if tx.send(BridgeEvent::Ir(index, state)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    (MSGTYPE_DATA, SONAR_CODE, SONAR_DATA_RANGES) => {
+                        let state = decode_sonar(&msg.payload)?;
+                        if tx.send(BridgeEvent::Sonar(state)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    (MSGTYPE_DATA, POWER_CODE, POWER_DATA_STATE) => {
+                        let state = decode_power(&msg.payload)?;
+                        if tx.send(BridgeEvent::Power(state)).is_err() {
+                            return Ok(());
+                        }
+                    }
                     _ => {} // other interfaces: ignore
                 }
             }
@@ -245,6 +293,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // an unstamped static transform into /tf (as before) made tf2 unable
     // to resolve odom->laser at scan time, so RViz dropped every scan.
     let tf_static_pub = node.create_publisher("/tf_static".transient_local())?;
+
+    // Sensor publishers: one Range per array element lets RViz render
+    // each cliff/wall/sonar beam; the raw voltages and battery go to
+    // their own topics. Publishers are created once, keyed by topic
+    // name, so repeated frames do not churn.
+    use ros_env::sensor_msgs::msg::{BatteryState, Range};
+    use std::collections::HashMap;
+    let range_pubs: Arc<Mutex<HashMap<String, Publisher<Range>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    // Event-driven sensors (cliff/drop/power) send one frame per state
+    // change: latch their publishers so a late subscriber still learns
+    // the current state, like the bumper topic does.
+    let range_pub_new = |topic: &str| -> Result<Publisher<Range>, rclrs::RclrsError> {
+        node.create_publisher(topic.transient_local())
+    };
+    let volt_pub_wall = node.create_publisher("/wall_ir/voltages".transient_local())?;
+    let volt_pub_cliff = node.create_publisher("/cliff_ir/voltages".transient_local())?;
+    let volt_pub_drop = node.create_publisher("/drop_ir/voltages".transient_local())?;
+    let sonar_pub = node.create_publisher("/sonar".transient_local())?;
+    let battery_pub = node.create_publisher::<BatteryState>("/battery_state".transient_local())?;
 
     // Static base_link -> laser transform (mounting from the vendor config).
     let clock = Clock::system();
@@ -383,6 +451,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     tf.transforms.push(t);
                     let _ = tf_pub.publish(&tf);
+                }
+                Ok(BridgeEvent::Ir(index, state)) => {
+                    // ir:0 wall, ir:1 cliff, ir:2 drop. Each element of
+                    // the array becomes its own Range topic; voltages
+                    // (the analog readings) ride a single array topic.
+                    let (prefix, volt_pub): (
+                        &str,
+                        &Publisher<ros_env::std_msgs::msg::Float32MultiArray>,
+                    ) = match index {
+                        0 => ("/wall_ir", &volt_pub_wall),
+                        1 => ("/cliff_ir", &volt_pub_cliff),
+                        2 => ("/drop_ir", &volt_pub_drop),
+                        _ => continue,
+                    };
+                    for (i, &r) in state.ranges.iter().enumerate() {
+                        let topic = format!("{prefix}_{i}");
+                        let pub_once = {
+                            let mut map = range_pubs.lock().unwrap();
+                            map.entry(topic.clone())
+                                .or_insert_with(|| {
+                                    range_pub_new(&topic)
+                                        .expect("publisher creation cannot fail here")
+                                })
+                                .clone()
+                        };
+                        let mut header = ros_env::std_msgs::msg::Header::default();
+                        header.frame_id = base_frame.clone();
+                        if let Ok(stamp) = clock.now().to_ros_msg() {
+                            header.stamp = stamp;
+                        }
+                        // Player claims metres; the vendor firmware's
+                        // semantics are unproven (survey: cliff zeros may
+                        // be states), so the range is passed through
+                        // as-is rather than interpreted.
+                        let msg = Range {
+                            header,
+                            radiation_type: Range::INFRARED,
+                            field_of_view: 0.0,
+                            min_range: 0.0,
+                            max_range: 1.0,
+                            range: r,
+                            variance: 0.0,
+                        };
+                        let _ = pub_once.publish(&msg);
+                    }
+                    let volts = ros_env::std_msgs::msg::Float32MultiArray {
+                        data: state.voltages.clone(),
+                        ..Default::default()
+                    };
+                    let _ = volt_pub.publish(&volts);
+                }
+                Ok(BridgeEvent::Sonar(state)) => {
+                    let mut header = ros_env::std_msgs::msg::Header::default();
+                    header.frame_id = base_frame.clone();
+                    if let Ok(stamp) = clock.now().to_ros_msg() {
+                        header.stamp = stamp;
+                    }
+                    // The live frame carries one range of 65.534 m — a
+                    // suspected sentinel/error, not a distance; publish
+                    // it as-is and let consumers decide.
+                    let msg = Range {
+                        header,
+                        radiation_type: Range::ULTRASOUND,
+                        field_of_view: 0.0,
+                        min_range: 0.0,
+                        max_range: 6.0,
+                        range: state.ranges.first().copied().unwrap_or(0.0),
+                        variance: 0.0,
+                    };
+                    let _ = sonar_pub.publish(&msg);
+                }
+                Ok(BridgeEvent::Power(state)) => {
+                    let mut header = ros_env::std_msgs::msg::Header::default();
+                    header.frame_id = base_frame.clone();
+                    if let Ok(stamp) = clock.now().to_ros_msg() {
+                        header.stamp = stamp;
+                    }
+                    // PLAYER_POWER_MASK_VOLTS | WATTS | PERCENT | CHARGING
+                    let msg = BatteryState {
+                        header,
+                        voltage: if state.valid & 1 != 0 {
+                            state.volts
+                        } else {
+                            0.0
+                        },
+                        percentage: if state.valid & 8 != 0 {
+                            state.percent / 100.0
+                        } else {
+                            0.0
+                        },
+                        power_supply_status: if state.valid & 16 != 0 && state.charging > 0 {
+                            BatteryState::POWER_SUPPLY_STATUS_CHARGING
+                        } else {
+                            BatteryState::POWER_SUPPLY_STATUS_DISCHARGING
+                        },
+                        ..Default::default()
+                    };
+                    let _ = battery_pub.publish(&msg);
                 }
                 Ok(BridgeEvent::ProtocolError(e)) => return Err(e.into()),
                 Err(TryRecvError::Empty) => break,

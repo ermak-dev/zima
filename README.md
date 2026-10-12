@@ -168,13 +168,28 @@ robot bridge
    выключены);
 4. запускает `player_to_ros2` с heartbeat на супервизор.
 
-Пока сессия жива, в ROS 2 идут `/scan`, `/odom`, `/tf`, и принимается
-`/cmd_vel`. Мост сам ограничивает каждую команду лимитами проекта
-(0.1 м/с, 0.4 рад/с) и держит её не дольше `cmd_vel_timeout_s` (1 с):
-если команды перестали приходить (упал Nav2, отпущена клавиша), колёса
-получают ноль. **Как только мост умирает** (Ctrl-C, обрыв сети, падение) —
-супервизор в течение ~5 с сам возвращает штатное состояние: нулевую скорость
-→ standby-маску → `RoboController`.
+Пока сессия жива, в ROS 2 идут `/scan`, `/odom`, `/tf`, `/bumper` и
+датчики шасси, и принимается `/cmd_vel`. Мост сам ограничивает каждую
+команду лимитами проекта (0.1 м/с, 0.4 рад/с) и держит её не дольше
+`cmd_vel_timeout_s` (1 с): если команды перестали приходить (упал Nav2,
+отпущена клавиша), колёса получают ноль. **Как только мост умирает**
+(Ctrl-C, обрыв сети, падение) — супервизор в течение ~5 с сам возвращает
+штатное состояние: нулевую скорость → standby-маску → `RoboController`.
+
+Топики датчиков шасси (маска сессии `0x10f8ff` их уже включает):
+
+| Топик | Тип | Железо |
+|---|---|---|
+| `/wall_ir_0` + `/wall_ir/voltages` | `sensor_msgs/Range` (INFRARED), `Float32MultiArray` | ИК-датчик стены (`ir:0`), ~22 Гц |
+| `/cliff_ir_0..3` + `/cliff_ir/voltages` | `sensor_msgs/Range`, `Float32MultiArray` | 4 ИК-датчика обрыва (`ir:1`), кадр по изменению |
+| `/drop_ir_0..1` + `/drop_ir/voltages` | `sensor_msgs/Range`, `Float32MultiArray` | 2 датчика отрыва колёс (`ir:2`), кадр по изменению |
+| `/sonar` | `sensor_msgs/Range` (ULTRASOUND) | ультразвуковой датчик (`sonar:0`); живое значение 65.534 м — подозрительный sentinel, не дистанция |
+| `/battery_state` | `sensor_msgs/BatteryState` | батарея (`power:0`): процент и статус заряда |
+
+Единицы и семантика значений — по Player API; смысл нулей cliff/drop и
+sentinel сонара прошивкой не подтверждён (см. `docs/player-platform-survey.md`).
+Топики событийных датчиков (cliff/drop/battery) latched
+(transient_local): поздний подписчик сразу получает последнее состояние.
 
 Проверить поток:
 
@@ -304,7 +319,7 @@ bash ~/robot/scripts/nav2-replay.sh    # bag → Nav2 → /cmd_vel в файл
 | Файл | Назначение |
 |------|-----------|
 | `crates/player-bridge/` | протокол Player (XDR) + `robotctl`; без ROS |
-| `crates/player_to_ros2/` | ROS 2-узел: `/scan`, `/odom`, `/cmd_vel`, `/tf` |
+| `crates/player_to_ros2/` | ROS 2-узел: `/scan`, `/odom`, `/cmd_vel`, `/tf`, `/bumper`, датчики ИК/сонара/батареи |
 | `crates/mask-owner/` | владелец маски (`mask-owner`) и `robot-supervisor` |
 | `config/slam_offline.yaml` | slam_toolbox (режим mapping, фреймы) |
 | `config/slam_online.yaml` | slam_toolbox для езды с картографией (`--slam`) |
