@@ -204,6 +204,12 @@ setsid ros2 run robot_state_publisher robot_state_publisher \
 RSP_PID=$!
 pids+=("$RSP_PID")
 
+# Sensor value overlay: text labels over the robot for the chassis
+# sensors RViz has no display for (battery, bumper, IR, sonar, odom).
+setsid python3 "$repo/ros2/sensor_overlay.py" >>"$RUN_LOG" 2>&1 &
+OVERLAY_PID=$!
+pids+=("$OVERLAY_PID")
+
 banner 'starting RViz (close its window to end the session)'
 setsid rviz2 -d "$RVIZ_CONFIG" >>"$RUN_LOG" 2>&1 &
 RVIZ_PID=$!

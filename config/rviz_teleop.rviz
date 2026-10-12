@@ -166,6 +166,79 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /tf
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: SensorOverlay
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /sensor_overlay
+      Value: true
+    - Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/Range
+      Color: 85; 255; 255
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: Sonar
+      Queue Size: 10
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /sonar
+      Value: true
+    - Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/Range
+      Color: 255; 255; 0
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: WallIR
+      Queue Size: 10
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /wall_ir_0
+      Value: true
+    - Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/Range
+      Color: 255; 0; 255
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: CliffIR
+      Queue Size: 10
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /cliff_ir_0
+      Value: true
+    - Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/Range
+      Color: 255; 128; 0
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: DropIR
+      Queue Size: 10
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /drop_ir_0
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
