@@ -374,6 +374,10 @@ case "$1 $2" in
         trap 'printf "nav:term\n" >> "$ROBOT_TEST_LOG"; exit 0' TERM
         sleep 600 & wait $! ;;
     'lifecycle get') printf '%s\n' "${ROBOT_FAKE_NAV_STATE:-active [3]}" ;;
+    'bag record')
+        printf 'bag:record:%s\n' "${*:3}" >> "$ROBOT_TEST_LOG"
+        trap 'printf "bag:term\n" >> "$ROBOT_TEST_LOG"; exit 0' TERM
+        sleep 600 & wait $! ;;
     'run nav2_map_server')
         if [[ -e $ROBOT_TEST_DIR/slam-up ]]; then printf 'map-saved:slam-alive\n' >> "$ROBOT_TEST_LOG"; fi ;;
     'run robot_state_publisher')
@@ -390,6 +394,7 @@ run_session DISPLAY=:99 ROBOT_FAKE_RVIZ_SECS=2 ROBOT_SLAM_RVIZ_CONFIG="$tmp/slam
     bash "$root/scripts/run-rviz.sh" --slam >"$tmp/out" 2>&1 \
     || fail "slam session exited nonzero: $(cat "$tmp/out")"
 assert_log 'ros2:launch slam_toolbox online_sync_launch.py'
+assert_log "bag:record:-o"
 assert_log 'ros2:launch nav2_bringup navigation_launch.py'
 grep -F 'ros2:launch nav2_bringup' "$ROBOT_TEST_LOG" | grep -q 'use_sim_time:=false' || fail 'Nav2 on sim time'
 grep -F 'ros2:launch slam_toolbox' "$ROBOT_TEST_LOG" | grep -q 'use_sim_time:=false' || fail 'SLAM on sim time'
@@ -403,7 +408,9 @@ d = yaml.safe_load(open(sys.argv[1]))
 assert d['controller_server']['ros__parameters']['FollowPath']['plugin'].endswith('RegulatedPurePursuitController')
 cm = d['collision_monitor']['ros__parameters']
 assert cm['cmd_vel_out_topic'] == 'cmd_vel'
-assert cm[cm['polygons'][0]]['action_type'] == 'approach'
+zones = [cm[name] for name in cm['polygons']]
+assert any(z['action_type'] == 'stop' for z in zones), zones
+assert any(z['action_type'] == 'approach' for z in zones), zones
 s = d['slam_toolbox']['ros__parameters']
 assert s['base_frame'] == 'base_link' and s['mode'] == 'mapping'
 # No simulator overlay on the robot.

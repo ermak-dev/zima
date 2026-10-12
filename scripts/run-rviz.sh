@@ -43,6 +43,7 @@ if (( SLAM )); then
     RVIZ_CONFIG=${ROBOT_SLAM_RVIZ_CONFIG:-$(dirname "$ROS_SETUP")/share/nav2_bringup/rviz/nav2_default_view.rviz}
 fi
 MAP_OUT=${ROBOT_MAP_OUT:-$repo/maps/live-$(date +%Y%m%d-%H%M%S)}
+ROBOT_SESSION_BAG=${ROBOT_SESSION_BAG:-$HOME/robot-bags/session-$(date +%Y%m%d-%H%M%S)}
 
 banner() { printf '\n[robot run] %s\n' "$*"; }
 die() { echo "robot run: $*" >&2; exit 2; }
@@ -185,6 +186,13 @@ if (( SLAM )); then
         exit 3
     fi
     banner 'Nav2 active'
+    # Record the session: the first live drive ended bumper-to-wall with
+    # no data to dissect it with; the next incident must be replayable.
+    setsid ros2 bag record -o "$ROBOT_SESSION_BAG" /scan /odom /tf /tf_static \
+        /bumper /cmd_vel /cmd_vel_nav /cmd_vel_smoothed >>"$RUN_LOG" 2>&1 &
+    BAG_PID=$!
+    pids+=("$BAG_PID")
+    banner "recording the session to $ROBOT_SESSION_BAG"
 fi
 
 # Serve the vacuum model to RViz's RobotModel display. Single-link URDF

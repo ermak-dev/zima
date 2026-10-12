@@ -207,6 +207,10 @@ assert (cm['cmd_vel_in_topic'], cm['cmd_vel_out_topic']) == ('cmd_vel_smoothed',
 zones = [cm[name] for name in cm['polygons']]
 assert any(z['action_type'] == 'approach' and z['type'] == 'circle' and z['radius'] >= 0.1725
            and z['time_before_collision'] > 0 and z.get('enabled', True) for z in zones), zones
+# Hard stop inside the approach radius: beams entering the inner circle stop
+# the robot from any direction (approach only slows along the motion path).
+assert any(z['action_type'] == 'stop' and z['type'] == 'circle' and z['radius'] >= 0.17
+           and z.get('enabled', True) for z in zones), zones
 assert cm['observation_sources'] == ['scan'] and cm['scan']['topic'] == '/scan'
 assert cm['source_timeout'] <= 1.0
 PY
