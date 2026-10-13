@@ -6,7 +6,8 @@
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
-#        robot bridge            # full supervised session (needs sourced ROS 2)
+#        robot bridge            # full supervised session (sources ROS 2 itself)
+#        robot panel [--port N]  # web panel: camera, lidar, sensors, teleop
 #        robot run               # live RViz + teleop session (bridge + supervisor)
 #        robot run --sim         # offline Nav2 playground (Gazebo TB3 simulation)
 #        robot run --sim --slam  # playground + online SLAM: the map grows as you drive
@@ -28,9 +29,31 @@ ssh_wrap() {
     esac
 }
 
-usage() { sed -n '2,13s/^# //p' "$0"; }
+usage() { sed -n '2,14s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
+
+# Source the ROS 2 distro and the project workspace, so `robot bridge`
+# and `robot panel` work from a plain shell (running ros2 unsourced
+# leaves the controller disabled with nothing supervising it).
+# $1 = strict: also require the ros2 CLI on PATH (the bridge needs it;
+# the panel only needs rclpy inside python3).
+source_ros() {
+    local repo
+    repo=$(repo_root)
+    # The distro setup scripts reference unset vars (AMENT_TRACE_SETUP_FILES);
+    # relax nounset around them.
+    set +u
+    # shellcheck source=/dev/null
+    source "${ROBOT_ROS_SETUP:-/opt/ros/jazzy/setup.sh}" \
+        || { set -u; fail 'ROS setup not found; source a ROS 2 distro or set ROBOT_ROS_SETUP'; }
+    # shellcheck source=/dev/null
+    source "${ROBOT_WS_SETUP:-$HOME/robot/ros-ws/install/setup.sh}" 2>/dev/null || true
+    set -u
+    if [[ ${1:-} == strict ]] && ! command -v ros2 >/dev/null; then
+        fail 'ros2 is not in PATH after sourcing ROS'
+    fi
+}
 
 # Upload a file to the robot only when it differs (sha256 compare), via a
 # tmp+mv so a partial transfer never replaces the live remote file.
@@ -322,6 +345,7 @@ case $cmd in
         done
         repo=$(repo_root)
         [[ -d $repo/crates ]] || fail 'crates/ not found'
+        source_ros strict
         # 0. only one ROS session per host: next to the simulator this
         #    bridge would forward the sim's Nav2 /cmd_vel to the wheels.
         # shellcheck source=/dev/null
@@ -349,6 +373,19 @@ case $cmd in
         sleep 1
         ssh_wrap robot 'cat /tmp/robot-supervisor.log' >&2 || true
         exit "$status" ;;
+    panel)
+        port=8085
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --port) port=$2; shift 2 ;;
+                *) fail 'usage: robot panel [--port N]' ;;
+            esac
+        done
+        repo=$(repo_root)
+        panel_bin=${ROBOT_PANEL_BIN:-$repo/ros2/web_panel.py}
+        [[ -f $panel_bin ]] || fail "panel node not found: $panel_bin"
+        source_ros
+        exec "$panel_bin" --ros-args -p "port:=$port" ;;
     run)
         mode=live
         script_args=()

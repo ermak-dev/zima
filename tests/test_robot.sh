@@ -138,15 +138,23 @@ printf 'ros2:%s\n' "$*" >> "$ROBOT_TEST_LOG"
 [[ ${ROBOT_BRIDGE_FAIL:-0} != 1 ]]
 ROSEOF
 chmod +x "$tmp/fake-ros/ros2"
+# a no-op ROS setup: source_ros must not pull the real distro (nor the
+# real workspace, whose shim would shadow the fake ros2) into the test
+printf '# fake distro setup\n' > "$tmp/fake-ros/setup.sh"
+printf '# fake ws setup\n' > "$tmp/fake-ros/ws.sh"
 : > "$tmp/log"
-PATH="$tmp/fake-ros:$PATH" ROBOT_TEST_CONTROLLER_STATE=disabled "$root/bin/robot" bridge
+PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
+    ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh" \
+    ROBOT_TEST_CONTROLLER_STATE=disabled "$root/bin/robot" bridge
 grep -q "supervisor:.*listen" "$tmp/log" || fail 'supervisor not started for bridge'
 # disable travels as a stdin heredoc: count the bash -s dispatch between
 # the supervisor start and the ros2 launch
 [[ $(awk '/supervisor:/{s=1} /ros2:run/{e=1} s && !e && /bash -s/{n++} END{print n+0}' "$tmp/log") -ge 1 ]] || fail 'controller not disabled for bridge'
 grep -q 'ros2:run player_to_ros2' "$tmp/log" || fail 'bridge node not launched'
 : > "$tmp/log"
-PATH="$tmp/fake-ros:$PATH" ROBOT_BRIDGE_FAIL=1 ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
+PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
+    ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh" ROBOT_BRIDGE_FAIL=1 \
+    ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
 : > "$tmp/log"
 # A busy heartbeat port (stale never-activated supervisor) must stop the
 # bridge before it touches the controller.
@@ -369,3 +377,41 @@ rm "$tmp/fail-restart"
 [[ -e $ROBOT_TEST_STATE ]] || fail 'controller did not recover after retry'
 
 printf 'robot controller tests passed\n'
+
+# FEATURE: `robot panel` — the web control panel without manual ROS sourcing.
+# SPEC: source the ROS setup(s), then exec the panel node; a missing panel
+# script is a clear error; extra arguments are rejected.
+panel_cases() {
+    local log="$ROBOT_TEST_LOG"
+    # sources both setups and execs the node; the setups echo markers
+    mkdir -p "$tmp/ros"
+    printf 'echo sourced-ros\n' > "$tmp/ros/setup.sh"
+    printf 'echo sourced-ws\n' > "$tmp/ros-ws.sh"
+    env ROBOT_ROS_SETUP="$tmp/ros/setup.sh" ROBOT_WS_SETUP="$tmp/ros-ws.sh" \
+        ROBOT_PANEL_BIN="$tmp/fake-panel" \
+        bash "$root/bin/robot" panel >"$tmp/out" 2>&1
+    grep -q 'panel:exec' "$log" || fail 'panel node was not execed'
+    grep -q 'sourced-ros' "$tmp/out" || fail 'panel did not source ROS setup'
+    grep -q 'sourced-ws' "$tmp/out" || fail 'panel did not source the workspace setup'
+
+    # rejects extra arguments
+    if bash "$root/bin/robot" panel extra >/dev/null 2>&1; then
+        fail 'robot panel must reject extra arguments'
+    fi
+
+    # a missing panel script fails clearly
+    if env ROBOT_PANEL_BIN="$tmp/missing-panel" \
+        bash "$root/bin/robot" panel >"$tmp/out" 2>&1; then
+        fail 'missing panel script must fail'
+    fi
+    grep -q 'panel node not found' "$tmp/out" \
+        || fail "expected clear error, got: $(cat "$tmp/out")"
+    echo 'robot panel tests passed'
+}
+
+cat > "$tmp/fake-panel" <<'EOF'
+#!/usr/bin/env bash
+printf 'panel:exec %s\n' "$*" >> "$ROBOT_TEST_LOG"
+EOF
+chmod +x "$tmp/fake-panel"
+panel_cases
