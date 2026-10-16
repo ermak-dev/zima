@@ -74,14 +74,7 @@ fn static_laser_tf_is_latched_and_resolves_at_scan_time() {
     eprintln!("player server on port {port}");
 
     // Run the bridge node against the local server and capture its log.
-    let repo = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let bridge = format!("{repo}/../target/debug/player_to_ros2");
-    if !std::path::Path::new(&bridge).exists() {
-        eprintln!(
-            "skipping: bridge binary not built ({bridge}); run: cargo build -p player_to_ros2"
-        );
-        return;
-    }
+    let bridge = env!("CARGO_BIN_EXE_player_to_ros2");
     let log = std::env::temp_dir().join("player_to_ros2_it.log");
     let mut child = Command::new(&bridge)
         .args([

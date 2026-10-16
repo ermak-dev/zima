@@ -26,6 +26,7 @@ pub use sensors::{
     IR_DATA_RANGES, POWER_CODE, POWER_DATA_STATE, SONAR_CODE, SONAR_DATA_RANGES,
 };
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -334,13 +335,17 @@ pub fn decode_position2d(payload: &[u8]) -> Result<Position2dState, Error> {
 /// Connected client speaking the subset the bridge needs.
 pub struct Client {
     stream: TcpStream,
+    pending_data: VecDeque<Message>,
 }
 
 impl Client {
     pub fn connect(host: &str, port: u16) -> Result<Self, Error> {
         let stream = TcpStream::connect((host, port))?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut client = Client { stream };
+        let mut client = Client {
+            stream,
+            pending_data: VecDeque::new(),
+        };
         let mut banner = [0u8; 32];
         client.stream.read_exact(&mut banner)?;
         if &banner[..9] != b"Player v." {
@@ -355,8 +360,15 @@ impl Client {
         Ok(())
     }
 
-    /// Read one full message (header + payload).
+    /// Read one full message, including DATA buffered during subscriptions.
     pub fn read_message(&mut self) -> Result<Message, Error> {
+        if let Some(msg) = self.pending_data.pop_front() {
+            return Ok(msg);
+        }
+        self.read_wire_message()
+    }
+
+    fn read_wire_message(&mut self) -> Result<Message, Error> {
         let mut hdr_buf = [0u8; MSGHDR_SIZE];
         self.stream.read_exact(&mut hdr_buf)?;
         let header = decode_header(&hdr_buf).ok_or(Error::BadBanner)?;
@@ -401,12 +413,13 @@ impl Client {
             size: req.len() as u32,
         };
         self.send(&header, &req)?;
-        // In push mode the server may start streaming device data
-        // immediately after granting access; skip DATA messages until
-        // the acknowledgement arrives.
+        // DATA can precede this reply, including one-shot initial states
+        // from earlier subscriptions. Preserve it for the caller; read only
+        // the wire here so later subscriptions do not reconsume the queue.
         let reply = loop {
-            let msg = self.read_message()?;
+            let msg = self.read_wire_message()?;
             if msg.header.msg_type == MSGTYPE_DATA {
+                self.pending_data.push_back(msg);
                 continue;
             }
             break msg;
@@ -455,6 +468,111 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BUG: subscription round trips discard initial, possibly one-shot sensor DATA.
+    // HYPOTHESIS: DATA before ACK/NACK must be queued, not skipped.
+    // SOLUTION: queue DATA while reading replies directly from the wire.
+    // RESULT: FIXED — initial states are delivered once, in wire order, after ACK/NACK.
+    #[test]
+    fn subscription_round_trips_preserve_data_in_wire_order() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let devices = [
+            (BUMPER_CODE, 0),
+            (IR_CODE, 1),
+            (IR_CODE, 2),
+            (POWER_CODE, 0),
+        ];
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut banner = [0; 32];
+            banner[..9].copy_from_slice(b"Player v.");
+            stream.write_all(&banner).unwrap();
+            let send =
+                |stream: &mut TcpStream, interf, index, msg_type, subtype, payload: &[u8]| {
+                    let header = MsgHeader {
+                        addr: DevAddr {
+                            host: 0,
+                            robot: 0,
+                            interf,
+                            index,
+                        },
+                        msg_type,
+                        subtype,
+                        timestamp: 123.0,
+                        seq: 0,
+                        size: payload.len() as u32,
+                    };
+                    stream.write_all(&encode_header(&header)).unwrap();
+                    stream.write_all(payload).unwrap();
+                };
+            for round in 0..4 {
+                let mut header = [0; MSGHDR_SIZE];
+                stream.read_exact(&mut header).unwrap();
+                let header = decode_header(&header).unwrap();
+                assert_eq!((header.msg_type, header.subtype), (MSGTYPE_REQ, REQ_DEV));
+                let mut request = vec![0; header.size as usize];
+                stream.read_exact(&mut request).unwrap();
+                // Initial bumper/cliff/drop states arrive after an earlier ACK,
+                // during the next subscribe; power arrives before its own ACK.
+                let events: &[usize] = match round {
+                    0 => &[],
+                    1 => &[0, 1],
+                    2 => &[2],
+                    _ => &[3],
+                };
+                for &event in events {
+                    let (interf, index) = devices[event];
+                    send(&mut stream, interf, index, MSGTYPE_DATA, 1, &[event as u8]);
+                }
+                let mut reply = [0; 28];
+                reply[19] = OPEN_MODE;
+                send(
+                    &mut stream,
+                    PLAYER_CODE,
+                    0,
+                    if round == 2 {
+                        MSGTYPE_RESP_NACK
+                    } else {
+                        MSGTYPE_RESP_ACK
+                    },
+                    REQ_DEV,
+                    &reply,
+                );
+            }
+            // A fresh wire message must follow buffered DATA without duplication.
+            send(&mut stream, SONAR_CODE, 0, MSGTYPE_DATA, 1, &[4]);
+        });
+
+        let mut client = Client::connect("127.0.0.1", port).unwrap();
+        assert_eq!(client.subscribe(BUMPER_CODE, 0).unwrap(), OPEN_MODE);
+        assert_eq!(client.subscribe(IR_CODE, 1).unwrap(), OPEN_MODE);
+        assert!(matches!(client.subscribe(SONAR_CODE, 1), Err(Error::Nak)));
+        assert_eq!(client.subscribe(POWER_CODE, 0).unwrap(), OPEN_MODE);
+        for (event, (interf, index)) in devices.into_iter().chain([(SONAR_CODE, 0)]).enumerate() {
+            let msg = client
+                .read_message()
+                .expect("initial sensor DATA must survive subscription");
+            assert_eq!(msg.header.msg_type, MSGTYPE_DATA);
+            assert_eq!(
+                (msg.header.addr.interf, msg.header.addr.index),
+                (interf, index),
+                "initial sensor DATA must survive subscription in wire order"
+            );
+            assert_eq!(msg.header.timestamp, 123.0);
+            assert_eq!(msg.payload, vec![event as u8]);
+        }
+        assert!(
+            client.read_message().is_err(),
+            "no DATA may be delivered twice"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn subscribe_payload_places_access_at_16() {
