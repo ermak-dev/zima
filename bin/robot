@@ -7,7 +7,7 @@
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
 #        robot bridge            # full supervised session (sources ROS 2 itself)
-#        robot panel [--port N]  # web panel: camera, lidar, sensors, teleop
+#        robot panel [--slam] [--port N]  # --slam: bridge + mapping + web panel, no Nav2/RViz
 #        robot run               # live RViz + teleop session (bridge + supervisor)
 #        robot run --sim         # offline Nav2 playground (Gazebo TB3 simulation)
 #        robot run --sim --slam  # playground + online SLAM: the map grows as you drive
@@ -374,14 +374,25 @@ case $cmd in
         ssh_wrap robot 'cat /tmp/robot-supervisor.log' >&2 || true
         exit "$status" ;;
     panel)
-        port=8085
+        port=8085 slam=0
         while [[ $# -gt 0 ]]; do
             case $1 in
-                --port) port=$2; shift 2 ;;
-                *) fail 'usage: robot panel [--port N]' ;;
+                --slam) slam=1; shift ;;
+                --port)
+                    (( $# >= 2 )) || fail 'usage: robot panel [--slam] [--port N]'
+                    port=$2; shift 2 ;;
+                *) fail 'usage: robot panel [--slam] [--port N]' ;;
             esac
         done
+        if [[ ! $port =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+            fail 'panel port must be an integer in 1..65535'
+        fi
         repo=$(repo_root)
+        if (( slam )); then
+            script=${ROBOT_MAPPING_SCRIPT:-$repo/scripts/run-mapping.sh}
+            [[ -f $script ]] || fail "mapping wrapper not found: $script"
+            exec bash "$script" --port "$port"
+        fi
         panel_bin=${ROBOT_PANEL_BIN:-$repo/ros2/web_panel.py}
         [[ -f $panel_bin ]] || fail "panel node not found: $panel_bin"
         source_ros

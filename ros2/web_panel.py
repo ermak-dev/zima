@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Single-port ROS panel: MJPEG camera, odom-frame lidar, sensors and teleop.
+"""Single-port ROS panel: occupancy map, MJPEG camera, sensors and teleop.
 
 ROS imports live inside main so the HTTP proxy and pure conversions can be
 verified offline. The panel never takes ownership of the bridge session.
 """
+import base64
 import http.server
 import json
 import math
+import struct
 import threading
+import time
 import urllib.parse
+import zlib
 from pathlib import Path
 
 MAX_LINEAR = 0.1
@@ -43,7 +47,30 @@ def state_to_json(state):
         'battery', 'bumper', 'wall_ir', 'cliff_ir', 'drop_ir', 'sonar')}
     for key in ('wall_voltages', 'cliff_ranges', 'drop_ranges'):
         out['sensors'][key] = state.get(key)
+    out['map_pose'] = state.get('map_pose')
+    out['map_age_s'] = state.get('map_age_s')
     return out
+
+
+def map_to_json(width, height, resolution, origin, data, frame, version):
+    """Encode ROS row order losslessly; the browser projects rows into map Y."""
+    if (width <= 0 or height <= 0 or len(data) != width * height
+            or not math.isfinite(resolution) or resolution <= 0):
+        raise ValueError('invalid occupancy grid')
+    pixels = bytes(160 if v < 0 else round(255 - min(v, 100) * 2.23) for v in data)
+    rows = b''.join(b'\x00' + pixels[i:i + width] for i in range(0, len(pixels), width))
+
+    def chunk(kind, body):
+        return (struct.pack('>I', len(body)) + kind + body
+                + struct.pack('>I', zlib.crc32(kind + body)))
+
+    png = (b'\x89PNG\r\n\x1a\n'
+           + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+    x, y, yaw = origin
+    return {'width': width, 'height': height, 'resolution': resolution,
+            'origin': {'x': x, 'y': y, 'yaw': yaw}, 'frame': frame, 'version': version,
+            'image': 'data:image/png;base64,' + base64.b64encode(png).decode('ascii')}
 
 
 def points_in_odom(points, x, y, yaw):
@@ -125,7 +152,7 @@ def main():
     import sys
     import rclpy
     from geometry_msgs.msg import Twist
-    from nav_msgs.msg import Odometry
+    from nav_msgs.msg import OccupancyGrid, Odometry
     from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -140,7 +167,11 @@ def main():
             self.state = {}
             self.scan = None
             self.pending_scan = None
+            self.map = None
+            self.map_received = None
+            self.map_version = time.time_ns() // 1_000_000
             self.odom_frame = 'odom'
+            self.base_frame = 'base_link'
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
             self.port = self.declare_parameter('port', 8085).value
@@ -164,7 +195,44 @@ def main():
             self.create_subscription(Range, '/sonar', self.on_sonar, latched)
             self.create_subscription(Odometry, '/odom', self.on_odom, volatile)
             self.create_subscription(LaserScan, '/scan', self.on_scan, volatile)
+            self.create_subscription(OccupancyGrid, '/map', self.on_map,
+                                     QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                                reliability=ReliabilityPolicy.RELIABLE))
             self.create_timer(0.05, self.transform_scan)
+            self.create_timer(0.1, self.update_map_pose)
+
+        def on_map(self, msg):
+            p, q = msg.info.origin.position, msg.info.origin.orientation
+            yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+            try:
+                grid = map_to_json(msg.info.width, msg.info.height, msg.info.resolution,
+                                   (p.x, p.y, yaw), msg.data, msg.header.frame_id,
+                                   self.map_version + 1)
+            except ValueError:
+                self.get_logger().warning('Ignoring invalid occupancy grid')
+                return
+            self.map_version += 1
+            self.map_received = time.monotonic()
+            self.map = grid
+            self.update_map_pose()
+
+        def update_map_pose(self):
+            self.state['map_pose'] = None
+            if self.map is None:
+                return
+            try:
+                transform = self.tf_buffer.lookup_transform(self.map['frame'], self.base_frame, Time())
+                age = (self.get_clock().now() - Time.from_msg(transform.header.stamp)).nanoseconds / 1e9
+                if age > 2.0 or age < -0.5:
+                    return
+                tf = transform.transform
+            except TransformException:
+                return
+            q = tf.rotation
+            self.state['map_pose'] = {
+                'x': tf.translation.x, 'y': tf.translation.y,
+                'yaw': math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)),
+                'frame': self.map['frame']}
 
         def on_bumper(self, msg):
             self.state['bumper'] = bool(msg.data)
@@ -190,6 +258,7 @@ def main():
         def on_odom(self, msg):
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
             self.odom_frame = msg.header.frame_id
+            self.base_frame = msg.child_frame_id or 'base_link'
             self.state['odom'] = (p.x, p.y, msg.twist.twist.linear.x, msg.twist.twist.angular.z)
             self.state['odom_yaw'] = math.atan2(2 * (q.w * q.z + q.x * q.y),
                                                1 - 2 * (q.y * q.y + q.z * q.z))
@@ -203,7 +272,8 @@ def main():
             if msg is None:
                 return
             try:
-                tf = self.tf_buffer.lookup_transform(self.odom_frame, msg.header.frame_id,
+                frame = self.map['frame'] if self.map else self.odom_frame
+                tf = self.tf_buffer.lookup_transform(frame, msg.header.frame_id,
                                                      Time.from_msg(msg.header.stamp)).transform
             except TransformException:
                 return
@@ -212,7 +282,7 @@ def main():
             q = tf.rotation
             yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
             self.scan = {'points': points_in_odom(points, tf.translation.x, tf.translation.y, yaw),
-                         'range_max': msg.range_max, 'frame': self.odom_frame}
+                         'range_max': msg.range_max, 'frame': frame}
             self.pending_scan = None
 
         def dispatch(self, handler, method):
@@ -224,8 +294,18 @@ def main():
                 if path == '/favicon.svg':
                     handler.send(200, 'image/svg+xml', b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#2a78d6"/></svg>')
                     return
+                if path == '/map.json':
+                    grid = self.map
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
+                    if grid and query.get('version') == [str(grid['version'])]:
+                        grid = {'version': grid['version']}
+                    handler.send(200, 'application/json', json.dumps(grid or {}).encode())
+                    return
                 if path in ('/state.json', '/scan.json', '/odom.json'):
-                    state = state_to_json(self.state.copy())
+                    snapshot = self.state.copy()
+                    snapshot['map_age_s'] = (time.monotonic() - self.map_received
+                                             if self.map_received is not None else None)
+                    state = state_to_json(snapshot)
                     body = {'/state.json': state, '/scan.json': self.scan or {},
                             '/odom.json': state.get('odom', {})}[path]
                     handler.send(200, 'application/json', json.dumps(body).encode())

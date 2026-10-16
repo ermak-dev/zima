@@ -42,6 +42,7 @@ function browser() {
   }
   const sandbox = {
     console, Math, Number, Date, JSON, Set, devicePixelRatio: 1,
+    Image: class { set src(value) { this.value = value; this.onload?.(); } },
     document: {
       getElementById: element,
       addEventListener: (name, fn) => listeners['document:' + name] = fn,
@@ -83,7 +84,58 @@ function wheel(b, deltaY, deltaMode = 0) {
   b.listeners['scan:wheel']({deltaY, deltaMode, preventDefault() { prevented = true; }});
   assert.ok(prevented, 'map wheel must not scroll the page');
 }
+// FEATURE: occupancy map is primary; pose and optional scan must share its frame.
+// IMPLEMENTATION: versioned PNG, map-frame overlays, fit/pan and scan toggle.
+// RESULT: IMPLEMENTED — unit regressions and offline browser interactions pass.
 const tests = {
+  map_uses_origin_yaw_and_resolution_without_raw_odom_overlay() {
+    const b = browser();
+    assert.equal(typeof b.sandbox.renderMap, 'function');
+    b.sandbox.renderMap({width:2,height:3,resolution:.05,origin:{x:4,y:5,yaw:.3},frame:'map',version:1,image:'data:image/png;base64,test'});
+    b.drawOps.length=0;
+    b.sandbox.renderState({sensors:{},odom:{x:100,y:100,yaw:0},map_age_s:0,map_pose:{x:4,y:5,yaw:.5,frame:'map'}});
+    assert.ok(b.drawOps.some(op=>op[0]==='drawImage'), 'occupancy image must be drawn');
+    assert.ok(b.drawOps.some(op=>op[0]==='rotate'&&op[1]===-.3), 'grid origin rotation');
+    assert.equal(b.drawOps.filter(op=>op[0]==='rotate').at(-1)[1], -.5-Math.PI/2);
+    assert.equal(b.elements['pose-x'].textContent,'4.00 м');
+    b.drawOps.length=0;
+    b.sandbox.renderState({sensors:{},odom:{x:100,y:100,yaw:0},map_age_s:0});
+    assert.equal(b.drawOps.filter(op=>op[0]==='arc').length,0,'no robot without map TF');
+    assert.match(b.elements['map-message'].textContent,/TF/);
+    assert.equal(b.posts.length,0);
+  },
+  map_frame_mismatch_hides_scan_and_pose_and_restart_clears_map() {
+    const b=browser();
+    b.sandbox.renderMap({width:2,height:2,resolution:.05,origin:{x:0,y:0,yaw:0},frame:'map',version:1,image:'data:image/png;base64,test'});
+    vm.runInContext("lidar={frame:'odom',points:[[1,0]]}",b.sandbox);
+    b.drawOps.length=0;
+    b.sandbox.renderState({sensors:{},odom:{x:100,y:100,yaw:0},map_pose:{x:100,y:100,yaw:0,frame:'odom'}});
+    assert.equal(dots(b).length,0,'odom scan must not appear on map');
+    assert.equal(b.elements['pose-x'].textContent,'—','mismatched pose must stay missing');
+    b.sandbox.renderMap({});
+    assert.equal(vm.runInContext('occupancy',b.sandbox),null,'empty map after restart clears old map');
+  },
+  map_fit_pan_and_scan_toggle_are_passive() {
+    const b=browser();
+    b.sandbox.renderMap({width:100,height:100,resolution:.05,origin:{x:-2,y:-2,yaw:0},frame:'map',version:1,image:'data:image/png;base64,test'});
+    click(b,'map-fit');
+    const center=vm.runInContext('({...viewCenter})',b.sandbox);
+    assert.equal(center.x,.5); assert.equal(center.y,.5);
+    b.listeners['scan:pointerdown']({button:0,pointerId:1,clientX:10,clientY:10});
+    b.listeners['scan:pointermove']({pointerId:1,clientX:60,clientY:10});
+    b.listeners['scan:pointerup']({pointerId:1});
+    assert.ok(vm.runInContext('viewCenter.x',b.sandbox)<center.x);
+    click(b,'map-scan');
+    assert.equal(b.elements['map-scan'].getAttribute('aria-pressed'),'false');
+    assert.equal(b.posts.length,0);
+  },
+  map_age_and_missing_map_are_explicit() {
+    const b=browser();
+    assert.match(b.elements['map-message'].textContent,/Ожидание карты/);
+    b.sandbox.renderMap({width:2,height:2,resolution:1,origin:{x:0,y:0,yaw:0},frame:'map',version:1,image:'data:image/png;base64,test'});
+    b.sandbox.renderState({sensors:{},map_age_s:12,map_pose:{x:0,y:0,yaw:0,frame:'map'}});
+    assert.match(b.elements['map-message'].textContent,/Нет обновлений/);
+  },
   lidar_keeps_original_orientation_while_model_turns() {
     const b = browser(); showScan(b);
     const points = dots(b);

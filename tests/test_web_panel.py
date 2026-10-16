@@ -147,6 +147,44 @@ class PanelRegressions(unittest.TestCase):
         self.assertIn('setTimeout(connectCamera', panel.INDEX_HTML)
 
 
+# FEATURE: versioned occupancy PNG and map-frame pose for the web panel.
+# SPEC: preserve grid origin/yaw, unknown cells and row order; no ROS required.
+# IMPLEMENTATION: stdlib PNG encoding and a separate TF-derived map pose.
+# RESULT: IMPLEMENTED — pure regressions and isolated DDS integration pass.
+class OccupancyMap(unittest.TestCase):
+    def test_grid_encodes_lossless_grayscale_png_and_metadata(self):
+        import base64
+        import struct
+        import zlib
+        result = panel.map_to_json(2, 2, .05, (-1., 2., math.pi / 2),
+                                   [-1, 0, 100, 50], 'map', 7)
+        self.assertEqual(result['origin'], {'x': -1., 'y': 2., 'yaw': math.pi / 2})
+        self.assertEqual((result['width'], result['height'], result['resolution']), (2, 2, .05))
+        self.assertEqual((result['frame'], result['version']), ('map', 7))
+        png = base64.b64decode(result['image'].split(',')[1])
+        self.assertEqual(png[:8], b'\x89PNG\r\n\x1a\n')
+        self.assertEqual(struct.unpack('>IIBBBBB', png[16:29]), (2, 2, 8, 0, 0, 0, 0))
+        offset, compressed = 8, b''
+        while offset < len(png):
+            length = struct.unpack('>I', png[offset:offset+4])[0]
+            if png[offset+4:offset+8] == b'IDAT':
+                compressed += png[offset+8:offset+8+length]
+            offset += length + 12
+        self.assertEqual(zlib.decompress(compressed), bytes([0, 160, 255, 0, 32, 144]))
+
+    def test_invalid_or_empty_grid_is_rejected(self):
+        for width, height, resolution, data in [(0, 1, .05, []), (2, 2, .05, [0]),
+                                                (1, 1, 0., [0]), (1, 1, float('nan'), [0])]:
+            with self.assertRaises(ValueError):
+                panel.map_to_json(width, height, resolution, (0, 0, 0), data, 'map', 1)
+
+    def test_map_pose_is_not_replaced_by_raw_odometry(self):
+        result = panel.state_to_json({'odom': (1, 2, .1, .2),
+                                      'map_pose': {'x': 10, 'y': 20, 'yaw': .5, 'frame': 'map'}})
+        self.assertEqual(result['map_pose']['x'], 10)
+        self.assertEqual(result['odom']['x'], 1)
+
+
 class CmdClamp(unittest.TestCase):
     def test_clamps_to_project_limits(self):
         self.assertEqual(panel.clamp_cmd(0.5, 2.0), (0.1, 0.4))

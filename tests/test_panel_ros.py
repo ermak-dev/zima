@@ -21,10 +21,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(importlib.util.find_spec('rclpy'), 'source ROS Jazzy to run DDS integration')
 class PanelRos(unittest.TestCase):
+    def test_latched_map_and_map_frame_pose(self):
+        self.run_panel_fixture(mapping=True)
+
     def test_latched_inventory_and_scan_time_tf(self):
+        self.run_panel_fixture(mapping=False)
+
+    def run_panel_fixture(self, mapping):
         import rclpy
         from geometry_msgs.msg import TransformStamped, Twist
-        from nav_msgs.msg import Odometry
+        from nav_msgs.msg import OccupancyGrid, Odometry
         from rclpy.qos import QoSProfile, DurabilityPolicy
         from sensor_msgs.msg import BatteryState, LaserScan, Range
         from std_msgs.msg import Bool, Float32MultiArray
@@ -59,6 +65,15 @@ class PanelRos(unittest.TestCase):
         mount.transform.translation.x = -.1
         mount.transform.rotation.w = 1.0
         publish('/tf_static', TFMessage, TFMessage(transforms=[mount]))
+        if mapping:
+            grid = OccupancyGrid()
+            grid.header.frame_id = 'map'
+            grid.info.width, grid.info.height = 2, 2
+            grid.info.resolution = .05
+            grid.info.origin.position.x = -1.
+            grid.info.origin.orientation.w = 1.
+            grid.data = [-1, 0, 100, 50]
+            publish('/map', OccupancyGrid, grid)
         tf_pub = node.create_publisher(TFMessage, '/tf', 10)
         odom_pub = node.create_publisher(Odometry, '/odom', 10)
         scan_pub = node.create_publisher(LaserScan, '/scan', 10)
@@ -88,7 +103,13 @@ class PanelRos(unittest.TestCase):
                 tf.transform.translation.y = 2.0
                 tf.transform.rotation.z = math.sqrt(.5)
                 tf.transform.rotation.w = math.sqrt(.5)
-                tf_pub.publish(TFMessage(transforms=[tf]))
+                correction = TransformStamped()
+                correction.header.frame_id = 'map'
+                correction.child_frame_id = 'odom'
+                correction.header.stamp = stamp
+                correction.transform.translation.x = 10.
+                correction.transform.rotation.w = 1.
+                tf_pub.publish(TFMessage(transforms=[correction, tf] if mapping else [tf]))
                 odom = Odometry()
                 odom.header.frame_id = 'odom'
                 odom.header.stamp = stamp
@@ -105,7 +126,8 @@ class PanelRos(unittest.TestCase):
                 try:
                     state, cloud = get('/state.json'), get('/scan.json')
                     if (cloud.get('points') and state.get('sensors', {}).get('drop_ranges')
-                            and state['sensors'].get('battery')):
+                            and state['sensors'].get('battery')
+                            and (not mapping or (state.get('map_pose') and cloud.get('frame') == 'map'))):
                         break
                 except (OSError, urllib.error.URLError):
                     pass
@@ -117,8 +139,25 @@ class PanelRos(unittest.TestCase):
             self.assertEqual(state['sensors']['cliff_ir'], [0.0, 1.0, 2.0, 3.0])
             self.assertEqual(state['sensors']['bumper'], 'clear')
             self.assertEqual(state['sensors']['battery']['percent'], 87)
-            self.assertEqual(cloud['frame'], 'odom')
-            self.assertAlmostEqual(cloud['points'][0][0], 1.0, places=5)
+            if mapping:
+                grid = get('/map.json')
+                self.assertEqual(grid['width'], 2)
+                self.assertEqual(grid['origin']['x'], -1.)
+                self.assertTrue(grid['image'].startswith('data:image/png;base64,'))
+                self.assertLess(grid['version'], 2**53, 'version must survive JavaScript JSON numbers exactly')
+                cached = get('/map.json?version=' + str(grid['version']))
+                self.assertEqual(cached['version'], grid['version'])
+                self.assertNotIn('image', cached, 'unchanged map must not be transferred again')
+                self.assertAlmostEqual(state['map_pose']['x'], 11.)
+                self.assertAlmostEqual(state['map_pose']['y'], 2.)
+                self.assertAlmostEqual(state['map_pose']['yaw'], math.pi / 2)
+                self.assertEqual(state['map_pose']['frame'], 'map')
+                self.assertIsNotNone(state['map_age_s'])
+            else:
+                self.assertEqual(get('/map.json'), {})
+                self.assertIsNone(state.get('map_pose'))
+            self.assertEqual(cloud['frame'], 'map' if mapping else 'odom')
+            self.assertAlmostEqual(cloud['points'][0][0], 11.0 if mapping else 1.0, places=5)
             self.assertAlmostEqual(cloud['points'][0][1], 2.9, places=5)
             self.assertEqual(commands, [], 'passive HTTP polling must not publish motion')
             request = urllib.request.Request(url + '/cmd_vel', data=b'{"v":1,"w":2}',
