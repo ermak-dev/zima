@@ -19,8 +19,11 @@ Auth: like bin/camera/snapshot, credentials come from a mode-0600 netrc
 (machine <host>); they never enter the stream URL or logs.
 """
 import base64
+import netrc
+import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 # Pull SOI..EOI-delimited JPEG frames out of an arbitrary byte stream
@@ -48,6 +51,29 @@ def split_mjpeg_frames(buf):
     return frames, buf
 
 
+def open_mjpeg(url, netrc_path):
+    """Open an MJPEG URL and return its context-manager-compatible response.
+
+    The caller owns and closes the response and can forward its Content-Type
+    header unchanged, including the camera's multipart boundary. Stream bytes
+    are not parsed or transcoded. Credentials come from the expanded netrc
+    path; a missing/malformed file or unmatched host permits anonymous access.
+    HTTP/network errors propagate to the caller. Reads use a 10-second timeout.
+    """
+    headers = {}
+    try:
+        entry = netrc.netrc(os.path.expanduser(netrc_path)).authenticators(
+            urllib.parse.urlsplit(url).hostname)
+        if entry:
+            token = base64.b64encode(
+                f"{entry[0]}:{entry[2]}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+    except (FileNotFoundError, netrc.NetrcParseError):
+        pass  # camera may be open on the LAN
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=10)
+
+
 def main():
     import rclpy
     from rclpy.node import Node
@@ -72,31 +98,19 @@ def main():
             threading.Thread(target=self.stream_loop, daemon=True).start()
 
         def stream_loop(self):
-            import netrc
             url = self.get_parameter("url").value
             netrc_path = self.get_parameter("netrc").value
             fps = self.get_parameter("fps").value
             min_interval = 1.0 / fps if fps > 0 else 0.0
             while True:
                 try:
-                    auth = None
-                    try:
-                        entry = netrc.netrc(netrc_path).authenticators(
-                            urllib.parse.urlsplit(url).hostname)
-                        if entry:
-                            token = base64.b64encode(
-                                f"{entry[0]}:{entry[2]}".encode()).decode()
-                            auth = {"Authorization": f"Basic {token}"}
-                    except (FileNotFoundError, netrc.NetrcParseError):
-                        pass  # camera may be open on the LAN
-                    self.stream(url, auth, min_interval)
+                    self.stream(url, netrc_path, min_interval)
                 except Exception as e:  # reconnect with backoff
                     self.get_logger().warn(f"camera stream: {e}; retry in 2 s")
                     time.sleep(2.0)
 
-        def stream(self, url, auth, min_interval):
-            req = urllib.request.Request(url, headers=auth or {})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+        def stream(self, url, netrc_path, min_interval):
+            with open_mjpeg(url, netrc_path) as resp:
                 self.get_logger().info(f"camera streaming from {url}")
                 buf = b""
                 last_pub = 0.0
