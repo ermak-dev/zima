@@ -107,6 +107,46 @@ class PanelState(unittest.TestCase):
         self.assertAlmostEqual(points[0][1], -1.0, places=5)  # sin(-90)
 
 
+# BUG: missing readings disappear, and lidar/model use unrelated frames.
+# HYPOTHESIS: sparse UI rows and drawing raw laser coordinates hide the state.
+# SOLUTION: explicit sensor inventory, scan-time TF, and one viewport-sized map.
+# RESULT: FIXED — offline regressions and isolated ROS integration pass.
+class PanelRegressions(unittest.TestCase):
+    def test_all_sensor_channels_have_explicit_missing_state(self):
+        state = panel.state_to_json({})
+        for key in ('battery', 'bumper', 'wall_ir', 'wall_voltages',
+                    'cliff_ir', 'cliff_ranges', 'drop_ir', 'drop_ranges', 'sonar'):
+            self.assertIn(key, state.get('sensors', {}), key)
+            self.assertIsNone(state['sensors'][key], key)
+
+    def test_ranges_and_voltages_are_both_exposed(self):
+        state = panel.state_to_json({'cliff': [1, 2, 3, 4],
+                                     'cliff_ranges': [0, 0, 0, 0],
+                                     'drop': [0, 1], 'drop_ranges': [0, 0],
+                                     'wall_voltages': [0]})
+        self.assertEqual(state['sensors']['cliff_ir'], [1, 2, 3, 4])
+        self.assertEqual(state['sensors']['cliff_ranges'], [0, 0, 0, 0])
+        self.assertEqual(state['sensors']['drop_ranges'], [0, 0])
+        self.assertEqual(state['sensors']['wall_voltages'], [0])
+
+    def test_laser_mount_and_pose_transform_points_to_odom(self):
+        points = panel.points_in_odom([(1, 0), (0, 1)],
+                                       -0.1, 2.0, math.pi / 2)
+        self.assertAlmostEqual(points[0][0], -0.1)
+        self.assertAlmostEqual(points[0][1], 3.0)
+        self.assertAlmostEqual(points[1][0], -1.1)
+        self.assertAlmostEqual(points[1][1], 2.0)
+
+    def test_model_and_pose_share_lidar_view(self):
+        self.assertNotIn('id="model"', panel.INDEX_HTML)
+        self.assertIn('id="odom"', panel.INDEX_HTML)
+        self.assertIn('height:100dvh', panel.INDEX_HTML)
+        self.assertIn('overflow:hidden', panel.INDEX_HTML)
+
+    def test_camera_failure_has_retry(self):
+        self.assertIn('setTimeout(connectCamera', panel.INDEX_HTML)
+
+
 class CmdClamp(unittest.TestCase):
     def test_clamps_to_project_limits(self):
         self.assertEqual(panel.clamp_cmd(0.5, 2.0), (0.1, 0.4))

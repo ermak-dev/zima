@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Robot panel</title><link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+:root{--bg:#edf2f6;--surface:#fff;--ink:#223446;--muted:#576b7c;--line:#dbe4ec;--blue:#2a78d6;--good:#25734c;--alert:#ad382e}
+*{box-sizing:border-box}html,body{height:100%;overflow:hidden}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.4 'Segoe UI',system-ui,sans-serif;height:100dvh;display:grid;grid-template-rows:48px minmax(0,1fr) 34px;padding:0 16px;gap:10px}
+header,footer,.heading,.pose,.legend{display:flex;align-items:center;justify-content:space-between;gap:12px}
+header{border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:650}.brand svg{width:28px;height:28px}.brand small{font-size:12px;font-weight:400;color:var(--muted);margin-left:8px}
+#connection{font-size:12px;color:var(--muted)}main{min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:12px}
+section{min-width:0;min-height:0;background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.heading{height:42px;padding:0 14px;flex-shrink:0}h1,h2{font-size:13px;font-weight:650;margin:0}.meta,.legend{font-size:11px;color:var(--muted)}
+.map{display:flex;flex-direction:column;position:relative}.map .heading{border-bottom:1px solid var(--line)}.map-stage{position:relative;flex:1;min-height:0;background:#f8fafc}canvas{display:block;width:100%;height:100%}
+#map-message{position:absolute;left:14px;top:12px;max-width:80%;font-size:12px;color:var(--muted);pointer-events:none}.legend{position:absolute;bottom:12px;left:14px;justify-content:flex-start;pointer-events:none}.legend span{display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;background:var(--blue)}.robot-dot{width:12px;height:12px;border:2px solid var(--ink);border-radius:50%;background:white}
+.pose{padding:10px 14px;min-height:42px;border-top:1px solid var(--line);font-variant-numeric:tabular-nums;flex-wrap:wrap;gap:4px 16px}.pose span{color:var(--muted);font-size:11px}.pose b{color:var(--ink);font-weight:550;font-size:12px;margin-left:5px}
+aside{min-height:0;display:grid;grid-template-rows:minmax(0,1fr) 370px;gap:12px}.camera{display:flex;flex-direction:column}.camera-stage{flex:1;min-height:0;position:relative;background:#e8eef3;display:grid;place-items:center;overflow:hidden}#cam{display:block;width:100%;height:100%;object-fit:contain;position:absolute}#cam-off{text-align:center;padding:12px;color:var(--muted);font-size:12px;max-width:260px}#cam-status{font-size:11px;color:var(--muted)}
+.sensors{display:flex;flex-direction:column}.sensors .heading{height:38px}.sensor-table{width:calc(100% - 28px);margin:0 14px;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;flex:1}.sensor-table td{padding:3px 0;border-top:1px solid var(--line);height:23px}.sensor-table td:last-child{text-align:right;font-weight:550}.sensor-table td:first-child{color:var(--muted)}.sensor-table .group td{font-size:11px;font-weight:550;background:#f8fafc;text-align:left}.missing{font-weight:400!important;color:var(--muted)}.alert{color:var(--alert)}.sensor-note{font-size:10px;line-height:1.35;color:var(--muted);padding:5px 14px 9px;margin:0}
+footer{justify-content:flex-start;gap:16px;color:var(--muted);font-size:11px;padding-bottom:8px}kbd{background:white;border:1px solid var(--line);border-radius:4px;padding:1px 4px;font:inherit;color:var(--ink)}footer .limits{margin-left:auto}button{font:inherit;color:var(--ink);background:white;border:1px solid var(--line);border-radius:6px;padding:4px 7px}button{cursor:pointer}button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}#stop{color:var(--alert)}
+@media(max-width:850px){main{grid-template-columns:minmax(0,1fr) 300px}.brand small{display:none}.pose{gap:4px 10px;padding:8px 10px}}
+@media(max-width:620px){body{grid-template-rows:40px minmax(0,1fr) 32px;gap:8px}main{grid-template-columns:1fr;grid-template-rows:minmax(110px,1fr) minmax(356px,1.15fr);gap:8px}aside{grid-template-rows:1fr;grid-template-columns:minmax(90px,.58fr) minmax(200px,1fr);gap:8px}.heading{height:34px;padding:0 10px}.camera .heading{display:block;height:47px;padding-top:6px}.sensor-table{width:calc(100% - 20px);margin:0 10px;font-size:11px}.sensor-table td{padding:2px 0;height:20px}.sensors .heading{height:30px}.sensor-note{padding:4px 10px 6px;font-size:9px}.legend{bottom:8px;left:10px}.pose{min-height:36px}.pose b{font-size:11px}.pose span{font-size:10px}footer{gap:8px;font-size:10px}footer .limits{display:none}.brand{font-size:13px}#connection{font-size:10px}#cam-off{font-size:11px;padding:8px}}
+@media(max-height:620px) and (min-width:621px){body{grid-template-rows:36px minmax(0,1fr) 28px;gap:6px}aside{grid-template-rows:minmax(70px,.5fr) minmax(260px,1fr);gap:6px}.heading{height:30px}.sensors .heading{height:28px}.sensor-table td{height:18px;padding:1px 0;font-size:11px}.sensor-note{font-size:9px;padding:3px 14px 5px}.pose{min-height:32px;padding:5px 14px}}
+.heading-end,.panel-actions{display:flex;align-items:center;gap:8px}.heading-end{min-width:0}.panel-actions{gap:3px;flex-shrink:0}.panel-action{width:25px;height:25px;padding:0;font-size:18px;line-height:1;border-color:transparent;background:transparent}.panel-action:hover{background:var(--bg);border-color:var(--line)}.map-meta{white-space:nowrap}.sensor-meta{font-size:10px}.heading h1,.heading h2{min-width:0}.is-collapsed>:not(.heading){display:none}.is-collapsed .map-meta,.is-collapsed #cam-status,.is-collapsed .sensor-meta{display:none}.is-collapsed h1,.is-collapsed h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.map.is-collapsed{align-self:start}
+#workspace:not([data-expanded=""]) section:not(.is-expanded){visibility:hidden}.is-expanded{position:fixed;inset:58px 16px 44px;z-index:5;width:auto;height:auto}
+@media(min-width:621px){#workspace[data-map-collapsed="true"]{grid-template-columns:200px minmax(0,1fr)}#workspace[data-camera-collapsed="true"] aside{grid-template-rows:42px minmax(0,1fr)}#workspace[data-sensors-collapsed="true"] aside{grid-template-rows:minmax(0,1fr) 38px}#workspace[data-camera-collapsed="true"][data-sensors-collapsed="true"] aside{grid-template-rows:42px 38px;align-content:start}}
+@media(max-width:850px){.sensor-meta{display:none}.heading-end{gap:5px}}
+@media(max-width:620px){.map-meta .zoom-hint,.map-meta .frame-label{display:none}.camera .heading{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;height:76px;gap:3px}.camera .heading-end{flex-wrap:wrap;gap:3px}.camera #cam-status{font-size:10px}.heading{gap:5px}.panel-action{width:23px;height:23px}.is-expanded{inset:48px 16px 40px}#workspace[data-map-collapsed="true"]{grid-template-rows:34px minmax(0,1fr)}#workspace[data-sensors-collapsed="true"] aside{grid-template-columns:minmax(90px,1fr) 132px}.camera.is-collapsed,.sensors.is-collapsed{align-self:start}#workspace[data-camera-collapsed="true"][data-sensors-collapsed="true"]{grid-template-rows:minmax(110px,1fr) 76px}#workspace[data-camera-collapsed="true"][data-sensors-collapsed="true"] aside{grid-template-columns:1fr 1fr}#workspace[data-map-collapsed="true"][data-camera-collapsed="true"][data-sensors-collapsed="true"]{grid-template-rows:34px 76px;align-content:start}}
+@media(max-height:620px) and (min-width:621px){.is-expanded{inset:42px 16px 34px}.panel-action{width:22px;height:22px}}
+</style></head><body>
+<header><div class="brand"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="13" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="16" r="4" stroke="currentColor" stroke-width="1.5"/><path d="M22 10v12M25 13v6" stroke="currentColor" stroke-width="1.5"/></svg>Roborock<span class="meta">V1</span><small>Рабочая панель</small></div><span id="connection" role="status">Ожидание ROS</span></header>
+<main id="workspace">
+<section id="panel-map" class="map" aria-labelledby="map-title"><div class="heading"><h1 id="map-title">Лидар и положение</h1><div class="heading-end"><span class="meta map-meta" title="Колесо мыши над картой меняет масштаб"><span class="zoom-hint">Колесо · </span><span id="scale-value">3.0 м</span><span class="frame-label"> · odom</span></span><div class="panel-actions"><button id="map-collapse" class="panel-action" type="button" aria-controls="panel-map" aria-expanded="true" aria-label="Свернуть панель «Лидар»">−</button><button id="map-expand" class="panel-action" type="button" aria-controls="panel-map" aria-pressed="false" aria-label="Развернуть панель «Лидар»">⤢</button></div></div></div>
+<div class="map-stage"><canvas id="scan" aria-label="Лидар, модель и ориентация робота в системе odom"></canvas><span id="map-message">Ожидание скана и TF</span><div class="legend"><span><i class="dot"></i>Скан</span><span><i class="robot-dot"></i>Робот Ø 0.345 м</span></div></div>
+<div class="pose" id="odom"><span>x <b id="pose-x">—</b></span><span>y <b id="pose-y">—</b></span><span>θ <b id="pose-yaw">—</b></span><span>v <b id="pose-v">—</b></span><span>ω <b id="pose-w">—</b></span></div></section>
+<aside>
+<section id="panel-camera" class="camera" aria-labelledby="camera-title"><div class="heading"><h2 id="camera-title">Камера</h2><div class="heading-end"><span id="cam-status">Подключение</span><div class="panel-actions"><button id="camera-collapse" class="panel-action" type="button" aria-controls="panel-camera" aria-expanded="true" aria-label="Свернуть панель «Камера»">−</button><button id="camera-expand" class="panel-action" type="button" aria-controls="panel-camera" aria-pressed="false" aria-label="Развернуть панель «Камера»">⤢</button></div></div></div><div class="camera-stage"><div id="cam-off" role="status">Подключение к камере…</div><img id="cam" alt="Прямой поток с камеры робота"></div></section>
+<section id="panel-sensors" class="sensors" aria-labelledby="sensor-title"><div class="heading"><h2 id="sensor-title">Датчики шасси</h2><div class="heading-end"><span class="meta sensor-meta">Range / V</span><div class="panel-actions"><button id="sensors-collapse" class="panel-action" type="button" aria-controls="panel-sensors" aria-expanded="true" aria-label="Свернуть панель «Датчики»">−</button><button id="sensors-expand" class="panel-action" type="button" aria-controls="panel-sensors" aria-pressed="false" aria-label="Развернуть панель «Датчики»">⤢</button></div></div></div>
+<table class="sensor-table" aria-label="Все датчики шасси"><tbody>
+<tr><td>Батарея</td><td id="battery" class="missing">нет данных</td></tr>
+<tr><td>Бампер</td><td id="bumper" class="missing">нет данных</td></tr>
+<tr><td>Стена</td><td id="wall" class="missing">нет данных</td></tr>
+<tr class="group"><td colspan="2">Обрыв · расстояние / напряжение</td></tr>
+<tr><td>ИК 1</td><td id="cliff-0" class="missing">нет данных</td></tr>
+<tr><td>ИК 2</td><td id="cliff-1" class="missing">нет данных</td></tr>
+<tr><td>ИК 3</td><td id="cliff-2" class="missing">нет данных</td></tr>
+<tr><td>ИК 4</td><td id="cliff-3" class="missing">нет данных</td></tr>
+<tr class="group"><td colspan="2">Отрыв колёс · расстояние / напряжение</td></tr>
+<tr><td>ИК 1</td><td id="drop-0" class="missing">нет данных</td></tr>
+<tr><td>ИК 2</td><td id="drop-1" class="missing">нет данных</td></tr>
+<tr><td>Сонар</td><td id="sonar" class="missing">нет данных</td></tr>
+</tbody></table><p class="sensor-note">Нули ИК — сырые показания, не признак безопасности. 65.534 м сонара — вероятный sentinel, не дистанция.</p></section>
+</aside></main>
+<footer><span><kbd>W A S D</kbd> / <kbd>↑ ← ↓ →</kbd> удерживать</span><button id="stop" type="button">Стоп · Space</button><span class="limits">≤ 0.1 м/с &nbsp; ≤ 0.4 рад/с</span></footer>
+<script>
+const $=id=>document.getElementById(id);
+let state={},lidar={},cameraRetry,viewRadius=3;
+const finite=v=>typeof v==='number'&&Number.isFinite(v);
+const fmt=(v,d=2)=>finite(v)?v.toFixed(d):'—';
+function reading(id,text,alert=false){const el=$(id);el.textContent=text??'нет данных';el.className=text===null?'missing':alert?'alert':'';}
+function pair(range,voltage){if(!finite(range)&&!finite(voltage))return null;return `${fmt(range,3)} м / ${fmt(voltage)} V`;}
+function renderState(s){
+ state=s;const v=s.sensors||{};
+ reading('battery',v.battery?`${v.battery.percent}% / ${v.battery.volts} V${v.battery.charging?' · заряд':''}`:null);
+ reading('bumper',v.bumper===null||v.bumper===undefined?null:v.bumper==='PRESSED'?'Нажат':'Свободен',v.bumper==='PRESSED');
+ reading('wall',pair(v.wall_ir,v.wall_voltages?.[0]));
+ for(const [name,count]of [['cliff',4],['drop',2]])for(let i=0;i<count;i++)reading(`${name}-${i}`,pair(v[`${name}_ranges`]?.[i],v[`${name}_ir`]?.[i]));
+ reading('sonar',finite(v.sonar)?v.sonar>65?'65.534 м · sentinel':`${fmt(v.sonar,3)} м`:null,finite(v.sonar)&&v.sonar>65);
+ const o=s.odom||{};for(const [id,val,unit]of [['x',o.x,'м'],['y',o.y,'м'],['yaw',finite(o.yaw)?o.yaw*180/Math.PI:null,'°'],['v',o.vx,'м/с'],['w',o.yaw_rate,'рад/с']])$(`pose-${id}`).textContent=finite(val)?`${fmt(val)} ${unit}`:'—';
+ $('connection').textContent=s.odom?'Данные ROS':'Ожидание ROS';drawMap();
+}
+const canvas=$('scan'),ctx=canvas.getContext('2d');
+function drawMap(){
+ const box=canvas.getBoundingClientRect(),W=box.width,H=box.height;if(!W||!H)return;
+ const dpr=devicePixelRatio||1;canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);
+ ctx.fillStyle='#f8fafc';ctx.fillRect(0,0,W,H);
+ const o=state.odom,ox=o?.x||0,oy=o?.y||0,r=viewRadius,k=Math.max(1,Math.min(W,H)-54)/(2*r);
+ const at=(x,y)=>[W/2+(x-ox)*k,H/2-(y-oy)*k];
+ ctx.lineWidth=1;ctx.strokeStyle='#e0e8ef';ctx.beginPath();
+ const step=r<=1?.25:r<=6?1:5;for(let x=Math.floor((ox-W/(2*k))/step)*step;x<ox+W/(2*k);x+=step){const[p]=at(x,0);ctx.moveTo(p,0);ctx.lineTo(p,H);}
+ for(let y=Math.floor((oy-H/(2*k))/step)*step;y<oy+H/(2*k);y+=step){const[,p]=at(0,y);ctx.moveTo(0,p);ctx.lineTo(W,p);}ctx.stroke();
+ ctx.fillStyle='#576b7c';ctx.font='11px system-ui';ctx.fillText(`${step} м`,W-44,H-12);
+ ctx.fillStyle='#2a78d6';for(const[x,y]of lidar.points||[]){const[a,b]=at(x,y);ctx.beginPath();ctx.arc(a,b,2,0,2*Math.PI);ctx.fill();}
+ if(o){
+ const[x,y]=at(o.x,o.y),radius=.1725*k;ctx.save();ctx.translate(x,y);ctx.rotate(-o.yaw-Math.PI/2);
+ ctx.fillStyle='#fff';ctx.strokeStyle='#223446';ctx.lineWidth=2;ctx.beginPath();ctx.arc(0,0,radius,0,2*Math.PI);ctx.fill();ctx.stroke();
+ ctx.fillStyle='#edf2f6';ctx.beginPath();ctx.arc(-.1*k,0,.045*k,0,2*Math.PI);ctx.fill();ctx.stroke();
+ ctx.beginPath();ctx.moveTo(radius+10,0);ctx.lineTo(radius+3,-4);ctx.lineTo(radius+3,4);ctx.closePath();ctx.fillStyle='#223446';ctx.fill();ctx.restore();
+ }
+ $('map-message').textContent=lidar.error||(!lidar.points?.length?'Ожидание скана и TF':!o?'Ожидание одометрии':'');
+}
+new ResizeObserver(drawMap).observe(canvas);
+canvas.addEventListener('wheel',e=>{
+ e.preventDefault();if(!Number.isFinite(e.deltaY))return;
+ const unit=e.deltaMode===1?16:e.deltaMode===2?canvas.getBoundingClientRect().height:1;
+ viewRadius=Math.max(.35,Math.min(30,viewRadius*Math.exp(e.deltaY*unit*.0015)));
+ $('scale-value').textContent=`${viewRadius.toFixed(viewRadius<1?2:1)} м`;drawMap();
+},{passive:false});
+const panelNames={map:'Лидар',camera:'Камера',sensors:'Датчики'};
+const collapsedPanels=new Set();let expandedPanel=null;
+function syncPanels(){
+ const workspace=$('workspace');workspace.dataset.expanded=expandedPanel||'';
+ for(const[id,name]of Object.entries(panelNames)){
+  const collapsed=collapsedPanels.has(id),expanded=expandedPanel===id;
+  $('panel-'+id).classList.toggle('is-collapsed',collapsed);
+  $('panel-'+id).classList.toggle('is-expanded',expanded);
+  workspace.dataset[id+'Collapsed']=String(collapsed);
+  const collapse=$(id+'-collapse'),expand=$(id+'-expand');
+  collapse.setAttribute('aria-expanded',String(!collapsed));
+  collapse.setAttribute('aria-label',`${collapsed?'Открыть':'Свернуть'} панель «${name}»`);
+  collapse.title=collapse.getAttribute('aria-label');collapse.textContent=collapsed?'+':'−';
+  expand.setAttribute('aria-pressed',String(expanded));
+  expand.setAttribute('aria-label',`${expanded?'Вернуть размер':'Развернуть панель'} «${name}»`);
+  expand.title=expand.getAttribute('aria-label');expand.textContent=expanded?'⤡':'⤢';
+ }
+ drawMap();
+}
+for(const id of Object.keys(panelNames)){
+ $(id+'-collapse').addEventListener('click',()=>{
+  if(expandedPanel===id)expandedPanel=null;
+  if(collapsedPanels.has(id))collapsedPanels.delete(id);else collapsedPanels.add(id);
+  syncPanels();
+ });
+ $(id+'-expand').addEventListener('click',()=>{
+  expandedPanel=expandedPanel===id?null:id;
+  if(expandedPanel)collapsedPanels.delete(id);
+  syncPanels();
+ });
+}
+addEventListener('keydown',e=>{
+ if(e.code!=='Escape'||!expandedPanel)return;
+ e.preventDefault();const id=expandedPanel;expandedPanel=null;syncPanels();$(id+'-expand').focus();
+});
+syncPanels();
+async function poll(){try{const [a,b]=await Promise.all([fetch('/state.json'),fetch('/scan.json')]);if(!a.ok||!b.ok)throw Error();lidar=await b.json();renderState(await a.json());}catch{$('connection').textContent='Нет связи с панелью';}finally{setTimeout(poll,400);}}poll();
+const cam=$('cam');
+function connectCamera(){clearTimeout(cameraRetry);$('cam-status').textContent='Подключение';cam.src='/camera.mjpeg?t='+Date.now();}
+cam.onerror=()=>{cam.style.visibility='hidden';$('cam-off').hidden=false;$('cam-off').textContent='Камера недоступна. Повторное подключение…';$('cam-status').textContent='Нет потока';cameraRetry=setTimeout(connectCamera,2500);};
+cam.onload=()=>{cam.style.visibility='visible';$('cam-off').hidden=true;$('cam-status').textContent='Прямой поток';};connectCamera();
+let cur={v:0,w:0};const held=new Set();
+function send(){fetch('/cmd_vel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cur)}).catch(()=>{});}
+function stop(){held.clear();cur={v:0,w:0};send();}
+const keys={ArrowUp:['v',1],KeyW:['v',1],ArrowDown:['v',-1],KeyS:['v',-1],ArrowLeft:['w',1],KeyA:['w',1],ArrowRight:['w',-1],KeyD:['w',-1]};
+function updateCommand(){cur={v:0,w:0};for(const code of held){const[axis,dir]=keys[code];cur[axis]=dir*(axis==='v'?.1:.4);}send();}
+addEventListener('keydown',e=>{if(['SELECT','INPUT','BUTTON','TEXTAREA'].includes(e.target.tagName))return;if(e.code==='Space'){stop();e.preventDefault();return;}if(!keys[e.code])return;e.preventDefault();held.add(e.code);updateCommand();});
+addEventListener('keyup',e=>{if(!held.has(e.code))return;e.preventDefault();held.delete(e.code);updateCommand();});
+function release(){if(held.size||cur.v||cur.w)stop();}
+addEventListener('blur',release);document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
+setInterval(()=>{if(held.size)send();},150);$('stop').addEventListener('click',stop);
+</script></body></html>
