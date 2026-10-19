@@ -13,6 +13,7 @@
 - [Требования](#требования)
 - [Установка](#установка)
 - [Команды CLI](#команды-cli-robot)
+- [Звук и голос](#звук-и-голос)
 - [Навигация: карта и поездка](#навигация-от-карты-до-поездки)
 - [Конфигурация и скрипты](#конфигурация-и-скрипты)
 - [Разработка и тесты](#разработка-и-тесты)
@@ -147,6 +148,7 @@ robot run --slam              # живой робот: клик-цель в RViz
                               #   при выходе (см. «Шаг 3»)
 
 robot snapshot ./frame.jpg    # кадр с OpenIPC-камеры (HTTP Basic)
+robot audio --help            # захват, динамик, TTS, wake word и диагностика
 
 robot bug list                # GitLab-задачи (см. robot bug --help)
 ```
@@ -220,6 +222,35 @@ Ctrl-C в терминале завершает сессию: панель ос�
 `robot panel`: он подключится к `/map`, не меняя состояние сессии.
 **Не используйте ручное управление панели одновременно с активной
 автономной навигацией Nav2**: у них общий `/cmd_vel`.
+
+## Звук и голос
+
+Аудиосервис на хосте получает один поток `http://cam/audio.opus`, декодирует
+его в PCM 16 кГц/моно и предоставляет ROS 2-топики, wake word и локальное ASR.
+Выход — отдельный ALSA-helper на пылесосе и отменяемые Actions воспроизведения
+и речи. TTS первой версии — через явно настроенную модель OpenRouter;
+микрофонные записи внешнему провайдеру не отправляются.
+
+```sh
+robot audio check-config --config config/audio.example.json
+robot audio run --config config/audio.example.json  # по умолчанию всё disabled
+robot audio status
+robot audio mute on             # запретить озвучивание, не выключая микрофон
+robot audio listen off          # остановить захват и очистить голосовой сеанс
+```
+
+Сначала собрать `robot_audio_interfaces` через colcon из `ros-ws`.
+Аудиокоманды **не включают лидар**, не снимают RoboController и не запускают
+движение. Установка helper на робота — отдельный явный `audio deploy --confirm`.
+Новый ARM-helper проверен на роботе: воспроизведение, BUSY и подтверждённая
+отмена работают без перезапуска штатного контроллера. Живой TTS проверен с
+`openai/gpt-audio-mini` / `alloy`, потоковый формат — PCM16. Камера принимает
+контрольную речь, но её уровень низкий; русская wake-модель, дальняя речь и
+акустический full-duplex ещё не приняты. Нет скрытого облачного ASR или
+автоматических загрузок моделей. Результаты — [живая проверка](docs/audio-live-20261018.md).
+
+Сборка, конфигурация, полный ROS-контракт, запись для измерений, приёмка
+моделей, ограничения и тесты описаны в [docs/audio.md](docs/audio.md).
 
 ## Навигация: от карты до поездки
 
@@ -444,6 +475,8 @@ python3 tests/test_robot_bug.py
 python3 tests/test_web_panel.py
 python3 tests/test_camera_transport.py
 python3 tests/test_panel_http.py
+# Аудио без устройств; ROS-тесты требуют собранного robot_audio_interfaces:
+python3 -m unittest discover -s tests -p 'test_audio*.py'
 node tests/test_panel_frontend.cjs
 # ROS-интеграция панели: локальные фейки в отдельном DDS-домене
 source /opt/ros/jazzy/setup.bash
