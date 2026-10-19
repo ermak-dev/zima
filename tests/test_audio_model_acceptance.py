@@ -61,6 +61,52 @@ class ModelAcceptanceTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_experimental_model_requires_explicit_opt_in_and_still_checks_report(self):
+        self.manifest['verified']=False
+        self.file.write_text(json.dumps(self.manifest))
+        with self.assertRaises(ConfigurationRequired):load_wake_manifest(self.file,require_russian=True)
+        result=load_wake_manifest(self.file,require_russian=True,allow_experimental=True)
+        self.assertTrue(result['experimental'])
+        self.assertFalse(result['verified'])
+        self.report['accepted']=False;self.write_report()
+        with self.assertRaises(ConfigurationRequired):load_wake_manifest(self.file,require_russian=True,allow_experimental=True)
+
+    def test_opposite_stress_report_cannot_verify_the_chosen_pronunciation(self):
+        self.manifest['pronunciation']='вы́бранная фра́за'
+        self.file.write_text(json.dumps(self.manifest))
+        self.report['pronunciation']='выбра́нная фра́за';self.write_report()
+        with self.assertRaises(ConfigurationRequired):load_wake_manifest(self.file,require_russian=True)
+
+    def test_runtime_experimental_opt_in_is_visible_and_does_not_set_verified(self):
+        from unittest.mock import patch
+        from robot_audio.runtime import AudioRuntime
+        class Session:
+            state='waiting';session_id=None;last_error=''
+            def close(self):pass
+            def tick(self,**kwargs):return []
+        self.manifest['verified']=False;self.file.write_text(json.dumps(self.manifest))
+        config={'wake':{'enabled':True,'manifest':str(self.file),'threshold':.6},
+                'input':{'microphone_verified':True},
+                'speech':{'enabled':True,'asr_model_path':'injected','language':'ru'}}
+        with patch('robot_audio.wake.OpenWakeWordBackend'):
+            runtime=AudioRuntime(config,session=Session(),allow_experimental_wake=True)
+            states=[];runtime.set_callbacks(speech_state=states.append)
+            try:
+                runtime.start();self.assertIsNotNone(runtime.detector)
+                self.assertEqual(states[-1]['error'],'experimental_model')
+                self.assertFalse(json.loads(self.file.read_text())['verified'])
+            finally:runtime.close()
+
+    def test_standalone_russian_detector_cannot_bypass_experimental_opt_in(self):
+        from unittest.mock import patch
+        from robot_audio.runtime import AudioRuntime
+        self.manifest['verified']=False;self.file.write_text(json.dumps(self.manifest))
+        with patch('robot_audio.wake.OpenWakeWordBackend') as backend:
+            runtime=AudioRuntime({'wake':{'enabled':True,'manifest':str(self.file),'threshold':.6}})
+            try:
+                self.assertIsNone(runtime.detector);backend.assert_not_called()
+            finally:runtime.close()
+
     def test_matching_report_exposes_the_evaluated_threshold(self):
         manifest = load_wake_manifest(self.file, require_russian=True)
         self.assertEqual(manifest['evaluation_threshold'], .6)

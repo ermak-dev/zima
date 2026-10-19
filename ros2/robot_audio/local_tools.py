@@ -64,6 +64,8 @@ def run_local(args):
     if args.command == 'evaluate':
         from .evaluation import load_dataset, evaluate_dataset, calibrate_threshold, wav_record_runner
         dataset = load_dataset(args.manifest)
+        from .training import validate_training_pronunciations
+        phrase_spec = validate_training_pronunciations(dataset)
         model_path = getattr(args, 'wake_manifest', None)
         if not model_path:
             report = {'mode': 'dataset_validation_only', 'model_verified': False,
@@ -80,6 +82,13 @@ def run_local(args):
             else:
                 report = evaluate_dataset(args.manifest, runner, threshold=args.threshold, split=args.split)
             report['artifacts_sha256'] = wake_artifact_hashes(manifest)
+        if phrase_spec:
+            report.update(pronunciation=phrase_spec.pronunciation,
+                          negative_pronunciations=list(phrase_spec.negative_pronunciations))
+        if 'verification_scope' in dataset:
+            report['verification_scope'] = dataset['verification_scope']
+        if 'heldout_wrong_stress_negative' in dataset:
+            report['heldout_wrong_stress_negative'] = dataset['heldout_wrong_stress_negative']
         print(json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2))
         return 0
     raise ValueError('unsupported local audio operation')

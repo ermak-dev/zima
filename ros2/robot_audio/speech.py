@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .wake import ConfigurationRequired, _finite, validate_chunk
+from .phrases import strip_wake_prefix
 
 
 def _samples(pcm):
@@ -240,14 +241,7 @@ class SpeechSession:
         self.state = 'transcribing'
 
     def _strip_wake(self, text):
-        phrase = self.wake_phrase.strip()
-        if not phrase:
-            return text.strip()
-        words = re.findall(r'\w+', phrase, re.UNICODE)
-        if not words:
-            return text.strip()
-        pattern = r'^\W*' + r'\W+'.join(re.escape(word) for word in words) + r'\b[\W]*'
-        return re.sub(pattern, '', text, count=1, flags=re.IGNORECASE).strip()
+        return strip_wake_prefix(text, self.wake_phrase, allow_asr_substitution=True)
 
     def tick(self, *, now=None):
         now = self._now(now)

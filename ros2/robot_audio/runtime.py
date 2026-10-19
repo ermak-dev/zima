@@ -16,7 +16,11 @@ _TERMINAL = {'completed', 'cancelled', 'expired', 'failed', 'unknown'}
 
 class AudioRuntime:
     def __init__(self, config=None, *, source=None, detector=None, session=None,
-                 playback=None, tts=None, echo=None, output_policy=None, clock=time.monotonic):
+                 playback=None, tts=None, echo=None, output_policy=None, clock=time.monotonic,
+                 allow_experimental_wake=False):
+        if type(allow_experimental_wake) is not bool:
+            raise ValueError('experimental wake consent must be boolean')
+        self.allow_experimental_wake = allow_experimental_wake
         self.config = validate_config(config or {})
         self.clock = clock
         from .policy import OutputPolicy
@@ -58,8 +62,14 @@ class AudioRuntime:
             try:
                 from .wake import load_wake_manifest, OpenWakeWordBackend, WakeDetector
                 cfg = self.config['wake']
-                russian = self.config['speech']['enabled'] and self.config['speech']['language'] == 'ru'
-                manifest = load_wake_manifest(cfg['manifest'], require_russian=russian)
+                manifest = load_wake_manifest(cfg['manifest'])
+                russian = (manifest['language'].lower() == 'ru' or
+                    (self.config['speech']['enabled'] and self.config['speech']['language'] == 'ru'))
+                if russian:
+                    manifest = load_wake_manifest(cfg['manifest'], require_russian=True,
+                                                  allow_experimental=self.allow_experimental_wake)
+                if manifest.get('experimental'):
+                    self._errors['wake'] = 'experimental_model'
                 if russian and abs(cfg['threshold'] - manifest['evaluation_threshold']) > 1e-9:
                     raise ValueError('wake threshold differs from held-out evaluation')
                 self.detector = WakeDetector(OpenWakeWordBackend(manifest), phrase=manifest['phrase'],

@@ -44,7 +44,7 @@ def wake_artifact_hashes(manifest):
     return hashes
 
 
-def load_wake_manifest(path, *, require_russian=False):
+def load_wake_manifest(path, *, require_russian=False, allow_experimental=False):
     path = Path(path).expanduser().resolve()
     try:
         if path.stat().st_size > 65536:
@@ -66,8 +66,9 @@ def load_wake_manifest(path, *, require_russian=False):
                 raise ConfigurationRequired(f'missing or oversized local {key}')
             data[key] = str(model)
         if require_russian:
-            if data['language'] != 'ru' or data.get('verified') is not True:
+            if data['language'] != 'ru' or (data.get('verified') is not True and allow_experimental is not True):
                 raise ConfigurationRequired('verified Russian wake model is required')
+            data['experimental'] = data.get('verified') is not True
             report_path = data.get('evaluation_report')
             if not isinstance(report_path, str):
                 raise ConfigurationRequired('held-out evaluation report is required')
@@ -78,6 +79,12 @@ def load_wake_manifest(path, *, require_russian=False):
             if (report.get('accepted') is not True or report.get('split') != 'test' or
                     report.get('phrase') != data['phrase'] or report.get('language') != data['language']):
                 raise ConfigurationRequired('matching held-out wake evaluation is required')
+            if 'pronunciation' in data:
+                from .phrases import PhraseSpec
+                PhraseSpec(data['phrase'], data['pronunciation'], data.get('negative_pronunciations', ()))
+                if (report.get('pronunciation') != data['pronunciation'] or
+                        report.get('negative_pronunciations', []) != data.get('negative_pronunciations', [])):
+                    raise ConfigurationRequired('wake pronunciation differs from the evaluated phrase')
             if report.get('artifacts_sha256') != wake_artifact_hashes(data):
                 raise ConfigurationRequired('wake artifacts differ from the evaluated model')
             data['evaluation_threshold'] = _finite(report.get('threshold'), 'evaluated threshold', 0, 1)

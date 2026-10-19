@@ -77,6 +77,19 @@ class EvaluationToolsTests(unittest.TestCase):
         self.assertEqual(report['split'], 'validation')
         self.assertTrue(all(item['split'] == 'validation' for item in report['reports']))
 
+    def test_pronunciation_acceptance_is_preserved_and_unverified_positives_fail(self):
+        data=json.loads(self.dataset.read_text())
+        data.update(pronunciation='test phrase',negative_pronunciations=[],verification_scope='synthetic_only')
+        for record in data['records']:
+            record['spoken_pronunciation']='test phrase' if record['events'] else 'other'
+            record['pronunciation_verified']=True
+        self.dataset.write_text(json.dumps(data))
+        report=self.run_report(wake_manifest=self.model)
+        self.assertEqual(report['pronunciation'],'test phrase')
+        self.assertEqual(report['verification_scope'],'synthetic_only')
+        data['records'][0]['pronunciation_verified']=False;self.dataset.write_text(json.dumps(data))
+        with self.assertRaises(ValueError):self.run_report(wake_manifest=self.model)
+
     def test_model_phrase_must_match_the_dataset(self):
         data = json.loads(self.model.read_text()); data['phrase'] = 'different'
         self.model.write_text(json.dumps(data))

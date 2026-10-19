@@ -44,6 +44,22 @@ class SpeechTests(unittest.TestCase):
                              silence_s=.2, wait_s=1, max_command_s=2,
                              asr_timeout_s=1, echo_tail_s=.2, **kwargs), recognizer
 
+    def test_stressed_name_strips_only_the_full_lexical_wake_prefix(self):
+        session,recognizer=self.session()
+        session.wake_phrase='Привет, Зи́ма'
+        self.assertEqual(session._strip_wake('Привет, Зима! Какой у тебя заряд?'),'Какой у тебя заряд?')
+        self.assertEqual(session._strip_wake('Привет, Зи́ма'),'')
+        self.assertEqual(session._strip_wake('Привет, Зимарь, привет'),'Привет, Зимарь, привет')
+
+    def test_confirmed_wake_session_cleans_one_asr_name_substitution(self):
+        session, recognizer = self.session()
+        session.wake_phrase = 'Привет, Зима'
+        self.assertTrue(session.on_wake(wake(), now=0))
+        session.feed(block(speech=False), now=.3)
+        recognizer.future.set_result('Привет, Сима. Какое тебя заряд?')
+        transcript, = session.tick(now=.4)
+        self.assertEqual(transcript.text, 'Какое тебя заряд?')
+
     def test_one_command_preserves_preroll_and_strips_initial_wake_phrase(self):
         session, recognizer = self.session()
         self.assertTrue(session.on_wake(wake(), now=0))

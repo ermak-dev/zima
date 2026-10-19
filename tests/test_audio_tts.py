@@ -164,6 +164,16 @@ class TTSTests(unittest.TestCase):
         self.assertEqual(client.last_usage,{})
         self.assertEqual(client.last_transcript,'')
 
+    def test_stress_hints_do_not_change_lexical_verbatim_matching(self):
+        transcript=('data: '+json.dumps({'choices':[{'delta':{'audio':{'transcript':'Привет, Зима'}}}]})+'\n\n').encode()
+        self.body=transcript+sse(wav_data())
+        client=self.client(require_verbatim=True,pronunciation_hints={'Зима':'Зи́ма'})
+        self.assertEqual(client.synthesize('Привет, Зи́ма'),wav_data())
+        job=json.loads(json.loads(self.requests[-1].data)['messages'][-1]['content'])
+        self.assertEqual(job['pronunciation_hints'],{'Зима':'Зи́ма'})
+        self.assertEqual(job['text'],'Привет, Зи́ма')
+        with self.assertRaises(ValueError):self.client(pronunciation_hints={'Зима':'другая команда'})
+
     def test_private_token_file(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'token'; p.write_text('private-test-token\n'); p.chmod(0o600)
