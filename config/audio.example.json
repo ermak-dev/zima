@@ -56,6 +56,13 @@
     "echo_tail_s": 0.5,
     "vad_threshold_dbfs": -40.0
   },
+  "controller": {
+    "enabled": false,
+    "allow_reported_battery": false,
+    "cache_only": false,
+    "reply_cache": {},
+    "max_queue_s": 5.0
+  },
   "echo": {
     "enabled": false,
     "verified": false,

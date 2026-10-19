@@ -1,4 +1,5 @@
 """ROS transport for the host audio runtime; it never publishes robot motion."""
+import hashlib
 import math
 import re
 import threading
@@ -45,13 +46,14 @@ def _seconds(value):
 
 
 class AudioNode(Node):
-    def __init__(self, runtime=None, config=None, **kwargs):
+    def __init__(self, runtime=None, config=None, battery_reader=None, allow_experimental_wake=False, **kwargs):
         super().__init__('robot_audio', **kwargs)
         self.config = validate_config(config or {})
         if runtime is None:
             from .runtime import AudioRuntime
-            runtime = AudioRuntime(self.config)
+            runtime = AudioRuntime(self.config, allow_experimental_wake=allow_experimental_wake)
         self.runtime = runtime
+        self._controller = None
         self._closed = False
         self._goal_lock = threading.Lock()
         self._cancellations = {}
@@ -90,6 +92,13 @@ class AudioNode(Node):
             SetBool, '/robot/audio/output/set_muted', self._set_muted, callback_group=self._group)
         self._finish_service = self.create_service(
             FinishSpeech, '/robot/speech/finish', self._finish_speech, callback_group=self._group)
+        if self.config['controller']['enabled']:
+            from .controller import VoiceController, RobotBatteryReader
+            cfg = self.config['controller']
+            self._controller = VoiceController(battery_reader or RobotBatteryReader(), self._speak_reply,
+                runtime.response_finished, allow_reported=cfg['allow_reported_battery'],
+                max_queue_s=cfg['max_queue_s'])
+            self._controller.start()
         runtime.set_callbacks(chunk=self._chunk, input_state=self._input_state,
                               wake=self._wake, transcript=self._transcript,
                               playback=self._playback, reference=self._reference,
@@ -266,6 +275,26 @@ class AudioNode(Node):
                                    status=str(value.get('status', '')), error=str(value.get('error', '')))
         _stamp(message.header.stamp, value.get('stamp_ns', time.time_ns()))
         self._transcript_pub.publish(message)
+        if self._controller is not None:
+            self._controller.submit(value)
+
+    def _speak_reply(self, text, session_id, cancel):
+        cfg = self.config['controller']
+        request = {'volume': self.config['output']['volume'], 'priority': 0, 'max_queue_wait': 30.0}
+        asset = cfg['reply_cache'].get(text)
+        if asset:
+            kind = 'play'
+            request['asset_id'] = asset
+        elif cfg['cache_only']:
+            self._component_diagnostic({'name': 'voice_controller', 'state': 'reply_cache_miss'})
+            return
+        else:
+            kind = 'say'
+            request.update(text=text, voice='')
+        task_id = 'voice-' + hashlib.sha256(session_id.encode()).hexdigest()
+        result = self.runtime.execute(kind, request, task_id, cancel, lambda value: None)
+        if result.get('error_code'):
+            self._component_diagnostic({'name': 'voice_controller', 'state': 'reply_not_completed'})
 
     def _playback(self, value):
         message = PlaybackState(state=str(value.get('state', 'idle')),
@@ -297,7 +326,11 @@ class AudioNode(Node):
         with self._goal_lock:
             for event in self._cancellations.values():
                 event.set()
-        self.runtime.close()
+        try:
+            if self._controller is not None:
+                self._controller.close()
+        finally:
+            self.runtime.close()
         with self._goal_lock:
             workers = list(self._workers)
         for worker in workers:

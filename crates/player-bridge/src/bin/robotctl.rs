@@ -30,7 +30,7 @@ fn install_signal_handlers() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: robotctl <host> position|fan|stop|move <forward|backward|left|right> <seconds (0, 2]>"
+        "usage: robotctl <host> position|fan|battery|stop|move <forward|backward|left|right> <seconds (0, 2]>"
     );
     std::process::exit(2);
 }
@@ -66,6 +66,70 @@ fn read_position(
     }
 }
 
+// A separate path is essential: ordinary robotctl commands subscribe position2d
+// and send a stop on exit. Battery must never do either, even on errors.
+fn battery(host: String, port: u16) -> i32 {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut client = Client::connect(&host, port)?;
+            if client.subscribe(player_bridge::POWER_CODE, 0)? != player_bridge::OPEN_MODE {
+                return Err(Error::Nak);
+            }
+            loop {
+                let msg = client.read_message()?;
+                if msg.header.msg_type == MSGTYPE_DATA
+                    && msg.header.addr.interf == player_bridge::POWER_CODE
+                    && msg.header.addr.index == 0
+                    && msg.header.subtype == player_bridge::POWER_DATA_STATE
+                {
+                    return player_bridge::decode_power(&msg.payload);
+                }
+            }
+        })();
+        let _ = tx.send(result);
+    });
+    // Bounds the whole operation, including DNS, banner and ACK. main exits the
+    // process after this returns, so a stalled worker cannot keep the CLI alive.
+    let state = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(state)) => Some(state),
+        error => {
+            eprintln!("robotctl: battery unavailable within 3 seconds: {error:?}");
+            None
+        }
+    };
+    let number = |value: Option<f32>| {
+        value
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".into())
+    };
+    let valid = state.as_ref().map(|s| s.valid).unwrap_or(0);
+    let percent = state
+        .as_ref()
+        .filter(|s| valid & 8 != 0 && s.percent.is_finite() && (0.0..=100.0).contains(&s.percent))
+        .map(|s| s.percent);
+    let voltage = state
+        .as_ref()
+        .filter(|s| valid & 1 != 0 && s.volts.is_finite() && s.volts > 0.0)
+        .map(|s| s.volts);
+    let charging = match state
+        .as_ref()
+        .filter(|_| valid & 16 != 0)
+        .map(|s| s.charging)
+    {
+        Some(0) => "false",
+        Some(1) => "true",
+        _ => "null",
+    };
+    // Player's header timestamp is not evidence of sensor measurement time.
+    println!("{{\"valid\":{valid},\"percent\":{},\"voltage\":{},\"charging\":{charging},\"freshness\":\"unknown\",\"measurement_time\":null}}", number(percent), number(voltage));
+    if state.is_some() {
+        0
+    } else {
+        1
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 || args[0].is_empty() {
@@ -89,7 +153,7 @@ fn main() {
             };
             (linear, angular, duration)
         }
-        "position" | "fan" | "stop" => {
+        "position" | "fan" | "battery" | "stop" => {
             if !args.is_empty() {
                 usage();
             }
@@ -105,6 +169,10 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(6665);
+
+    if cmd == "battery" {
+        std::process::exit(battery(host, port));
+    }
 
     let mut client = match Client::connect(&host, port) {
         Ok(c) => c,

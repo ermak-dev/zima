@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Control the rooted vacuum through Player without starting cleaning.
 # Usage: robot enable|disable|status        # stock controller handoff
-#        robot position|fan|stop
+#        robot position|fan|battery|stop   # battery: read-only power:0 JSON
 #        robot snapshot [output.jpg]
 #        robot audio <command>   # capture, playback, speech (see audio --help)
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
@@ -285,7 +285,7 @@ case $cmd in
     status)
         (( $# == 0 )) || fail 'usage: robot status'
         controller_status ;;
-    position|fan)
+    position|fan|battery)
         (( $# == 0 )) || fail "$cmd takes no arguments"
         robotctl "$cmd" ;;
     snapshot)

@@ -85,6 +85,13 @@ grep -q 'robot enable|disable|status' "$tmp/out" || fail 'help is missing flat c
 # consumed on stdin. Two bash -s dispatches mean both scripts ran.
 [[ $(grep -c 'ssh:robot bash -s' "$tmp/log") == 2 ]] || fail 'enable/disable not dispatched'
 : > "$tmp/log"
+# FEATURE: battery dispatch is read-only even with the stock controller enabled.
+"$root/bin/robot" battery
+assert_log 'robotctl:192.0.2.82 battery'
+[[ $(wc -l < "$tmp/log") == 1 ]] || fail 'battery touched controller or armed movement guard'
+: > "$tmp/log"
+expect_failure "$root/bin/robot" battery extra
+[[ ! -s $tmp/log ]] || fail 'invalid battery arguments performed IO'
 "$root/bin/robot" position
 assert_log 'robotctl:192.0.2.82 position'
 "$root/bin/robot" snapshot "$tmp/frame.jpg"
@@ -140,8 +147,16 @@ ROSEOF
 chmod +x "$tmp/fake-ros/ros2"
 # a no-op ROS setup: source_ros must not pull the real distro (nor the
 # real workspace, whose shim would shadow the fake ros2) into the test
-printf '# fake distro setup\n' > "$tmp/fake-ros/setup.sh"
-printf '# fake ws setup\n' > "$tmp/fake-ros/ws.sh"
+export ROBOT_TEST_ROS_LOG="$tmp/ros-log"
+cat > "$tmp/fake-ros/setup.sh" <<'EOF'
+printf 'setup:ros\n' >> "$ROBOT_TEST_ROS_LOG"
+EOF
+cat > "$tmp/fake-ros/ws.sh" <<'EOF'
+printf 'setup:ws\n' >> "$ROBOT_TEST_ROS_LOG"
+EOF
+# Every bridge case must use fake ROS, including failure paths.
+export PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
+    ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh"
 : > "$tmp/log"
 PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
     ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh" \
@@ -176,8 +191,11 @@ first_sup=$(grep -n 'supervisor:' "$tmp/log" | head -1 | cut -d: -f1)
 [[ -n $first_stale && -n $first_sup && $first_stale -lt $first_sup ]] \
     || fail 'stale supervisor reaped after starting the new one'
 : > "$tmp/log"
+: > "$tmp/ros-log"
 ROBOT_TEST_SUPERVISOR_ACTIVE=1 ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
-grep -q 'refusing to start another' "$tmp/out" || fail 'activated supervisor session not refused'
+grep -Fqx 'setup:ros' "$tmp/ros-log" || fail 'active supervisor case did not source fake ROS'
+grep -Fqx 'setup:ws' "$tmp/ros-log" || fail 'active supervisor case did not source fake workspace'
+grep -q 'refusing to start another' "$tmp/out" || fail "activated supervisor session not refused: $(cat "$tmp/out")"
 if grep -q 'pkill:stale-supervisor' "$tmp/log"; then fail 'an activated supervisor was killed as stale'; fi
 if grep -q 'controller disabled' "$tmp/out"; then fail 'controller was disabled despite an active session'; fi
 : > "$tmp/log"

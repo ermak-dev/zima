@@ -26,6 +26,8 @@ _DEFAULTS = {
                'mode': 'half_duplex', 'max_command_s': 15.0,
                'end_silence_s': .8, 'listen_timeout_s': 5.0,
                'asr_timeout_s': 30.0, 'echo_tail_s': .5, 'vad_threshold_dbfs': -40.0},
+    'controller': {'enabled': False, 'allow_reported_battery': False, 'cache_only': False,
+                   'reply_cache': {}, 'max_queue_s': 5.0},
     'echo': {'enabled': False, 'verified': False, 'delay_ms': 0,
              'max_drift_ms': 40, 'filter_ms': 200},
 }
@@ -90,6 +92,7 @@ def validate_config(patch):
         ('speech', 'asr_timeout_s'): (.1, 120, False),
         ('speech', 'echo_tail_s'): (0, 5, False),
         ('speech', 'vad_threshold_dbfs'): (-100, 0, False),
+        ('controller', 'max_queue_s'): (.1, 30, False),
         ('echo', 'delay_ms'): (0, 2000, True),
         ('echo', 'max_drift_ms'): (1, 100, True),
         ('echo', 'filter_ms'): (20, 1000, True),
@@ -118,6 +121,13 @@ def validate_config(patch):
         raise ValueError('unknown speech duplex mode')
     if speech['mode'] == 'full_duplex' and not (config['echo']['enabled'] and config['echo']['verified']):
         raise ValueError('full duplex requires enabled, evaluated echo cancellation')
+    cache = config['controller']['reply_cache']
+    if not isinstance(cache, dict) or len(cache) > 32:
+        raise ValueError('reply cache must be a small text-to-asset mapping')
+    for text, asset in cache.items():
+        if (not isinstance(text, str) or not 1 <= len(text) <= 512 or
+                not isinstance(asset, str) or not re.fullmatch(r'[a-f0-9]{64}', asset)):
+            raise ValueError('invalid reply cache entry')
     from .policy import OutputPolicy
     OutputPolicy(muted=out['muted'], quiet_hours=out['quiet_hours'], timezone_name=out['timezone'])
     return config

@@ -110,6 +110,12 @@ class AudioConfigTests(unittest.TestCase):
             finally:runtime.close()
         with self.assertRaises(ValueError):self.validate({'speech':{'vad_threshold_dbfs':float('nan')}})
 
+    def test_readonly_controller_is_explicit_and_cache_ids_are_not_paths(self):
+        self.assertFalse(self.defaults()['controller']['enabled'])
+        config=self.validate({'controller':{'enabled':True,'allow_reported_battery':True,'reply_cache':{'ответ':'a'*64}}})
+        self.assertTrue(config['controller']['enabled'])
+        with self.assertRaises(ValueError):self.validate({'controller':{'reply_cache':{'ответ':'../file'}}})
+
     def test_recognition_requires_explicit_local_models(self):
         for patch in ({'wake': {'enabled': True}}, {'speech': {'enabled': True}}):
             with self.subTest(patch=patch):

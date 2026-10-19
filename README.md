@@ -118,6 +118,7 @@ robot disable                 # снять RoboController (нужно для mas
 
 robot position                # свежая одометрия Player (метры, радианы)
 robot fan                     # сырой датчик fan_motor_status (IR index 6)
+robot battery                 # read-only power:0 JSON; возраст измерения неизвестен
 robot stop                    # нулевая скорость
 robot move forward 0.5        # ограниченное движение, макс 2 с
 robot move backward 0.5
