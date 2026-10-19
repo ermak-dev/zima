@@ -125,6 +125,40 @@ class GitLabCommandTests(unittest.TestCase):
                     self.bug.command_new(args)
         call.assert_called_once_with("GET", "/issues/5")
 
+    def test_edit_can_link_an_existing_issue_into_epic_checklist(self):
+        args = Namespace(iid=34, title=None, body_file=None, epic=11)
+        issue = {"iid": 34, "title": "Утечка сессий", "web_url": "https://example.test/34",
+                 "description": "Наблюдение"}
+        epic = {"title": "[Эпик] Робот", "description": "Цель\n\n## Задачи\n\n- [ ] #32 Сеанс"}
+        with patch.object(self.bug, "call", side_effect=[issue, epic, epic]) as call:
+            with patch("builtins.print"):
+                self.bug.command_edit(args)
+        self.assertEqual(call.call_args_list[0].args, ("GET", "/issues/34"))
+        self.assertEqual(call.call_args_list[1].args, ("GET", "/issues/11"))
+        self.assertEqual(call.call_args_list[2].args, ("PUT", "/issues/11", {
+            "description": "Цель\n\n## Задачи\n\n- [ ] #32 Сеанс\n- [ ] #34 Утечка сессий",
+        }))
+
+    def test_edit_epic_link_is_idempotent_and_rejects_non_epic(self):
+        args = Namespace(iid=34, title=None, body_file=None, epic=11)
+        issue = {"iid": 34, "title": "Утечка сессий", "web_url": "https://example.test/34"}
+        epic = {"title": "[Эпик] Робот",
+                "description": "## Задачи\n\n- [ ] #34 Утечка сессий"}
+        with patch.object(self.bug, "call", side_effect=[issue, epic]) as call:
+            with patch("builtins.print"):
+                self.bug.command_edit(args)
+        self.assertEqual(call.call_count, 2)
+        plain = {"title": "Обычная задача", "description": ""}
+        with patch.object(self.bug, "call", side_effect=[issue, plain]) as call:
+            with self.assertRaises(SystemExit):
+                self.bug.command_edit(args)
+        self.assertEqual(call.call_count, 2)
+
+    def test_edit_without_changes_still_fails(self):
+        args = Namespace(iid=34, title=None, body_file=None, epic=None)
+        with self.assertRaises(SystemExit):
+            self.bug.command_edit(args)
+
     def test_robot_bug_dispatches_without_contacting_robot(self):
         with tempfile.TemporaryDirectory() as temp:
             fake_bug = Path(temp) / "bug"

@@ -168,11 +168,28 @@ def command_labels(args):
         print(f"{label['name']:<24} {label.get('description') or ''}")
 
 
+def link_epic(epic_id, issue_iid, title, epic=None):
+    """Append one issue to the epic's checklist; never duplicate an entry."""
+    if epic is None:
+        epic = call("GET", f"/issues/{epic_id}")
+    if not epic["title"].startswith("[Эпик] "):
+        fail(f"#{epic_id} не является issue-эпиком")
+    line = f"- [ ] #{issue_iid} {title}"
+    description = (epic.get("description") or "").rstrip()
+    if line in description.splitlines():
+        return
+    if "## Задачи" not in description:
+        description += "\n\n## Задачи"
+    description += f"\n\n{line}" if description.endswith("## Задачи") else f"\n{line}"
+    call("PUT", f"/issues/{epic_id}", {"description": description})
+
+
 def command_new(args):
     body = body_from(args)
     if not body.strip():
         fail("пустое описание issue")
     epic_id = getattr(args, "epic", None)
+    epic = None
     if epic_id is not None:
         epic = call("GET", f"/issues/{epic_id}")
         if not epic["title"].startswith("[Эпик] "):
@@ -185,11 +202,7 @@ def command_new(args):
     })
     print(f"#{issue['iid']} создан · {issue['web_url']}")
     if epic_id is not None:
-        description = (epic.get("description") or "").rstrip()
-        if "## Задачи" not in description:
-            description += "\n\n## Задачи"
-        description += f"\n\n- [ ] #{issue['iid']} {args.title}" if description.endswith("## Задачи") else f"\n- [ ] #{issue['iid']} {args.title}"
-        call("PUT", f"/issues/{epic_id}", {"description": description})
+        link_epic(epic_id, issue["iid"], args.title, epic)
 
 
 def command_epic_new(args):
@@ -218,8 +231,14 @@ def command_edit(args):
         if not body.strip():
             fail("пустое описание issue")
         payload["description"] = body
+    epic_id = getattr(args, "epic", None)
+    if epic_id is not None:
+        link_epic(epic_id, args.iid, call("GET", f"/issues/{args.iid}")["title"])
     if not payload:
-        fail("укажите --title и/или --body-file")
+        if epic_id is None:
+            fail("укажите --title, --body-file и/или --epic")
+        print(f"#{args.iid} добавлен в чек-лист #{epic_id}")
+        return
     issue = call("PUT", f"/issues/{args.iid}", payload)
     print(f"#{args.iid} обновлён · {issue['web_url']}")
 
@@ -313,6 +332,7 @@ def main():
     edit.add_argument("iid", type=int)
     edit.add_argument("--title")
     edit.add_argument("--body-file")
+    edit.add_argument("--epic", type=int, help="добавить issue в чек-лист эпика")
     edit.set_defaults(fn=command_edit)
     close = commands.add_parser("close", help="закрыть issue")
     close.add_argument("iid", type=int)
