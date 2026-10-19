@@ -1,0 +1,66 @@
+{
+  "input": {
+    "enabled": false,
+    "url": "http://cam/audio.opus",
+    "netrc": "~/.config/robot/camera.netrc",
+    "microphone_verified": false,
+    "chunk_ms": 20,
+    "queue_size": 10,
+    "timeout_s": 3.0
+  },
+  "output": {
+    "enabled": false,
+    "host": "robot",
+    "helper": "/tmp/robot-audio/robot-audio",
+    "asset_dir": "~/.cache/robot/audio",
+    "volume": 0.35,
+    "max_volume": 0.7,
+    "max_duration_s": 30.0,
+    "queue_size": 8,
+    "muted": false,
+    "quiet_hours": [],
+    "timezone": "UTC"
+  },
+  "tts": {
+    "enabled": false,
+    "allow_external": false,
+    "model": "",
+    "voice": "",
+    "api_key_file": "~/.config/robot/openrouter.key",
+    "env_file": "",
+    "audio_format": "wav",
+    "pcm_sample_rate": 24000,
+    "max_output_tokens": 512,
+    "require_verbatim": true,
+    "timeout_s": 30.0,
+    "max_text_chars": 2000,
+    "max_audio_bytes": 4000000,
+    "cache_ttl_s": 3600.0
+  },
+  "wake": {
+    "enabled": false,
+    "manifest": "~/.config/robot/wake/manifest.json",
+    "threshold": 0.5,
+    "refractory_s": 2.0,
+    "preroll_s": 1.5
+  },
+  "speech": {
+    "enabled": false,
+    "asr_model_path": "~/.local/share/robot/models/whisper",
+    "language": "ru",
+    "mode": "half_duplex",
+    "max_command_s": 15.0,
+    "end_silence_s": 0.8,
+    "listen_timeout_s": 5.0,
+    "asr_timeout_s": 30.0,
+    "echo_tail_s": 0.5,
+    "vad_threshold_dbfs": -40.0
+  },
+  "echo": {
+    "enabled": false,
+    "verified": false,
+    "delay_ms": 0,
+    "max_drift_ms": 40,
+    "filter_ms": 200
+  }
+}

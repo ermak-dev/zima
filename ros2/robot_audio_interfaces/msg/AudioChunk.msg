@@ -1,0 +1,9 @@
+std_msgs/Header header
+string stream_id
+uint64 sequence
+uint32 sample_rate
+uint8 channels
+string sample_format
+bool discontinuity
+bool estimated_timestamp
+uint8[] data

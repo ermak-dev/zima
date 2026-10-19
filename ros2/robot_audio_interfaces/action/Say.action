@@ -1,0 +1,13 @@
+string text
+string voice
+float32 volume
+uint8 priority
+builtin_interfaces/Duration max_queue_wait
+---
+uint16 error_code
+string message
+string task_id
+---
+string phase
+builtin_interfaces/Duration played
+string task_id
