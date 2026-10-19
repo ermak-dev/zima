@@ -3,6 +3,9 @@
 import argparse
 import json
 import math
+import signal
+import subprocess
+from urllib.parse import urlsplit
 from pathlib import Path
 import re
 import sys
@@ -20,6 +23,14 @@ def parser():
     for name in ('run', 'check-config'):
         item = sub.add_parser(name)
         item.add_argument('--config', type=Path)
+        if name == 'run':
+            item.add_argument('--experimental-wake', action='store_true')
+    companion = sub.add_parser('companion', help='explicit bounded LDS/camera/gain session; no motion')
+    companion.add_argument('--config', type=Path, required=True)
+    companion.add_argument('--experimental-wake', action='store_true')
+    companion.add_argument('--max-seconds', type=int, default=600)
+    companion.add_argument('--startup-seconds', type=int, default=120)
+    companion.add_argument('--gain', type=int, default=90)
     for name in ('status', 'stop'):
         item = sub.add_parser(name)
         item.add_argument('--timeout', type=float, default=5)
@@ -55,6 +66,13 @@ def parser():
     analyze = sub.add_parser('analyze')
     analyze.add_argument('wav', type=Path)
     analyze.add_argument('--reference', type=Path)
+    train = sub.add_parser('train')
+    train.add_argument('manifest', type=Path)
+    train.add_argument('--features-dir', type=Path, required=True)
+    train.add_argument('--output', type=Path, required=True)
+    train.add_argument('--kind', choices=('logistic', 'mlp'), default='logistic')
+    train.add_argument('--window-frames', type=int, default=16)
+    train.add_argument('--seed', type=int, default=17)
     evaluate = sub.add_parser('evaluate')
     evaluate.add_argument('manifest', type=Path)
     evaluate.add_argument('--wake-manifest', type=Path)
@@ -191,6 +209,66 @@ def _ros_request(args):
             rclpy.shutdown()
 
 
+def _stop_child(process):
+    previous = {}
+    try:
+        # Session handlers raise: repeated signals must not bypass bounded shutdown.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, signal.SIG_IGN)
+        if process.poll() is not None:
+            return
+        try:
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        except ProcessLookupError:
+            process.wait(timeout=2)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _run_companion(args):
+    from robot_audio.camera_session import CameraSession, CameraGainLease, CameraSSH, CameraSessionError
+    config = load_config(args.config)
+    if not config['input']['enabled']:
+        raise ValueError('companion requires an explicitly enabled microphone source')
+    if not 1 <= args.max_seconds <= 3600 or not 1 <= args.startup_seconds <= 3600 or not 0 <= args.gain <= 100:
+        raise ValueError('invalid bounded camera session parameters')
+    parsed = urlsplit(config['input']['url'])
+    if parsed.scheme != 'http' or parsed.port not in (None, 80):
+        raise ValueError('camera session expects the OpenIPC HTTP endpoint on port 80')
+    ssh = CameraSSH(host=parsed.hostname, netrc_path=config['input']['netrc'])
+    gain = CameraGainLease(ssh, volume=args.gain, ttl_s=args.max_seconds, startup_s=args.startup_seconds)
+    try:
+        with CameraSession(explicit=True, ttl_s=args.max_seconds, startup_s=args.startup_seconds, gain=gain) as session:
+            command = [str(ROOT/'bin/robot'), 'audio', 'run', '--config', str(args.config)]
+            if args.experimental_wake:
+                command.append('--experimental-wake')
+            process = subprocess.Popen(command, start_new_session=True)
+            next_check = 0.0
+            try:
+                while process.poll() is None:
+                    if time.monotonic() >= next_check or getattr(session, 'remaining_s', 1) <= 0:
+                        session.check()
+                        next_check = time.monotonic() + 10
+                    time.sleep(.1)
+                code = process.poll()
+            finally:
+                _stop_child(process)
+        return 0 if code == 0 else 1
+    except CameraSessionError as error:
+        if str(error) == 'session_interrupted':
+            raise KeyboardInterrupt from None
+        raise
+
+
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
@@ -218,6 +296,8 @@ def main(argv=None):
         if args.command == 'check-config':
             print(json.dumps(load_config(args.config), ensure_ascii=False, indent=2))
             return 0
+        if args.command == 'companion':
+            return _run_companion(args)
         if args.command == 'run':
             config = load_config(args.config)
             import rclpy
@@ -227,7 +307,7 @@ def main(argv=None):
             node = None
             executor = None
             try:
-                node = AudioNode(config=config)
+                node = AudioNode(config=config, allow_experimental_wake=args.experimental_wake)
                 executor = MultiThreadedExecutor(num_threads=4)
                 executor.add_node(node)
                 executor.spin()
@@ -252,6 +332,11 @@ def main(argv=None):
         if args.command == 'import':
             from robot_audio.local_tools import prepare_asset
             print(json.dumps(prepare_asset(args.wav, load_config(args.config))))
+            return 0
+        if args.command == 'train':
+            from robot_audio.training import train_model
+            print(json.dumps(train_model(args.manifest, args.features_dir, args.output,
+                kind=args.kind, window_frames=args.window_frames, seed=args.seed), ensure_ascii=False, indent=2))
             return 0
         if args.command in ('analyze', 'evaluate'):
             from robot_audio.local_tools import run_local
