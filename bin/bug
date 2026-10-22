@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """robot bug — GitLab issues for the robot project.
 
-Credentials are loaded from the private .env beside the repository, with process
-variables taking precedence. No issue labels or workflow from Rugent are assumed.
+The credential is loaded from the private .env beside the repository, with
+process variables taking precedence: GITLAB_TOKEN, a personal access token with
+the api scope. No issue labels or workflow from Rugent are assumed.
 """
 
 import argparse
@@ -18,8 +19,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-GITLAB_KEYS = {"GITLAB_SITE", "GITLAB_USER", "GITLAB_PASSWORD", "GITLAB_PROJECT_ID"}
-_token = None
+GITLAB_KEYS = {"GITLAB_SITE", "GITLAB_TOKEN", "GITLAB_PROJECT_ID"}
 
 
 def load_gitlab_env(path, environ):
@@ -51,26 +51,23 @@ def site():
     return value
 
 
-def token():
-    global _token
-    if _token is None:
-        user = os.environ.get("GITLAB_USER")
-        password = os.environ.get("GITLAB_PASSWORD")
-        if not user or not password:
-            fail("GITLAB_USER / GITLAB_PASSWORD отсутствуют в .env")
-        data = urllib.parse.urlencode(
-            {"grant_type": "password", "username": user, "password": password}
-        ).encode()
-        try:
-            with urllib.request.urlopen(
-                urllib.request.Request(f"https://{site()}/oauth/token", data=data), timeout=20
-            ) as response:
-                _token = json.load(response)["access_token"]
-        except urllib.error.HTTPError as error:
-            fail(f"авторизация GitLab: HTTP {error.code}")
-        except urllib.error.URLError as error:
-            fail(f"соединение с GitLab: {error.reason}")
-    return _token
+def auth_header():
+    """The header we introduce ourselves with: a personal access token.
+
+    There is no second way. GITLAB_USER with GITLAB_PASSWORD used to be
+    exchanged for a short-lived bearer through the OAuth resource owner
+    password credentials grant, and GitLab removed that grant in 19.0 —
+    `POST /oauth/token` refuses the grant type itself with a 400 that names
+    nothing to fix, so the refusal below names the setting instead.
+    """
+    value = os.environ.get("GITLAB_TOKEN")
+    if not value:
+        fail(
+            "GITLAB_TOKEN отсутствует в .env: нужен личный токен с правом api. "
+            "GITLAB_USER и GITLAB_PASSWORD больше не подходят — OAuth-грант "
+            "password убран в GitLab 19.0"
+        )
+    return ("PRIVATE-TOKEN", value)
 
 
 def call(method, path, payload=None):
@@ -78,7 +75,7 @@ def call(method, path, payload=None):
         f"https://{site()}/api/v4/projects/{project_id()}{path}",
         data=json.dumps(payload).encode() if payload is not None else None,
         method=method,
-        headers={"Authorization": f"Bearer {token()}"},
+        headers=dict([auth_header()]),
     )
     if payload is not None:
         request.add_header("Content-Type", "application/json")

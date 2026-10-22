@@ -28,15 +28,18 @@ class GitLabCommandTests(unittest.TestCase):
             env_file = Path(temp) / ".env"
             env_file.write_text(
                 "GITLAB_SITE=git.example.test\n"
-                "GITLAB_USER=someone\n"
-                "GITLAB_PASSWORD='two words # included'\n"
+                "GITLAB_TOKEN='two words # included'\n"
+                "GITLAB_PASSWORD=no-longer-read\n"
                 "DATABASE_URL=not-for-this-command\n"
             )
-            environ = {"GITLAB_USER": "override"}
+            environ = {"GITLAB_SITE": "override"}
             self.bug.load_gitlab_env(env_file, environ)
-            self.assertEqual(environ["GITLAB_USER"], "override")
-            self.assertEqual(environ["GITLAB_PASSWORD"], "two words # included")
+            self.assertEqual(environ["GITLAB_SITE"], "override")
+            self.assertEqual(environ["GITLAB_TOKEN"], "two words # included")
             self.assertNotIn("DATABASE_URL", environ)
+            # The pair authenticates nowhere since GitLab 19, so the password
+            # is not copied into this process's environment at all.
+            self.assertNotIn("GITLAB_PASSWORD", environ)
 
     def test_project_defaults_to_robot_not_rugent(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -66,12 +69,13 @@ class GitLabCommandTests(unittest.TestCase):
                 return b'{"path_with_namespace":"ermak/robot"}'
 
         with patch.dict(os.environ, {"GITLAB_SITE": "git.example.test", "GITLAB_PROJECT_ID": "40"}):
-            with patch.object(self.bug, "token", return_value="test-token"):
+            with patch.object(self.bug, "auth_header", return_value=("PRIVATE-TOKEN", "test-token")):
                 with patch.object(self.bug.urllib.request, "urlopen", return_value=Response()) as open_url:
                     self.assertEqual(self.bug.call("GET", "")["path_with_namespace"], "ermak/robot")
                     request = open_url.call_args.args[0]
                     self.assertEqual(request.full_url, "https://git.example.test/api/v4/projects/40")
-                    self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+                    self.assertEqual(request.get_header("Private-token"), "test-token")
+                    self.assertIsNone(request.get_header("Authorization"))
 
     def test_mr_title_does_not_close_issue_implicitly(self):
         self.assertEqual(self.bug.strip_closing("fix: wheel (Closes #12)"), "fix: wheel (#12)")
@@ -172,6 +176,52 @@ class GitLabCommandTests(unittest.TestCase):
                 check=True,
             )
             self.assertEqual(result.stdout.strip(), "list --all")
+
+
+class GitLabAuthTests(unittest.TestCase):
+    """How the command introduces itself to GitLab.
+
+    The GITLAB_USER / GITLAB_PASSWORD pair was exchanged for a short-lived
+    bearer through the OAuth resource owner password credentials grant, and
+    GitLab removed that grant in 19.0: `POST /oauth/token` answers
+    `400 unsupported_grant_type` before it reads the credentials at all, so
+    every tracker call died on a network code that names nothing to fix. A
+    personal access token (GITLAB_TOKEN) is the only way left.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("robot_bug_auth", str(BUG))
+        spec = spec_from_loader(loader.name, loader)
+        cls.bug = module_from_spec(spec)
+        loader.exec_module(cls.bug)
+
+    def test_personal_token_goes_in_the_private_token_header(self):
+        with patch.dict(os.environ, {"GITLAB_TOKEN": "glpat-xxx"}):
+            self.assertEqual(self.bug.auth_header(), ("PRIVATE-TOKEN", "glpat-xxx"))
+
+    def test_user_and_password_alone_refuse_by_naming_the_token(self):
+        env = {"GITLAB_USER": "ermak", "GITLAB_PASSWORD": "secret"}
+        with patch.dict(os.environ, env):
+            os.environ.pop("GITLAB_TOKEN", None)
+            with self.assertRaises(SystemExit) as refused:
+                self.bug.auth_header()
+        self.assertIn("GITLAB_TOKEN", str(refused.exception))
+
+    def test_the_env_file_is_read_for_the_token(self):
+        # The loader copies an allowlist of keys, so a token in .env that is
+        # not on that list is silently ignored and the refusal above fires
+        # with the token sitting right there in the file.
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / ".env"
+            env_file.write_text("GITLAB_TOKEN=glpat-from-file\n")
+            environ = {}
+            self.bug.load_gitlab_env(env_file, environ)
+            self.assertEqual(environ.get("GITLAB_TOKEN"), "glpat-from-file")
+
+    def test_the_dead_password_grant_is_gone(self):
+        self.assertNotIn('"grant_type"', BUG.read_text(encoding="utf-8"))
+        self.assertFalse(hasattr(self.bug, "token"), "the password-grant mint must be gone")
 
 
 if __name__ == "__main__":
