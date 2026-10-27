@@ -247,6 +247,13 @@ def command_close(args):
     print(f"#{args.iid} закрыт")
 
 
+def command_delete(args):
+    if not args.yes:
+        fail("удаление необратимо; подтвердите флагом --yes")
+    call("DELETE", f"/issues/{args.iid}")
+    print(f"#{args.iid} удалён")
+
+
 def command_reopen(args):
     call("PUT", f"/issues/{args.iid}", {"state_event": "reopen"})
     print(f"#{args.iid} переоткрыт")
@@ -338,6 +345,11 @@ def main():
     reopen = commands.add_parser("reopen", help="переоткрыть issue")
     reopen.add_argument("iid", type=int)
     reopen.set_defaults(fn=command_reopen)
+    delete = commands.add_parser("delete", help="безвозвратно удалить issue")
+    delete.add_argument("iid", type=int)
+    delete.add_argument("--yes", action="store_true",
+                        help="подтверждение необратимого удаления")
+    delete.set_defaults(fn=command_delete)
     relabel = commands.add_parser("relabel", help="изменить метки issue")
     relabel.add_argument("iid", type=int)
     relabel.add_argument("--label", action="append", default=[])

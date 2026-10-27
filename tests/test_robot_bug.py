@@ -163,6 +163,21 @@ class GitLabCommandTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.bug.command_edit(args)
 
+    def test_delete_requires_explicit_confirmation(self):
+        args = Namespace(iid=34, yes=False)
+        with patch.object(self.bug, "call") as call:
+            with self.assertRaises(SystemExit):
+                self.bug.command_delete(args)
+        call.assert_not_called()
+
+    def test_delete_confirmed_removes_the_issue(self):
+        args = Namespace(iid=34, yes=True)
+        with patch.object(self.bug, "call") as call:
+            with patch("builtins.print") as printed:
+                self.bug.command_delete(args)
+        call.assert_called_once_with("DELETE", "/issues/34")
+        printed.assert_called_once_with("#34 удалён")
+
     def test_robot_bug_dispatches_without_contacting_robot(self):
         with tempfile.TemporaryDirectory() as temp:
             fake_bug = Path(temp) / "bug"
