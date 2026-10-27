@@ -87,9 +87,26 @@ class PanelRos(unittest.TestCase):
         proc = subprocess.Popen([sys.executable, script, '--ros-args', '-p', f'port:={port}'],
                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         url = f'http://127.0.0.1:{port}'
-        def get(path):
-            with urllib.request.urlopen(url + path, timeout=.5) as resp:
-                return json.load(resp)
+        from websocket import create_connection
+        ws = None
+        deadline = time.monotonic() + 10
+        while ws is None:
+            try:
+                ws = create_connection(f'ws://127.0.0.1:{port}/ws', timeout=.5)
+            except (ConnectionRefusedError, OSError):
+                if time.monotonic() > deadline or proc.poll() is not None:
+                    raise
+                time.sleep(.2)
+        ws.settimeout(.5)
+        frames = []
+        def read_frame():
+            frames.append(json.loads(ws.recv()))
+            return frames[-1]
+        def latest(kind):
+            for frame in reversed(frames):
+                if frame['type'] == kind:
+                    return frame['data']
+            return None
         try:
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
@@ -124,13 +141,14 @@ class PanelRos(unittest.TestCase):
                 scan_pub.publish(scan)
                 rclpy.spin_once(node, timeout_sec=.05)
                 try:
-                    state, cloud = get('/state.json'), get('/scan.json')
-                    if (cloud.get('points') and state.get('sensors', {}).get('drop_ranges')
-                            and state['sensors'].get('battery')
-                            and (not mapping or (state.get('map_pose') and cloud.get('frame') == 'map'))):
-                        break
-                except (OSError, urllib.error.URLError):
+                    read_frame()
+                except Exception:
                     pass
+                state, cloud = latest('state'), latest('scan')
+                if (cloud and cloud.get('points') and state and state.get('sensors', {}).get('drop_ranges')
+                        and state['sensors'].get('battery')
+                        and (not mapping or (state.get('map_pose') and cloud.get('frame') == 'map'))):
+                    break
             else:
                 self.fail('latched sensor inventory and transformed scan never arrived')
             self.assertEqual(len(state['sensors']['cliff_ranges']), 4)
@@ -140,30 +158,41 @@ class PanelRos(unittest.TestCase):
             self.assertEqual(state['sensors']['bumper'], 'clear')
             self.assertEqual(state['sensors']['battery']['percent'], 87)
             if mapping:
-                grid = get('/map.json')
+                # Wait for the map push; no-map fixture asserts its absence.
+                deadline = time.monotonic() + 5
+                while latest('map') is None and time.monotonic() < deadline:
+                    try:
+                        read_frame()
+                    except Exception:
+                        pass
+                grid = latest('map')
                 self.assertEqual(grid['width'], 2)
                 self.assertEqual(grid['origin']['x'], -1.)
                 self.assertTrue(grid['image'].startswith('data:image/png;base64,'))
                 self.assertLess(grid['version'], 2**53, 'version must survive JavaScript JSON numbers exactly')
-                cached = get('/map.json?version=' + str(grid['version']))
-                self.assertEqual(cached['version'], grid['version'])
-                self.assertNotIn('image', cached, 'unchanged map must not be transferred again')
+                frames_before = len(frames)
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline:
+                    try:
+                        read_frame()
+                    except Exception:
+                        pass
+                for frame in frames[frames_before:]:
+                    self.assertNotEqual(frame['type'], 'map',
+                                        'unchanged map must not be resent')
                 self.assertAlmostEqual(state['map_pose']['x'], 11.)
                 self.assertAlmostEqual(state['map_pose']['y'], 2.)
                 self.assertAlmostEqual(state['map_pose']['yaw'], math.pi / 2)
                 self.assertEqual(state['map_pose']['frame'], 'map')
                 self.assertIsNotNone(state['map_age_s'])
             else:
-                self.assertEqual(get('/map.json'), {})
+                self.assertIsNone(latest('map'), 'map must not arrive without SLAM')
                 self.assertIsNone(state.get('map_pose'))
             self.assertEqual(cloud['frame'], 'map' if mapping else 'odom')
             self.assertAlmostEqual(cloud['points'][0][0], 11.0 if mapping else 1.0, places=5)
             self.assertAlmostEqual(cloud['points'][0][1], 2.9, places=5)
-            self.assertEqual(commands, [], 'passive HTTP polling must not publish motion')
-            request = urllib.request.Request(url + '/cmd_vel', data=b'{"v":1,"w":2}',
-                                             headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(request) as response:
-                self.assertEqual(json.load(response), {'v': .1, 'w': .4})
+            self.assertEqual(commands, [], 'passive viewing must not publish motion')
+            ws.send(json.dumps({'type': 'cmd', 'v': 1, 'w': 2}))
             deadline = time.monotonic() + 2
             while not commands and time.monotonic() < deadline:
                 rclpy.spin_once(node, timeout_sec=.05)

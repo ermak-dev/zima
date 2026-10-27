@@ -138,13 +138,20 @@ class PanelRegressions(unittest.TestCase):
         self.assertAlmostEqual(points[1][1], 2.0)
 
     def test_model_and_pose_share_lidar_view(self):
+        # The bundle is minified: JSX id="odom" compiles to id:"odom".
         self.assertNotIn('id="model"', panel.INDEX_HTML)
-        self.assertIn('id="odom"', panel.INDEX_HTML)
+        self.assertRegex(panel.INDEX_HTML, r'id:\s*"odom"')
         self.assertIn('height:100dvh', panel.INDEX_HTML)
         self.assertIn('overflow:hidden', panel.INDEX_HTML)
 
     def test_camera_failure_has_retry(self):
-        self.assertIn('setTimeout(connectCamera', panel.INDEX_HTML)
+        # MJPEG retry now lives in useMjpeg (2.5 s backoff, React source).
+        self.assertIn('setAttempt((n) => n + 1), 2500', self.panel_ui_source('useMjpeg.js'))
+
+    @staticmethod
+    def panel_ui_source(name):
+        return (Path(__file__).resolve().parents[1]
+                / 'tools' / 'panel-ui' / 'src' / name).read_text(encoding='utf-8')
 
 
 # FEATURE: versioned occupancy PNG and map-frame pose for the web panel.
