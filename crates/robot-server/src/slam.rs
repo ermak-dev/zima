@@ -6,7 +6,6 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
 };
 
 /// One request line. Scan bearings are radians in the base_link frame, ranges
@@ -75,8 +74,6 @@ pub fn parse_status(line: &str) -> Result<SlamStatus, String> {
     })
 }
 
-pub const UPDATE_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Thin owner of the adapter child process. One request line in, one reply
 /// line out; a dead or wedged child is an Err for the caller to restart.
 pub struct Adapter {
@@ -96,6 +93,12 @@ impl Adapter {
         Ok(Self { child, reader })
     }
     pub fn call(&mut self, req: &str) -> Result<SlamStatus, String> {
+        let line = self.call_raw(req)?;
+        parse_status(&line)
+    }
+    /// Raw reply line; extended replies (e.g. the occupancy grid) carry
+    /// fields beyond SlamStatus and need the full JSON.
+    pub fn call_raw(&mut self, req: &str) -> Result<String, String> {
         let stdin = self.child.stdin.as_mut().expect("adapter stdin");
         stdin
             .write_all(req.as_bytes())
@@ -109,7 +112,7 @@ impl Adapter {
         if line.trim().is_empty() {
             return Err("adapter closed".into());
         }
-        parse_status(&line)
+        Ok(line)
     }
 }
 
@@ -120,9 +123,142 @@ impl Drop for Adapter {
     }
 }
 
-/// Directory of the configured adapter executable, for tests and diagnostics.
-pub fn adapter_path_from_env(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).map(PathBuf::from)
+/// One observation ready for the adapter: scan in base_link (LDS mount
+/// offset applied here, as the panel renderer does) plus absolute odom pose.
+#[derive(Debug, Clone)]
+pub struct Observation {
+    pub angles: Vec<f32>,
+    pub ranges: Vec<f32>,
+    pub max_range: f32,
+    pub odom: Option<(f64, f64, f64)>,
+}
+
+impl Observation {
+    /// Convert a raw Player scan (bearings relative to the LDS zero) into
+    /// base_link bearings by adding the LDS mounting yaw.
+    pub fn from_scan(
+        s: &player_bridge::LaserScanAngle,
+        odom: Option<(f64, f64, f64)>,
+    ) -> Self {
+        let offset = player_bridge::scan::LDS_YAW_DEG.to_radians() as f32;
+        // Normalize to [-pi, pi): the adapter bins beams into fixed angular
+        // slots starting at -pi.
+        let norm = |a: f32| {
+            let mut a = a + offset;
+            while a < -std::f32::consts::PI {
+                a += 2. * std::f32::consts::PI;
+            }
+            while a >= std::f32::consts::PI {
+                a -= 2. * std::f32::consts::PI;
+            }
+            a
+        };
+        Self {
+            angles: s.angles.iter().map(|a| norm(*a)).collect(),
+            ranges: s.ranges.clone(),
+            max_range: s.max_range,
+            odom,
+        }
+    }
+    /// Request line for the adapter: valid beams only, each with its own
+    /// base_link bearing; ranges are measured from the LDS at `sensor_x`.
+    /// `delta` is the odom pose change since the previous update, in the
+    /// previous robot frame.
+    pub fn to_update_request(&self, delta: (f64, f64, f64)) -> String {
+        let mut angles = Vec::with_capacity(self.angles.len());
+        let mut ranges = Vec::with_capacity(self.ranges.len());
+        for (a, r) in self.angles.iter().zip(&self.ranges) {
+            if r.is_finite() && *r >= player_bridge::scan::LDS_RANGE_MIN && *r <= self.max_range {
+                angles.push(round(*a as f64));
+                ranges.push(round(*r as f64));
+            }
+        }
+        request(
+            "update",
+            json!({
+                "scan": {"angles": angles, "ranges": ranges},
+                "range_max": round(self.max_range as f64),
+                "sensor_x": player_bridge::scan::LDS_X,
+                "odom": {"dx": round(delta.0), "dy": round(delta.1), "dyaw": round(delta.2)}
+            }),
+        )
+    }
+}
+
+fn round(v: f64) -> f64 {
+    (v * 10000.).round() / 10000.
+}
+
+/// Owned thread talking to the adapter process. Observations in, slam state
+/// out; the safety gate gets a localized/lost verdict on every update.
+/// Restarting the adapter on crash keeps the session alive.
+pub struct SlamThread {
+    pub observe: std::sync::mpsc::Sender<Observation>,
+}
+
+impl SlamThread {
+    pub fn start(
+        exe: PathBuf,
+        mapping: bool,
+        map_path: Option<String>,
+        on_state: Box<dyn Fn(Value, bool) + Send + 'static>,
+    ) -> Result<Self, String> {
+        let mut adapter = Adapter::spawn(&exe)?;
+        let init = if mapping {
+            adapter.call(&request("start_mapping", json!({})))?
+        } else if let Some(path) = &map_path {
+            adapter.call(&request("load_map", json!({"path": path})))?
+        } else {
+            return Err("localize mode needs --slam-map".into());
+        };
+        if !init.ok {
+            return Err(format!("adapter init failed: {:?}", init.error));
+        }
+        let mut core = SlamCore::new(adapter, mapping);
+        let (tx, rx) = std::sync::mpsc::channel::<Observation>();
+        std::thread::spawn(move || {
+            // The occupancy grid is redrawn at a slow cadence: rebuilding it
+            // on every scan would dominate update latency for no visual gain.
+            const MAP_EVERY: u32 = 10;
+            let mut since_map = MAP_EVERY;
+            let mut last_map: Option<Value> = None;
+            for obs in rx {
+                // A scan without any odometry yet still updates SLAM with a
+                // zero delta; only feeding deltas requires two odom poses.
+                let (delta, _seen_before) = core.feed_odom(obs.odom);
+                let req = obs.to_update_request(delta);
+                let mut state = core.update_request(&req);
+                since_map += 1;
+                if since_map >= MAP_EVERY {
+                    since_map = 0;
+                    if let Some(m) = core.fetch_map() {
+                        last_map = Some(m);
+                    }
+                }
+                if let Some(m) = &last_map {
+                    state["map"] = m.clone();
+                }
+                // The drive gate: mapping always allows driving (that is
+                // how the map gets drawn); localize requires a trusted pose.
+                let mode = state["mode"].as_str().unwrap_or("lost");
+                let localized = mode == "mapping"
+                    || (mode == "localize"
+                        && state["quality"].as_f64().is_some_and(|q| q >= 0.5));
+                on_state(state, localized);
+            }
+        });
+        Ok(Self { observe: tx })
+    }
+}
+
+impl SlamCore<Adapter> {
+    /// Ask the adapter for the current occupancy grid (mapping rebuilds it
+    /// from the simplemap; localize returns the loaded map).
+    pub fn fetch_map(&mut self) -> Option<Value> {
+        let line = self.backend.call_raw(&request("map", json!({}))).ok()?;
+        let v: Value = serde_json::from_str(&line).ok()?;
+        v.get("grid").cloned()
+    }
 }
 
 /// What the adapter process must implement. Production uses `Adapter`;
@@ -179,6 +315,8 @@ impl<T: Backend> SlamCore<T> {
     }
     /// Feed one scan (and the absolute odom pose) through the adapter.
     /// Returns the panel-facing slam state.
+    /// Pure-path API exercised by unit tests; production uses update_request.
+    #[allow(dead_code)]
     pub fn update(&mut self, scan: &Value, odom: Option<(f64, f64, f64)>) -> Value {
         let delta = match (self.odom, odom) {
             (Some(p), Some(c)) => {
@@ -244,6 +382,7 @@ impl<T: Backend> SlamCore<T> {
             "lost": self.lost,
         })
     }
+    #[allow(dead_code)]
     pub fn save_map(&mut self, path: &str) -> Result<(), String> {
         let s = self.backend.call(&request("save_map", json!({"path": path})))?;
         if s.ok {
@@ -252,11 +391,104 @@ impl<T: Backend> SlamCore<T> {
             Err(s.error.unwrap_or_else(|| "save_map failed".into()))
         }
     }
+    /// Track absolute odom poses; emit the delta for this observation and
+    /// whether it is usable at all (first pose yields a zero delta).
+    pub fn feed_odom(
+        &mut self,
+        odom: Option<(f64, f64, f64)>,
+    ) -> ((f64, f64, f64), bool) {
+        match (self.odom, odom) {
+            (Some(p), Some(c)) => {
+                self.odom = Some(c);
+                (odom_delta(p, c), true)
+            }
+            (None, Some(c)) => {
+                self.odom = Some(c);
+                ((0., 0., 0.), true)
+            }
+            _ => ((0., 0., 0.), false),
+        }
+    }
+    /// One adapter update request -> panel state (keeps SlamCore::update for
+    /// the pure unit-tested path).
+    pub fn update_request(&mut self, req: &str) -> Value {
+        match self.backend.call(req) {
+            Ok(status) => {
+                if !status.ok {
+                    self.log.push(format!(
+                        "adapter error: {}",
+                        status.error.unwrap_or_default()
+                    ));
+                    return self.state_json(None);
+                }
+                if let Some(p) = status.pose.clone() {
+                    self.pose = Some(p);
+                }
+                if !self.mapping {
+                    let bad = status.quality.is_none_or(|q| q < QUALITY_BAD);
+                    if bad {
+                        self.bad += 1;
+                    } else {
+                        self.bad = 0;
+                        self.resets = 0;
+                        self.lost = false;
+                    }
+                    if self.bad == LOCAL_RESET_AT || self.bad == GLOBAL_RESET_AT {
+                        let op = if self.bad == LOCAL_RESET_AT {
+                            "local_reset"
+                        } else {
+                            "global_reset"
+                        };
+                        self.log
+                            .push(format!("{op} issued after {} bad updates", self.bad));
+                        let _ = self.backend.call(&request(op, json!({})));
+                        self.resets += 1;
+                    }
+                    if self.bad >= LOST_AFTER_BAD {
+                        self.lost = true;
+                    }
+                }
+                self.state_json(status.quality)
+            }
+            Err(e) => {
+                self.log.push(format!("adapter failure: {e}"));
+                self.state_json(None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // FEATURE: update request carries exact LDS geometry to the adapter.
+    // SPEC: bearings are base_link (mount yaw added, wrapped to [-pi,pi));
+    // beams inside the body (< LDS_RANGE_MIN) or invalid are dropped; the
+    // LDS lever arm is sent so the adapter can place the ray origin.
+    // IMPLEMENTATION: Observation::from_scan + to_update_request.
+    // RESULT: IMPLEMENTED — body hits dropped, offset and bearings verified.
+    // STATUS: DONE
+    #[test]
+    fn update_request_drops_body_hits_and_sends_lidar_offset() {
+        let scan = player_bridge::LaserScanAngle {
+            max_range: 6.0,
+            ranges: vec![0.1, 1.0, f32::NAN, 7.0, 2.0],
+            angles: vec![0.0, 0.0, 0.5, 1.0, 3.0],
+            intensities: vec![],
+            id: 0,
+        };
+        let req = Observation::from_scan(&scan, None).to_update_request((0., 0., 0.));
+        let v: Value = serde_json::from_str(&req).unwrap();
+        let ranges = v["scan"]["ranges"].as_array().unwrap();
+        assert_eq!(ranges.len(), 2, "0.1 m body hit, NaN and >max must go");
+        assert_eq!(v["scan"]["ranges"][0], 1.0);
+        assert_eq!(v["sensor_x"], -0.1);
+        let a0 = v["scan"]["angles"][0].as_f64().unwrap();
+        assert!((a0 - 97.6f64.to_radians()).abs() < 1e-3);
+        let a1 = v["scan"]["angles"][1].as_f64().unwrap();
+        let expected = 3.0 + 97.6f64.to_radians() - 2. * std::f64::consts::PI;
+        assert!((a1 - expected).abs() < 1e-3, "bearing must wrap into [-pi,pi)");
+    }
     // FEATURE: line JSON protocol with the MRPT adapter child process.
     // SPEC: requests carry an op plus merged fields; replies parse into a
     // typed status; adapter failures are data, not transport crashes.

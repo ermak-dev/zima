@@ -4,7 +4,7 @@ use crate::{safety::Safety, telemetry, Config, Failure};
 use player_bridge::*;
 use serde_json::Value;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -205,8 +205,10 @@ pub async fn read(
     states: watch::Sender<Value>,
     scans: watch::Sender<Option<Value>>,
     safety: Arc<Mutex<Safety>>,
+    slam: Option<mpsc::Sender<crate::slam::Observation>>,
 ) -> Result<(), Failure> {
     let mut telemetry = telemetry::Telemetry::new();
+    let mut odom_pose: Option<(f64, f64, f64)> = None;
     let mut pending = std::mem::take(&mut reader.pending).into_iter();
     loop {
         let m = if let Some(m) = pending.next() {
@@ -225,6 +227,13 @@ pub async fn read(
                 if let Some(v) = telemetry::scan(&m)? {
                     scans.send_replace(Some(v));
                 }
+                if let Some(tx) = &slam {
+                    let scan = decode_laser_scanangle(&m.payload)?;
+                    let _ = tx.send(crate::slam::Observation::from_scan(
+                        &scan,
+                        odom_pose,
+                    ));
+                }
             }
             (BUMPER_CODE, 0, BUMPER_DATA_STATE) => {
                 let v = decode_bumper(&m.payload)?;
@@ -236,16 +245,27 @@ pub async fn read(
             (POSITION2D_CODE, 0, POSITION2D_DATA_STATE) => {
                 let v = decode_position2d(&m.payload)?;
                 safety.lock().unwrap().odom(v.vx, v.vyaw, Instant::now());
+                odom_pose = Some((v.x as f64, v.y as f64, v.yaw as f64));
             }
             _ => {}
         }
         if telemetry.update(&m)? {
             let v = telemetry.json();
             states.send_if_modified(|old| {
-                if *old == v {
+                // Merge, not replace: the slam thread writes its own fields
+                // into this shared state and must survive telemetry publishes.
+                let mut next = v.clone();
+                if let (Some(dst), Some(src)) = (next.as_object_mut(), old.as_object()) {
+                    for (k, val) in src {
+                        if k == "slam" {
+                            dst.insert(k.clone(), val.clone());
+                        }
+                    }
+                }
+                if *old == next {
                     false
                 } else {
-                    *old = v;
+                    *old = next;
                     true
                 }
             });

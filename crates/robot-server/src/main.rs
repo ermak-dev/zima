@@ -41,6 +41,7 @@ struct Config {
     port: u16,
     camera_url: String,
     netrc: PathBuf,
+    slam_adapter: Option<PathBuf>,
 }
 impl Config {
     fn parse() -> Result<Option<Self>, Failure> {
@@ -52,11 +53,12 @@ impl Config {
             camera_url: "http://cam/mjpeg".into(),
             netrc: PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                 .join(".config/robot/camera.netrc"),
+            slam_adapter: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             if a == "--help" {
-                println!("robot-server\n\n--player-host HOST  Player host (robot)\n--player-port PORT  Player port (6665)\n--listen HOST       HTTP bind host (127.0.0.1)\n--port PORT         HTTP port (8085)\n--camera-url URL    MJPEG URL (http://cam/mjpeg)\n--netrc PATH        Camera credentials (~/.config/robot/camera.netrc)\n--help             Show help");
+                println!("robot-server\n\n--player-host HOST  Player host (robot)\n--player-port PORT  Player port (6665)\n--listen HOST       HTTP bind host (127.0.0.1)\n--port PORT         HTTP port (8085)\n--camera-url URL    MJPEG URL (http://cam/mjpeg)\n--netrc PATH        Camera credentials (~/.config/robot/camera.netrc)\n--slam-adapter EXE  Optional MRPT SLAM adapter (line JSON over stdio)\n--help             Show help");
                 return Ok(None);
             }
             let v = args.next().ok_or("option requires a value")?;
@@ -67,6 +69,13 @@ impl Config {
                 "--port" => c.port = v.parse()?,
                 "--camera-url" => c.camera_url = v,
                 "--netrc" => c.netrc = v.into(),
+                "--slam-adapter" => {
+                    let p = PathBuf::from(&v);
+                    if !p.is_file() {
+                        return Err(format!("--slam-adapter: {v} is not a file").into());
+                    }
+                    c.slam_adapter = Some(p);
+                }
                 _ => return Err("unknown option (see --help)".into()),
             }
         }
@@ -231,6 +240,42 @@ async fn run(c: Config) -> Result<(), Failure> {
     let safety = Arc::new(Mutex::new(Safety::new()));
     let (states, state) = watch::channel(telemetry::Telemetry::new().json());
     let (scans, scan) = watch::channel(None);
+    // Optional SLAM: adapter subprocess on its own thread; observations are
+    // forwarded from the Player reader, verdicts gate driving via Safety.
+    let slam_tx = if let Some(exe) = c.slam_adapter.clone() {
+        // Without a saved map the only meaningful mode is mapping; with one,
+        // localize unless mapping is explicitly requested.
+        let map_path = std::env::var("ROBOT_SLAM_MAP").ok();
+        let mapping =
+            map_path.is_none() || std::env::var_os("ROBOT_SLAM_MAPPING").is_some();
+        let safety = safety.clone();
+        let states_tx = states.clone();
+        match slam::SlamThread::start(
+            exe,
+            mapping,
+            map_path,
+            Box::new(move |slam_state, localized| {
+                safety.lock().unwrap().slam(localized, std::time::Instant::now());
+                states_tx.send_if_modified(|old| {
+                    let mut next = old.clone();
+                    next["slam"] = slam_state.clone();
+                    if *old == next {
+                        false
+                    } else {
+                        *old = next;
+                        true
+                    }
+                });
+            }),
+        ) {
+            Ok(t) => Some(t.observe),
+            Err(e) => {
+                return Err(format!("SLAM adapter failed to start: {e}").into());
+            }
+        }
+    } else {
+        None
+    };
     let mut hb = tokio::spawn(async move {
         if let Some(s) = supervisor.take() {
             heartbeat(s).await
@@ -249,7 +294,7 @@ async fn run(c: Config) -> Result<(), Failure> {
             return Err(e);
         }
     };
-    let mut read_task = tokio::spawn(player::read(reader, states, scans, safety.clone()));
+    let mut read_task = tokio::spawn(player::read(reader, states.clone(), scans, safety.clone(), slam_tx));
     let mut drive_task = tokio::spawn(player::drive(writer.clone(), safety.clone()));
     let app = App {
         safety,

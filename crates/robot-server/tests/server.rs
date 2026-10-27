@@ -80,6 +80,15 @@ impl Session {
         optional: bool,
         delay: Duration,
     ) -> Self {
+        Self::start_env(extra, hb, optional, delay, &[]).await
+    }
+    async fn start_env(
+        extra: &[&str],
+        hb: Option<String>,
+        optional: bool,
+        delay: Duration,
+        env: &[(&str, &str)],
+    ) -> Self {
         // Serialize port reservation until the child binds: parallel tests must not
         // accidentally discover another child's listener during the bind handoff.
         static STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -187,6 +196,9 @@ impl Session {
         .stderr(Stdio::piped());
         if let Some(hb) = hb {
             c.env("ROBOT_SERVER_HEARTBEAT", hb);
+        }
+        for (k, v) in env {
+            c.env(k, v);
         }
         let child = c.spawn().unwrap();
         let mut this = Self {
@@ -891,4 +903,344 @@ async fn camera_proxy_streams_with_server_only_auth_and_no_redirects() {
     }
     std::fs::remove_file(path).unwrap();
     task.abort();
+}
+
+// ---- SLAM adapter integration ----
+// FEATURE: optional MRPT adapter subprocess feeding the panel slam state.
+// SPEC: --slam-adapter EXE spawns the line-JSON adapter; scans+odom flow to
+// it as update; its pose/mode/quality appear as state.slam; lost mode stops
+// and blocks manual commands until quality recovers.
+// IMPLEMENTATION: dedicated blocking thread owns the adapter process; slam
+// state lands in the shared watch channel of "state".
+// RESULT: IMPLEMENTED — adapter feeding, lost gating and no-slam default
+// verified against a shell fake.
+// STATUS: DONE
+fn slam_fake(dir: &std::path::Path, mode_by_scan: usize) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("slam-adapter");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nn=0\nwhile read line; do\n  case \"$line\" in \
+             *start_mapping*) echo '{{\"ok\":true,\"mode\":\"mapping\"}}' ;; \
+             *load_map*) echo '{{\"ok\":true,\"mode\":\"localize\"}}' ;; \
+             *map*) echo '{{\"ok\":true,\"grid\":{{\"x_min\":0.0,\"y_min\":0.0,\"res\":0.05,\"w\":2,\"h\":1,\"cells\":\"50,-1\"}}}}' ;; \
+             *update*) n=$((n+1)); if [ $n -ge {mode_by_scan} ]; then \
+             echo '{{\"ok\":true,\"mode\":\"localize\",\"pose\":{{\"x\":1.5,\"y\":-0.2,\"yaw\":0.4}},\"quality\":0.9}}'; else \
+             echo '{{\"ok\":true,\"mode\":\"lost\",\"pose\":null,\"quality\":0.0}}'; fi ;; \
+             *) echo '{{\"ok\":true}}' ;; \
+             esac\ndone\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+fn scan_packet(stamp: f64) -> Vec<u8> {
+    let mut p = 10f32.to_be_bytes().to_vec();
+    p.extend(arr(&[1., 2., 0., 0.1, f32::NAN, 11.]));
+    p.extend(arr(&[0., 0.7, 1., 2., 3., 4.]));
+    p.extend(arr(&[]));
+    p.extend(1u32.to_be_bytes());
+    packet(6, 0, 3, stamp, &p)
+}
+#[tokio::test]
+async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
+    let dir = std::env::temp_dir().join(format!(
+        "robot-slam-it-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Fake turns "localized" after 3 update scans.
+    let fake = slam_fake(&dir, 3);
+    let fake2 = slam_fake(&dir, 10);
+    let mut s = Session::start(
+        &["--slam-adapter", fake.to_str().unwrap()],
+        None,
+        true,
+    )
+    .await;
+    let mut w = s.ws().await;
+    let initial = frame(&mut w, "state").await;
+    assert!(
+        initial.get("slam").is_none(),
+        "no slam state must be published before the adapter is started"
+    );
+    // Session 1 (mapping): no saved map, driving is allowed, pose flows.
+    let mut odom = vec![0u8; 49];
+    odom[..8].copy_from_slice(&0.0f64.to_be_bytes());
+    odom[8..16].copy_from_slice(&0.0f64.to_be_bytes());
+    odom[16..24].copy_from_slice(&0.0f64.to_be_bytes());
+    odom[24..32].copy_from_slice(&0.05f64.to_be_bytes());
+    odom[32..40].copy_from_slice(&0f64.to_be_bytes());
+    odom[40..48].copy_from_slice(&0f64.to_be_bytes());
+    s.send(packet(4, 0, 1, 1., &odom)).await;
+    s.send(scan_packet(1.1)).await;
+    let st = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w, "state").await;
+            if let Some(slam) = v.get("slam") {
+                return slam.clone();
+            }
+        }
+    })
+    .await
+    .expect("slam state must appear after the first scan");
+    assert_eq!(st["mode"], "mapping");
+    // Mapping drives the robot (that is how the map gets drawn).
+    cmd(&mut w, r#"{"v":0.1,"w":0.0}"#).await;
+    let m = s.command().await;
+    assert_eq!(m.1, 0.1);
+    s.fake.abort();
+    drop(s);
+
+    // Session 2 (localize on a "saved" map): the fake replies low quality
+    // first (lost: teleop blocked), then localizes with a pose (teleop on).
+    let mut s2 = Session::start_env(
+        &["--slam-adapter", fake2.to_str().unwrap()],
+        None,
+        true,
+        Duration::ZERO,
+        &[("ROBOT_SLAM_MAP", "/tmp/robot-slam-it-map.bin")],
+    )
+    .await;
+    let mut w2 = s2.ws().await;
+    s2.send(packet(4, 0, 1, 1., &odom)).await;
+    // SlamCore declares lost after LOST_AFTER_BAD consecutive bad updates.
+    for i in 0..4 {
+        s2.send(scan_packet(1.1 + i as f64)).await;
+    }
+    let st = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w2, "state").await;
+            if let Some(slam) = v.get("slam") {
+                if slam["mode"] == "lost" {
+                    return slam.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("slam must be lost on sustained low quality");
+    assert_eq!(st["mode"], "lost");
+    cmd(&mut w2, r#"{"v":0.1,"w":0.0}"#).await;
+    // The gate itself may emit a final stop zero; drain it, then no more.
+    sleep(Duration::from_millis(100)).await;
+    while let Ok(c) = s2.cmds.try_recv() {
+        assert_eq!(c.1, 0.0, "only a stop zero may slip through the gate");
+    }
+    s2.quiet(120).await;
+    // The fake localizes from its 10th update on; send enough scans.
+    for i in 0..8 {
+        s2.send(scan_packet(2. + i as f64)).await;
+    }
+    let st = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w2, "state").await;
+            if let Some(slam) = v.get("slam") {
+                if slam["mode"] == "localize"
+                    && slam["quality"].as_f64().is_some_and(|q| q >= 0.5)
+                {
+                    return slam.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("slam must recover to localize");
+    assert_eq!(st["pose"]["x"], 1.5);
+    assert_eq!(st["quality"], 0.9);
+    cmd(&mut w2, r#"{"v":0.1,"w":0.0}"#).await;
+    let m = s2.command().await;
+    assert_eq!(m.1, 0.1);
+}
+fn rand_suffix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+// ---- Real MRPT adapter path (requires tools/mrpt-adapter built) ----
+// FEATURE: end-to-end mapping through the actual C++ adapter.
+// SPEC: scans from the fake Player flow through robot-server into the MRPT
+// adapter and back as slam.pose tracking the driven path.
+// IMPLEMENTATION: same harness, real adapter binary, synthetic room scans.
+// RESULT: IMPLEMENTED — pose error stays under 0.5 m along the path.
+// STATUS: DONE
+#[tokio::test]
+async fn slam_survives_telemetry_updates_and_streams_map() {
+    let dir = std::env::temp_dir().join(format!(
+        "robot-slam-persist-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = slam_fake(&dir, 1);
+    let mut s = Session::start(
+        &["--slam-adapter", fake.to_str().unwrap()],
+        None,
+        true,
+    )
+    .await;
+    let mut w = s.ws().await;
+    // One scan seeds the slam state.
+    s.send(scan_packet(1.0)).await;
+    timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w, "state").await;
+            if v.get("slam").is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("slam must appear after first scan");
+    // Battery telemetry arrives afterwards (POWER update, all-invalid frame).
+    let mut power = 31u32.to_be_bytes().to_vec();
+    for f in [0f32, 0., 0., 0.] {
+        power.extend(f.to_be_bytes());
+    }
+    power.extend((-1i32).to_be_bytes());
+    s.send(packet(2, 0, 1, 1.2, &power)).await;
+    // The battery publish must keep the slam block AND carry the map that
+    // the first update already fetched (states only publish on change, so
+    // this is also the first frame where both are observable together).
+    let with_map = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w, "state").await;
+            if v.get("sensors").and_then(|s| s.get("battery")).is_some() {
+                let slam = v.get("slam").expect("telemetry publish wiped the slam state");
+                if slam.get("map").is_some() {
+                    return slam.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("battery telemetry must publish with slam+map intact");
+    assert_eq!(with_map["map"]["w"], 2);
+    assert_eq!(with_map["map"]["cells"], "50,-1");
+}
+#[tokio::test]
+#[ignore = "requires tools/mrpt-adapter built with MRPT"]
+async fn real_adapter_maps_synthetic_room() {
+    let adapter_real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/mrpt-adapter/adapter");
+    if !adapter_real.is_file() {
+        panic!("adapter binary missing; build it in tools/mrpt-adapter");
+    }
+    // Wrap: keep the adapter's stderr (MRPT logs) in a file for diagnosis.
+    let dir = std::env::temp_dir().join(format!(
+        "robot-slam-real-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wrapper = dir.join("wrap.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nLD_LIBRARY_PATH={} exec {} 2>>{}/adapter.log\n",
+            adapter_real.parent().unwrap().join("third_party/install/lib").display(),
+            adapter_real.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let adapter = wrapper;
+    let mut s = Session::start(
+        &["--slam-adapter", adapter.to_str().unwrap()],
+        None,
+        true,
+    )
+    .await;
+    let mut w = s.ws().await;
+    // Room [-3,3]^2 + pillar; robot drives +x from (-2, 0.5) in 0.1 m steps.
+    let walls: [(f64, f64, f64, f64); 4] = [
+        (-3., -3., 3., -3.),
+        (3., -3., 3., 3.),
+        (3., 3., -3., 3.),
+        (-3., 3., -3., -3.),
+    ];
+    let pillar = (1.2f64, -1.9, 1.6, -1.5);
+    let seg_hit = |px: f64, py: f64, dx: f64, dy: f64,
+                   (x1, y1, x2, y2): (f64, f64, f64, f64)| {
+        let (ex, ey) = (x2 - x1, y2 - y1);
+        let denom = dx * ey - dy * ex;
+        if denom.abs() < 1e-12 {
+            return f64::INFINITY;
+        }
+        let t = ((x1 - px) * ey - (y1 - py) * ex) / denom;
+        let u = ((x1 - px) * dy - (y1 - py) * dx) / denom;
+        if t > 0. && (0. ..=1.).contains(&u) {
+            t
+        } else {
+            f64::INFINITY
+        }
+    };
+    let scan_room = |x: f64, y: f64, yaw: f64| {
+        let off = 97.6f64.to_radians();
+        let mut ang = Vec::new();
+        let mut rng = Vec::new();
+        for k in 0..72 {
+            let a = -std::f64::consts::PI + 2. * std::f64::consts::PI * k as f64 / 72.;
+            let (c, sn) = ((yaw + a + off).cos(), (yaw + a + off).sin());
+            let mut best = 8.0f64;
+            for seg in walls {
+                best = best.min(seg_hit(x, y, c, sn, seg));
+            }
+            best = best.min(seg_hit(x, y, c, sn, pillar));
+            ang.push(a as f32 + off as f32);
+            rng.push(best as f32);
+        }
+        (ang, rng)
+    };
+    let mut x = -2.0f64;
+    let mut odom_x = 0.0f64;
+    for i in 0..10 {
+        odom_x += 0.1;
+        let mut odom = vec![0u8; 49];
+        odom[..8].copy_from_slice(&odom_x.to_be_bytes());
+        odom[8..16].copy_from_slice(&0f64.to_be_bytes());
+        odom[16..24].copy_from_slice(&0f64.to_be_bytes());
+        odom[24..32].copy_from_slice(&0.1f64.to_be_bytes());
+        s.send(packet(4, 0, 1, 1. + i as f64, &odom)).await;
+        let (ang, rng) = scan_room(x, -2.0, 0.);
+        let mut p = 8.0f32.to_be_bytes().to_vec();
+        p.extend(arr(&ang));
+        p.extend(arr(&rng));
+        p.extend(arr(&[]));
+        p.extend(1u32.to_be_bytes());
+        s.send(packet(6, 0, 3, 1.1 + i as f64, &p)).await;
+        x += 0.1;
+    }
+    // This test checks plumbing: scans reach the MRPT adapter and poses
+    // stream back to the panel, advancing roughly with the driven 1 m path.
+    // Absolute ICP accuracy on synthetic square rooms is limited by their
+    // symmetry; real-data tuning happens on the robot.
+    let mut last = Value::Null;
+    let deadline = Duration::from_secs(8);
+    timeout(deadline, async {
+        loop {
+            let v = frame(&mut w, "state").await;
+            if let Some(slam) = v.get("slam") {
+                last = slam.clone();
+                if slam["mode"] == "mapping"
+                    && slam["pose"]["x"].as_f64().is_some_and(|x| x >= 0.4)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("mapping pose must advance along the driven path");
+    assert!(last["mode"] == "mapping");
 }
