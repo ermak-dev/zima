@@ -60,7 +60,7 @@ ARM-бинарники владельца маски собираются ста
 | `ir:0` | Датчик стены: массивы range и voltage. |
 | `ir:1` | Четыре канала cliff: range/voltage. Ноль не доказан как признак безопасного пола. |
 | `ir:2` | Два канала drop: range/voltage. Смысл нулей и физическая реакция отдельно не приняты. |
-| `sonar:0` | Диапазон по Player в метрах. `65.534` — подозреваемый sentinel/ошибка, не достоверная дальность. |
+| `sonar:0` | Диапазон по Player в метрах. `65.534` — sentinel «нет эха»: u16 в мм, `0xFFFE`; не достоверная дальность. |
 | `power:0` | Напряжение, процент и заряд с valid-битами. Время физического измерения и правдоподобие показания по одному valid не гарантируются. |
 
 Дополнительно объявлены `ir:6` для состояния вентилятора, `ir:7/8` для
@@ -74,6 +74,39 @@ ARM-бинарники владельца маски собираются ста
 пакета не доказывает свежесть. На доке наблюдалось около 19.9 В, но это не
 установленный номинал ячеек батареи. Встречались и неправдоподобные положительные
 напряжения с выставленными valid-битами.
+
+### Vendor-стек: сонар и док (по `strings` прошивки, без декомпиляции)
+
+Наблюдение 2026-10-27 на живом роботе (только чтение: `/opt/rockrobo/cleaner/`
+— конфиги, `bin/RoboController`, `lib/libchassisdriver.so`, `lib/libNavDriver.so`).
+Названия классов/строк восстановлены из таблиц символов; точную семантику полей
+они не доказывают.
+
+**Сонар.** Один центральный датчик, без геометрии в `ruby_chassis.cfg`
+(`sonar_parameter` не задан). MCU шлёт дальность, `RubyChassisDriver::
+ProcessSonar` публикует `sonar:0`. NavDriver использует сонар не как дальномер
+для карты, а как «виртуальный бампер» (`SonarBumper`): порог 60 мм
+(`SONAR_THRESHOLD` в `Nav.cfg`), отъезд `BACKOFF_SPEED_SONAR`, ПИД подхода
+к цели (`SONAR_PID_*`, `DIS_EXPECTED_SONAR`), точки препятствий
+(`CreateSonarObstaclePoints`), отдельный режим перед доком
+(`ChargerProtectSonarBumper`, 30 мм). Ошибки `Error17/19_Sonar` — сонар
+не сработал там, где должен был. `SONAR_DELAY 40` мс.
+
+**Поиск дока — лидаром и по памяти позы, не ИК-маячком.** RoboController
+(состояния `CRoboStateBackToDock`/`SearchForDock`/`RubToDock`) посылает NavDriver
+`RT_Nav_BackToDock`. Автомат `ReturnCharger` идёт по состояниям
+`LocalSearch → GoToLocalSearchPoint → SearchCharger → ConfirmCharger →
+InsertCharger → GoToCharger → Charging`: поза дока известна из карты
+(`ChargerPos.data`, `StartPos.data`, `CalChargerPosWhenAtDock`), силуэт дока
+(230×65 мм, `Nav.cfg`) различается в лидарном скане (`CalcChargerPosition`,
+`CalcLaserAngleForCharger`) с двойным подтверждением (`initDoubleConfirmSuspect`,
+`ReCheckRotate`). Финальный заход защищают `ChargerProtectBumper/SonarBumper/
+LaserBumper` (60 мм в секторе ±70°). Детекция «на доке» — по статусу зарядки
+из MCU (`ProcessChargingCycle`, `RE_Mcu_DockConnected*`), контактные пластины
+FR/FL/Right дают ошибки `Error33–35_DockSensor*`. `chargerIntensity.cfg`
+(порог 900) — калибровка производственного теста детектора, не рулёжки.
+Для нашего стека воспроизводимая идея: поза дока из карты MRPT + финальный
+заход по сонару/зарядке, скорость захода у vendor 0.05 м/с.
 
 ### Лидар
 
