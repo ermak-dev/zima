@@ -3,7 +3,7 @@
  *
  * Wire format (76-byte packet, little-endian words), established offline from
  * libroboipc.so, the RoboController binary and a saved FIFO trace; see
- * docs/player-platform-survey.md:
+ * HARDWARE.md:
  *   +0  u16 event      0x0045 request, 0x00a9 acknowledgement
  *   +2  u8  src        1 = RoboController side, 4 = McuProxy side
  *   +3  u8  dst        counterpart of src
@@ -50,8 +50,8 @@
 /* Bits with a known device behind them; anything else is rejected. */
 #define MASK_KNOWN_BITS 0x0017ffffu
 
-/* Masks observed on the wire or derived from them; candidates stay untested
- * on the physical robot until a separate authorized session. */
+/* 0x10f8ff was observed with LDS and motion while both brushes stayed still.
+ * 0x10f0ff remains untested; see HARDWARE.md for the limits of that observation. */
 #define MASK_STOCK_CLEANING 0x0010feffu    /* both brushes + LDS + fan */
 #define MASK_CANDIDATE_NO_BRUSHES 0x0010f8ffu /* LDS kept, brushes off */
 #define MASK_CANDIDATE_NO_BRUSHES_NO_FAN 0x0010f0ffu

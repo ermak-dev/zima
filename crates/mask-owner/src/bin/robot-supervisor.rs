@@ -1,15 +1,15 @@
-//! robot-supervisor: the on-robot half of a bridge session.
+//! robot-supervisor: the on-robot half of a server session.
 //!
-//! The workstation bridge starts `robot disable`, then connects here and
-//! sends ACTIVATE. From that moment the supervisor:
+//! The CLI disables the stock controller, then robot-server connects here
+//! and sends ACTIVATE. From that moment the supervisor:
 //!   - applies the session device mask (LDS + wheels, brushes off) and
 //!     holds it;
 //!   - watches the heartbeat connection: bytes from the bridge mean
 //!     "still alive";
 //!   - when the connection dies (EOF) or goes silent past the timeout,
-//!     performs the full rollback entirely on the robot, with no network
-//!     access to the workstation: zero velocity over loopback Player TCP,
-//!     the standby mask over the FIFO, then the controller-restore script.
+//!     attempts the standby mask over the FIFO, then runs controller restore
+//!     locally, without access to the workstation. This path does not send
+//!     a separate zero velocity; full_rollback does so on mask-apply failure.
 //!
 //! If ACTIVATE never arrives, the supervisor exits without touching
 //! anything: a failed `robot disable` leaves a harmless listener behind.
