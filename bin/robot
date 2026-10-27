@@ -4,6 +4,7 @@
 #        robot position|fan|battery|stop   # battery: read-only power:0 JSON
 #        robot snapshot [output.jpg]
 #        robot record <output.wav> [--seconds N] [--gain 0..90]  # test WAV, no ROS
+#        robot say "text" [--yandex-env FILE]  # speak on the robot (no ROS)
 #        robot audio <command>   # capture, playback, speech (see audio --help)
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
@@ -31,7 +32,7 @@ ssh_wrap() {
     esac
 }
 
-usage() { sed -n '2,16s/^# //p' "$0"; }
+usage() { sed -n '2,17s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
 
@@ -309,6 +310,9 @@ case $cmd in
                 fi ;;
         esac
         exec python3 "$(repo_root)/bin/audio/cli.py" "$@" ;;
+    say)
+        # Local or SpeechKit TTS through the playback helper; no ROS, no controller.
+        exec python3 "$(repo_root)/bin/audio/say.py" "$@" ;;
     bug)
         exec "${ROBOT_BUG_BIN:-$(dirname "$(realpath "$0")")/bug}" "$@" ;;
     move)
