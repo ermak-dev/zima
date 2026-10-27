@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 crates/target/
 ros-ws/
+.playwright-mcp/

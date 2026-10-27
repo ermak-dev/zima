@@ -66,13 +66,15 @@ describe('usePanelSocket', () => {
 describe('useMjpeg', () => {
   it('inactive stream sets off status and never loads an image', () => {
     const { result } = renderHook(() => useMjpeg({ url: '/camera.mjpeg', active: false }))
-    expect(result.current).toBe('off')
+    expect(result.current.status).toBe('off')
+    expect(result.current.src).toBeUndefined()
   })
 
   it('unmount clears the retry timer and detaches handlers', () => {
     vi.useFakeTimers()
     const { result, unmount } = renderHook(() => useMjpeg({ url: '/camera.mjpeg', active: true }))
-    expect(['connecting', 'retrying']).toContain(result.current)
+    expect(['connecting', 'retrying']).toContain(result.current.status)
+    expect(result.current.src).toMatch(/^\/camera\.mjpeg\?t=/)
     unmount()
     const before = vi.getTimerCount()
     act(() => vi.advanceTimersByTime(10000))

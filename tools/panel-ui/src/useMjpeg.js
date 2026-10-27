@@ -2,10 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 
 // MJPEG in an <img> decodes every frame even when hidden, so the stream is
 // paused (src released) while the panel is collapsed and fully stopped on
-// unmount. The retry timer is cleared on every path.
+// unmount. The retry timer is cleared on every path; the cache-buster is
+// the attempt counter, so a retry always re-requests.
 export default function useMjpeg({ url, active }) {
   const [status, setStatus] = useState('connecting')
   const [attempt, setAttempt] = useState(0)
+  const src = active ? `${url}${url.includes('?') ? '&' : '?'}t=${attempt}-${Date.now()}` : undefined
 
   useEffect(() => {
     if (!active) {
@@ -22,7 +24,7 @@ export default function useMjpeg({ url, active }) {
       setStatus('retrying')
       retry = setTimeout(() => setAttempt((n) => n + 1), 2500)
     }
-    img.src = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`
+    img.src = src
     return () => {
       alive = false
       clearTimeout(retry)
@@ -30,7 +32,7 @@ export default function useMjpeg({ url, active }) {
       img.onerror = null
       img.src = ''
     }
-  }, [url, active, attempt])
+  }, [src, active])
 
-  return status
+  return { status, src }
 }

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import usePanelSocket from './usePanelSocket.js'
 import useMjpeg from './useMjpeg.js'
 import useOccupancyMap from './useOccupancyMap.js'
@@ -17,10 +17,10 @@ function reading(text, cls) {
   return { text: text ?? 'нет данных', cls: text === null ? 'missing' : cls || '' }
 }
 
-function SensorRow({ id, value }) {
+function SensorRow({ id, name, value }) {
   return (
     <tr>
-      <td>{id}</td>
+      <td>{name}</td>
       <td id={id} className={value.cls}>{value.text}</td>
     </tr>
   )
@@ -50,7 +50,7 @@ export default function App() {
 
   const { stop } = useTeleop(send)
   const cameraActive = !collapsed.camera && expanded !== 'map' && expanded !== 'sensors'
-  const camStatus = useMjpeg({ url: '/camera.mjpeg', active: cameraActive })
+  const { status: camStatus, src: camSrc } = useMjpeg({ url: '/camera.mjpeg', active: cameraActive })
 
   const fitMap = useCallback(() => {
     setView((v) => ({ ...v, fitRequest: v.fitRequest + 1 }))
@@ -85,6 +85,19 @@ export default function App() {
       return next
     })
   }
+
+  // Escape leaves the expanded layout and returns focus to its button.
+  useEffect(() => {
+    if (!expanded) return
+    const onKey = (e) => {
+      if (e.code !== 'Escape') return
+      e.preventDefault()
+      setExpanded(null)
+      document.getElementById(`${expanded}-expand`)?.focus()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [expanded])
 
   const panelBtn = (id, name) => (
     <>
@@ -176,7 +189,7 @@ export default function App() {
                   {camStatus === 'retrying' ? 'Камера недоступна. Повторное подключение…' : 'Подключение к камере…'}
                 </div>
                 {camStatus !== 'off' && (
-                  <img id="cam" alt="Прямой поток с камеры робота" src={camStatus === 'connecting' || camStatus === 'retrying' || camStatus === 'live' ? `/camera.mjpeg?t=${camStatus}` : undefined} />
+                  <img id="cam" alt="Прямой поток с камеры робота" src={camSrc} />
                 )}
               </div>
             )}
@@ -197,12 +210,12 @@ export default function App() {
                 <tr className="group"><td colSpan="2">Обрыв · расстояние / напряжение</td></tr>
                 {[0, 1, 2, 3].map((i) => {
                   const v = pair(sensors.cliff_ranges?.[i], sensors.cliff_ir?.[i])
-                  return <SensorRow key={i} id={`cliff-${i}`} value={reading(v, '')} />
+                  return <SensorRow key={i} id={`cliff-${i}`} name={`ИК ${i + 1}`} value={reading(v, '')} />
                 })}
                 <tr className="group"><td colSpan="2">Отрыв колёс · расстояние / напряжение</td></tr>
                 {[0, 1].map((i) => {
                   const v = pair(sensors.drop_ranges?.[i], sensors.drop_ir?.[i])
-                  return <SensorRow key={i} id={`drop-${i}`} value={reading(v, '')} />
+                  return <SensorRow key={i} id={`drop-${i}`} name={`ИК ${i + 1}`} value={reading(v, '')} />
                 })}
                 <tr><td>Сонар</td><td id="sonar" className={Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? 'alert' : '') : 'missing'}>
                   {Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? '65.534 м · sentinel' : `${fmt(sensors.sonar, 3)} м`) : 'нет данных'}
