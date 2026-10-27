@@ -70,6 +70,13 @@ fn bumper(pressed: bool) -> Vec<u8> {
     p.shrink_to_fit();
     packet(BUMPER_CODE, 0, 1, 10., &p)
 }
+fn bumper_segments(flags: &[u8]) -> Vec<u8> {
+    let mut p = (flags.len() as u32).to_be_bytes().to_vec();
+    p.extend((flags.len() as u32).to_be_bytes());
+    p.extend(flags);
+    p.resize(p.len().div_ceil(4) * 4, 0);
+    packet(BUMPER_CODE, 0, 1, 10., &p)
+}
 impl Session {
     async fn start(extra: &[&str], hb: Option<String>, optional: bool) -> Self {
         Self::start_delayed(extra, hb, optional, Duration::ZERO).await
@@ -388,6 +395,35 @@ async fn scan_and_raw_sensor_schema() {
         assert_eq!(page.status(), 503);
     }
     assert_eq!(frame(&mut w, "state").await["bumper"], "clear");
+    // Per-segment bumper state is inventory: Left/Front/Right flags ride along
+    // the aggregate without replacing it.
+    s.send(bumper_segments(&[1, 0, 1])).await;
+    let v = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w, "state").await;
+            if v["bumper"] == "PRESSED" {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(v["sensors"]["bumper_segments"], json!([true, false, true]));
+    s.send(bumper_segments(&[0, 0, 0])).await;
+    let v = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w, "state").await;
+            if v["bumper"] == "clear" {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        v["sensors"]["bumper_segments"],
+        json!([false, false, false])
+    );
     let mut p = 10f32.to_be_bytes().to_vec();
     p.extend(arr(&[1., 2., 0., 0.1, f32::NAN, 11.]));
     p.extend(arr(&[0., 0.7, 1., 2., 3., 4.]));
@@ -955,12 +991,7 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
     // Fake turns "localized" after 3 update scans.
     let fake = slam_fake(&dir, 3);
     let fake2 = slam_fake(&dir, 10);
-    let mut s = Session::start(
-        &["--slam-adapter", fake.to_str().unwrap()],
-        None,
-        true,
-    )
-    .await;
+    let mut s = Session::start(&["--slam-adapter", fake.to_str().unwrap()], None, true).await;
     let mut w = s.ws().await;
     let initial = frame(&mut w, "state").await;
     assert!(
@@ -1039,8 +1070,7 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
         loop {
             let v = frame(&mut w2, "state").await;
             if let Some(slam) = v.get("slam") {
-                if slam["mode"] == "localize"
-                    && slam["quality"].as_f64().is_some_and(|q| q >= 0.5)
+                if slam["mode"] == "localize" && slam["quality"].as_f64().is_some_and(|q| q >= 0.5)
                 {
                     return slam.clone();
                 }
@@ -1078,12 +1108,7 @@ async fn slam_survives_telemetry_updates_and_streams_map() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let fake = slam_fake(&dir, 1);
-    let mut s = Session::start(
-        &["--slam-adapter", fake.to_str().unwrap()],
-        None,
-        true,
-    )
-    .await;
+    let mut s = Session::start(&["--slam-adapter", fake.to_str().unwrap()], None, true).await;
     let mut w = s.ws().await;
     // One scan seeds the slam state.
     s.send(scan_packet(1.0)).await;
@@ -1111,7 +1136,9 @@ async fn slam_survives_telemetry_updates_and_streams_map() {
         loop {
             let v = frame(&mut w, "state").await;
             if v.get("sensors").and_then(|s| s.get("battery")).is_some() {
-                let slam = v.get("slam").expect("telemetry publish wiped the slam state");
+                let slam = v
+                    .get("slam")
+                    .expect("telemetry publish wiped the slam state");
                 if slam.get("map").is_some() {
                     return slam.clone();
                 }
@@ -1126,8 +1153,8 @@ async fn slam_survives_telemetry_updates_and_streams_map() {
 #[tokio::test]
 #[ignore = "requires tools/mrpt-adapter built with MRPT"]
 async fn real_adapter_maps_synthetic_room() {
-    let adapter_real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/mrpt-adapter/adapter");
+    let adapter_real =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/mrpt-adapter/adapter");
     if !adapter_real.is_file() {
         panic!("adapter binary missing; build it in tools/mrpt-adapter");
     }
@@ -1143,7 +1170,11 @@ async fn real_adapter_maps_synthetic_room() {
         &wrapper,
         format!(
             "#!/bin/sh\nLD_LIBRARY_PATH={} exec {} 2>>{}/adapter.log\n",
-            adapter_real.parent().unwrap().join("third_party/install/lib").display(),
+            adapter_real
+                .parent()
+                .unwrap()
+                .join("third_party/install/lib")
+                .display(),
             adapter_real.display(),
             dir.display()
         ),
@@ -1155,12 +1186,7 @@ async fn real_adapter_maps_synthetic_room() {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let adapter = wrapper;
-    let mut s = Session::start(
-        &["--slam-adapter", adapter.to_str().unwrap()],
-        None,
-        true,
-    )
-    .await;
+    let mut s = Session::start(&["--slam-adapter", adapter.to_str().unwrap()], None, true).await;
     let mut w = s.ws().await;
     // Room [-3,3]^2 + pillar; robot drives +x from (-2, 0.5) in 0.1 m steps.
     let walls: [(f64, f64, f64, f64); 4] = [
@@ -1170,8 +1196,7 @@ async fn real_adapter_maps_synthetic_room() {
         (-3., 3., -3., -3.),
     ];
     let pillar = (1.2f64, -1.9, 1.6, -1.5);
-    let seg_hit = |px: f64, py: f64, dx: f64, dy: f64,
-                   (x1, y1, x2, y2): (f64, f64, f64, f64)| {
+    let seg_hit = |px: f64, py: f64, dx: f64, dy: f64, (x1, y1, x2, y2): (f64, f64, f64, f64)| {
         let (ex, ey) = (x2 - x1, y2 - y1);
         let denom = dx * ey - dy * ex;
         if denom.abs() < 1e-12 {
@@ -1232,8 +1257,7 @@ async fn real_adapter_maps_synthetic_room() {
             let v = frame(&mut w, "state").await;
             if let Some(slam) = v.get("slam") {
                 last = slam.clone();
-                if slam["mode"] == "mapping"
-                    && slam["pose"]["x"].as_f64().is_some_and(|x| x >= 0.4)
+                if slam["mode"] == "mapping" && slam["pose"]["x"].as_f64().is_some_and(|x| x >= 0.4)
                 {
                     break;
                 }

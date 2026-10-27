@@ -50,6 +50,19 @@ describe('teleop safety', () => {
     expect(send).toHaveBeenCalledTimes(count)
   })
 
+  it('scales commands by the requested linear limit', () => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send, 0.06))
+    key('keydown', 'KeyW')
+    expect(send).toHaveBeenLastCalledWith({ v: 0.06, w: 0 })
+    key('keyup', 'KeyW')
+    key('keydown', 'KeyA')
+    // Angular scales by the same ratio so slow crawling turns slowly too.
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0.24 })
+    key('keyup', 'KeyA')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+  })
+
   it('releases a held key even if focus moved to a control', () => {
     const send = vi.fn()
     renderHook(() => useTeleop(send))

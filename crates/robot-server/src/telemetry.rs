@@ -29,6 +29,7 @@ impl Telemetry {
         for key in [
             "battery",
             "bumper",
+            "bumper_segments",
             "wall_ir",
             "cliff_ir",
             "drop_ir",
@@ -58,6 +59,8 @@ impl Telemetry {
             }
             (BUMPER_CODE, 0) => {
                 let s = decode_bumper(p)?;
+                // Aggregate keeps the safety/panel contract; the per-segment
+                // flags (vendor: Left/Front/Right) ride along as inventory.
                 self.fields.insert(
                     "bumper".into(),
                     json!(if s.pressed.iter().any(|v| *v) {
@@ -65,6 +68,14 @@ impl Telemetry {
                     } else {
                         "clear"
                     }),
+                );
+                self.fields.insert(
+                    "bumper_segments".into(),
+                    if s.pressed.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Array(s.pressed.iter().map(|v| json!(v)).collect())
+                    },
                 );
             }
             (IR_CODE, 0..=2) => {

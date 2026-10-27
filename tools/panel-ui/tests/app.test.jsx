@@ -35,7 +35,7 @@ afterEach(() => {
 describe('App lifecycle', () => {
   it('mounts sensor table with explicit missing values', () => {
     render(<App />)
-    for (const id of ['battery', 'bumper', 'wall', 'cliff-0', 'cliff-1', 'cliff-2', 'cliff-3', 'drop-0', 'drop-1', 'sonar']) {
+    for (const id of ['battery', 'bumper', 'wall', 'cliff-0', 'cliff-1', 'cliff-2', 'cliff-3', 'drop-0', 'drop-1', 'sonar', 'bumper-left', 'bumper-front', 'bumper-right']) {
       expect(document.getElementById(id).textContent).toBe('нет данных')
     }
   })
@@ -65,6 +65,43 @@ describe('App lifecycle', () => {
     act(() => lastHandler({ type: 'state', data: { sensors: { sonar: 65.534 } } }))
     expect(document.getElementById('sonar').textContent).toBe('65.534 м · sentinel')
     expect(document.getElementById('sonar').className).toBe('alert')
+  })
+
+  it('renders per-segment bumper state', () => {
+    render(<App />)
+    act(() => lastHandler({ type: 'state', data: { sensors: { bumper: 'PRESSED', bumper_segments: [true, false, true] } } }))
+    expect(document.getElementById('bumper').textContent).toBe('Нажат')
+    expect(document.getElementById('bumper').className).toBe('alert')
+    expect(document.getElementById('bumper-left').textContent).toBe('Нажат')
+    expect(document.getElementById('bumper-left').className).toBe('alert')
+    expect(document.getElementById('bumper-front').textContent).toBe('Свободен')
+    expect(document.getElementById('bumper-right').textContent).toBe('Нажат')
+    act(() => lastHandler({ type: 'state', data: { sensors: { bumper: 'clear', bumper_segments: [false, false, false] } } }))
+    expect(document.getElementById('bumper-left').textContent).toBe('Свободен')
+    expect(document.getElementById('bumper-left').className).toBe('')
+  })
+
+  it('speed slider scales teleop commands within the hard limits', () => {
+    const { container } = render(<App />)
+    const sent = () => sockets.flatMap((s) => s.sent)
+    const slider = container.querySelector('#speed-slider')
+    expect(slider).toBeTruthy()
+    expect(slider.value).toBe('0.1')
+    expect(document.getElementById('speed-value').textContent).toBe('0.10 м/с')
+    // The default limit keeps the current behavior byte-for-byte.
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: 0.1, w: 0 })
+    act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    act(() => {
+      set.call(slider, '0.06')
+      slider.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(document.getElementById('speed-value').textContent).toBe('0.06 м/с')
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: 0.06, w: 0 })
+    expect(sent().every((c) => Math.abs(c.v) <= 0.10001 && Math.abs(c.w) <= 0.40001)).toBe(true)
+    act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
   })
 
   it('state messages render odometry telemetry', () => {

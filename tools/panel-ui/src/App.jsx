@@ -6,6 +6,11 @@ import LidarCanvas from './LidarCanvas.jsx'
 import SlamStatus from './SlamStatus.jsx'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
+// Hard server-side drive limits; the slider only scales commands down.
+const HARD_LIMITS = { v: 0.1, w: 0.4 }
+const SEGMENTS = [
+  ['left', 'Левый'], ['front', 'Передний'], ['right', 'Правый'],
+]
 const pair = (range, voltage) => {
   const hasR = typeof range === 'number' && Number.isFinite(range)
   const hasV = typeof voltage === 'number' && Number.isFinite(voltage)
@@ -38,7 +43,9 @@ export default function App() {
     else if (msg.type === 'scan') setScan(msg.data)
   }, [])
   const { connected, send } = usePanelSocket(onMessage)
-  const { stop } = useTeleop(send)
+  const [speed, setSpeed] = useState(HARD_LIMITS.v)
+  const linearLimit = Number.isFinite(speed) ? Math.min(Math.max(speed, 0.01), HARD_LIMITS.v) : HARD_LIMITS.v
+  const { stop } = useTeleop(send, linearLimit)
   const cameraActive = !collapsed.camera && expanded !== 'lidar' && expanded !== 'sensors'
   const { status: camStatus, src: camSrc } = useMjpeg({ url: '/camera.mjpeg', active: cameraActive })
 
@@ -168,6 +175,12 @@ export default function App() {
               <table className="sensor-table" aria-label="Все датчики шасси"><tbody>
                 <tr><td>Батарея</td><td id="battery" className={batteryText === null ? 'missing' : ''}>{batteryText ?? 'нет данных'}</td></tr>
                 <tr><td>Бампер</td><td id="bumper" className={sensors.bumper === 'PRESSED' ? 'alert' : sensors.bumper ? '' : 'missing'}>{sensors.bumper ? (sensors.bumper === 'PRESSED' ? 'Нажат' : 'Свободен') : 'нет данных'}</td></tr>
+                {SEGMENTS.map(([id, name], i) => {
+                  const seg = Array.isArray(sensors.bumper_segments) ? sensors.bumper_segments[i] : undefined
+                  const known = typeof seg === 'boolean'
+                  return <SensorRow key={id} id={`bumper-${id}`} name={`Бампер · ${name}`}
+                    value={reading(known ? (seg ? 'Нажат' : 'Свободен') : null, seg ? 'alert' : '')} />
+                })}
                 <tr><td>Стена</td><td id="wall" className={pair(sensors.wall_ir, sensors.wall_voltages?.[0]) ? '' : 'missing'}>{pair(sensors.wall_ir, sensors.wall_voltages?.[0]) ?? 'нет данных'}</td></tr>
                 <tr className="group"><td colSpan="2">Обрыв · расстояние / напряжение</td></tr>
                 {[0, 1, 2, 3].map((i) => {
@@ -190,6 +203,11 @@ export default function App() {
       </main>
       <footer>
         <span><kbd>W A S D</kbd> / <kbd>↑ ← ↓ →</kbd> удерживать</span>
+        <label className="speed" htmlFor="speed-slider" title="Ограничение линейной скорости ручного управления">
+          <span>Скорость <b id="speed-value">{`${linearLimit.toFixed(2)} м/с`}</b></span>
+          <input id="speed-slider" type="range" min="0.01" max="0.1" step="0.01" value={linearLimit}
+            onChange={(e) => setSpeed(Number(e.target.value))} />
+        </label>
         <button id="stop" type="button" onClick={stop}>Стоп · Space</button>
         <span className="limits">≤ 0.1 м/с &nbsp; ≤ 0.4 рад/с</span>
       </footer>

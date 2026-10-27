@@ -2,24 +2,27 @@ import { useEffect, useRef, useState } from 'react'
 
 // Teleop: a held key publishes at 150 ms; blur, hidden tab, Space or keyup
 // stop immediately. The interval exists only while keys are held, so an
-// idle panel has zero running timers.
+// idle panel has zero running timers. The linear limit is a UI-side scale
+// factor only; the server keeps clamping to its own hard limits.
 const KEYS = {
   ArrowUp: ['v', 1], KeyW: ['v', 1], ArrowDown: ['v', -1], KeyS: ['v', -1],
   ArrowLeft: ['w', 1], KeyA: ['w', 1], ArrowRight: ['w', -1], KeyD: ['w', -1],
 }
 const LIMITS = { v: 0.1, w: 0.4 }
 
-export default function useTeleop(send) {
+export default function useTeleop(send, linearLimit = LIMITS.v) {
   const held = useRef(new Set())
   const [active, setActive] = useState(false)
   const sendRef = useRef(send)
   sendRef.current = send
+  const limitsRef = useRef({ v: linearLimit, w: linearLimit / LIMITS.v * LIMITS.w })
+  limitsRef.current = { v: linearLimit, w: linearLimit / LIMITS.v * LIMITS.w }
 
   const publish = () => {
     const cmd = { v: 0, w: 0 }
     for (const code of held.current) {
       const [axis, dir] = KEYS[code]
-      cmd[axis] = dir * LIMITS[axis]
+      cmd[axis] = dir * limitsRef.current[axis]
     }
     sendRef.current(cmd)
   }
