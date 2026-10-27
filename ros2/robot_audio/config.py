@@ -16,6 +16,8 @@ _DEFAULTS = {
                'quiet_hours': [], 'timezone': 'UTC'},
     'tts': {'enabled': False, 'allow_external': False, 'model': '', 'voice': '',
             'api_key_file': '~/.config/robot/openrouter.key', 'env_file': '',
+            'piper_model': '',
+            'yandex_env': '', 'yandex_url': '',
             'max_output_tokens': 512, 'audio_format': 'wav', 'pcm_sample_rate': 24000,
             'require_verbatim': True, 'timeout_s': 30.0,
             'max_text_chars': 2000, 'max_audio_bytes': 4_000_000,
@@ -110,6 +112,8 @@ def validate_config(patch):
         raise ValueError('TTS audio format must be wav or pcm16')
     if tts['enabled'] and (not tts['allow_external'] or not tts['model'].strip() or not tts['voice'].strip()):
         raise ValueError('TTS requires external consent and an explicit model and voice')
+    if not isinstance(tts['piper_model'], str):
+        raise ValueError('tts.piper_model must be a string path')
     if config['wake']['enabled'] and not config['wake']['manifest'].strip():
         raise ValueError('wake word requires an explicit local model manifest')
     speech = config['speech']

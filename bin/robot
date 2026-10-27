@@ -3,6 +3,7 @@
 # Usage: robot enable|disable|status        # stock controller handoff
 #        robot position|fan|battery|stop   # battery: read-only power:0 JSON
 #        robot snapshot [output.jpg]
+#        robot record <output.wav> [--seconds N] [--gain 0..90]  # test WAV, no ROS
 #        robot audio <command>   # capture, playback, speech (see audio --help)
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
@@ -30,7 +31,7 @@ ssh_wrap() {
     esac
 }
 
-usage() { sed -n '2,15s/^# //p' "$0"; }
+usage() { sed -n '2,16s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
 
@@ -290,6 +291,11 @@ case $cmd in
         robotctl "$cmd" ;;
     snapshot)
         exec "${ROBOT_CAMERA_BIN:-$(dirname "$(realpath "$0")")/camera/snapshot}" "$@" ;;
+    record)
+        # Standalone test capture: no ROS, no controller, no robot modes. Use
+        # `robot audio record` instead while an audio service owns the stream.
+        if [[ -n ${ROBOT_AUDIO_BIN:-} ]]; then exec "$ROBOT_AUDIO_BIN" capture "$@"; fi
+        exec python3 "$(repo_root)/bin/audio/cli.py" capture "$@" ;;
     audio)
         if [[ -n ${ROBOT_AUDIO_BIN:-} ]]; then exec "$ROBOT_AUDIO_BIN" "$@"; fi
         case ${1:---help} in

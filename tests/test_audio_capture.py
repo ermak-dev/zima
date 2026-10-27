@@ -35,6 +35,17 @@ class CaptureTests(unittest.TestCase):
         self.netrc = Path(self.temp.name) / 'camera.netrc'
         self.netrc.write_text('machine 127.0.0.1 login offline-user password offline-secret\n')
         self.netrc.chmod(0o600)
+        # Any worker-thread traceback (e.g. the HTTP feeder) fails the test:
+        # clean teardown must never let response.close() race a live read1().
+        self.thread_errors = []
+        previous = threading.excepthook
+
+        def collect(arguments):
+            if arguments.exc_type is not SystemExit:
+                self.thread_errors.append((arguments.exc_type, arguments.exc_value))
+
+        threading.excepthook = collect
+        self.addCleanup(setattr, threading, 'excepthook', previous)
 
     def test_credentials_fail_closed_without_leaking_secret(self):
         self.netrc.chmod(0o644)
@@ -261,6 +272,94 @@ class CaptureTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertEqual(source.state()['state'], 'stopped')
         self.assertFalse(source._thread.is_alive())
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed for teardown race test')
+    def test_stop_never_leaks_http_client_tracebacks_from_the_feeder(self):
+        # The reader thread may still sit in read1 while teardown closes the
+        # response; closing must not surface AttributeError('NoneType') in the
+        # thread or turn a clean stop into decoder_error.
+        url, _ = self.server(b'', hold=True)
+        source = self.capture.CameraAudioSource(self.capture.CaptureConfig(
+            url=url, netrc_path=str(self.netrc), max_reconnects=0,
+            connect_timeout=.3, stall_timeout=2, max_frame_age_s=.5))
+        self.addCleanup(source.stop)
+        source.start()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not source.state()['stream_id']:
+            threading.Event().wait(.01)
+        started = time.monotonic()
+        source.stop()
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(source.state()['state'], 'stopped')
+        self.assertFalse(source._thread.is_alive())
+        self.assertIsNone(source.state()['last_failure'])
+        self.assertEqual(source.state()['error'], None)
+        self.assertEqual(self.thread_errors, [],
+                         'feeder crashed during teardown: ' + repr(self.thread_errors))
+
+    def test_feeder_treats_closed_response_as_stop_not_crash(self):
+        # Deterministic: a response that raises AttributeError('NoneType') from
+        # read1 once closed. The feeder must swallow it as a benign stop, the
+        # session must end cleanly, and no excepthook traceback may appear.
+        import http.client
+        closed = threading.Event()
+        read1_entered = threading.Event()
+
+        class FakeResponse:
+            fp = None
+            def read1(self, n):
+                read1_entered.set()
+                # Model http.client: fp is nulled by close() DURING the read,
+                # so the AttributeError surfaces mid-call, not at entry.
+                closed.wait(2)
+                raise AttributeError("'NoneType' object has no attribute 'read1'")
+            def close(self):
+                closed.set()
+
+        class FakeDecoder:
+            def __init__(self, *a, **k): pass
+            def feed(inner, data): pass
+            def end_input(inner): pass
+            def pcm_blocks(inner, stop):
+                yield b''
+                closed.wait(1)
+            def interrupt(inner): pass
+            def close(inner): pass
+
+        # The constructor binds opener/decoder_factory as defaults, so they
+        # must be passed explicitly — patching the module would not take effect.
+        source = self.capture.CameraAudioSource(self.capture.CaptureConfig(
+            url='http://127.0.0.1/audio.opus', netrc_path=str(self.netrc),
+            max_reconnects=0, connect_timeout=.3, stall_timeout=2),
+            opener=lambda *a, **k: FakeResponse(), decoder_factory=FakeDecoder)
+        source.start()
+        time.sleep(.1)  # let the feeder park inside read1 before stop
+        source.stop()
+        self.assertEqual(source.state()['state'], 'stopped')
+        self.assertIsNone(source.state()['last_failure'])
+        self.assertEqual(self.thread_errors, [],
+                         'feeder crashed on a closed response: ' + repr(self.thread_errors))
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed for the close-race test')
+    def test_response_close_never_races_a_live_read1(self):
+        # Repeat stop/start/close rapidly: the feeder must tolerate the
+        # response being closed under it (fp becomes None) without any
+        # AttributeError traceback in threading.excepthook.
+        url, _ = self.server(b'', hold=True)
+        for round_number in range(10):
+            source = self.capture.CameraAudioSource(self.capture.CaptureConfig(
+                url=url, netrc_path=str(self.netrc), max_reconnects=0,
+                connect_timeout=.3, stall_timeout=2, max_frame_age_s=.5))
+            source.start()
+            try:
+                source.get_chunk(timeout=.8)
+            except queue.Empty:
+                pass
+            source.stop()
+            self.assertEqual(source.state()['state'], 'stopped', round_number)
+        time.sleep(.2)
+        self.assertEqual(self.thread_errors, [],
+                         'feeder crashed during teardown: ' + repr(self.thread_errors))
 
     @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed for stalled decoder test')
     def test_empty_stream_stalls_and_stop_is_bounded(self):

@@ -393,7 +393,9 @@ class CameraAudioSource:
                         if not data:
                             break
                         decoder.feed(data)
-                except (TimeoutError, OSError, ValueError):
+                except (TimeoutError, OSError, ValueError, AttributeError):
+                    # AttributeError: teardown closed the response under this
+                    # read (fp becomes None) — that is a stop, not a failure.
                     if not self._stop.is_set() and not session_stop.is_set():
                         feed_failure.append(CaptureError('stalled'))
                 finally:
@@ -416,11 +418,14 @@ class CameraAudioSource:
             raise
         finally:
             session_stop.set()
+            # Stop the reader before closing the socket it reads from:
+            # join first, then close, so read1 never races response.close().
+            if feeder is not None:
+                session_stop.set()
+                feeder.join(self.config.connect_timeout + .2)
             if decoder is not None:
                 decoder.close()
             response.close()
-            if feeder is not None:
-                feeder.join(self.config.connect_timeout + .2)
             with self._lock:
                 self._decoder = None
         if feed_failure:

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Audio commands; device and provider access require explicit enabled configuration."""
 import argparse
+import contextlib
 import json
 import math
+import os
+import queue
 import signal
 import subprocess
 from urllib.parse import urlsplit
@@ -10,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import wave
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'ros2'))
@@ -38,6 +42,12 @@ def parser():
     record.add_argument('wav', type=Path)
     record.add_argument('--seconds', type=float, default=6)
     record.add_argument('--timeout', type=float, default=35)
+    capture = sub.add_parser('capture', help='standalone test WAV; no ROS, no robot modes')
+    capture.add_argument('wav', type=Path)
+    capture.add_argument('--config', type=Path)
+    capture.add_argument('--seconds', type=float, default=6)
+    capture.add_argument('--timeout', type=float, default=35)
+    capture.add_argument('--gain', type=int, help='temporary camera gain 0..90, restored after')
     for name in ('listen', 'mute'):
         toggle = sub.add_parser(name)
         toggle.add_argument('state', choices=('on', 'off'))
@@ -125,6 +135,144 @@ def _record_ros(rclpy, node, args):
         return 0
     finally:
         recorder.close()
+
+
+def _gain_lease(cfg, volume, timeout):
+    """Temporary camera gain without owning LDS power: the camera is reachable on its own.
+
+    `audio companion` additionally stops the stock controller and spins the LDS, whose
+    noise dominates the microphone; a test WAV must not require either.
+    """
+    from robot_audio.camera_session import CameraGainLease, CameraSSH
+    parsed = urlsplit(cfg['url'])
+    if parsed.scheme != 'http' or parsed.port not in (None, 80):
+        raise ValueError('camera gain expects the OpenIPC HTTP endpoint on port 80')
+    ssh = CameraSSH(host=parsed.hostname, netrc_path=cfg['netrc'])
+    return CameraGainLease(ssh, volume=volume, ttl_s=max(60, int(timeout) + 60))
+
+
+class CameraSessionInterrupted(Exception):
+    """Marker for the sanitized interrupt raised by bounded camera contexts."""
+
+
+def _interrupted(error):
+    return isinstance(error, RuntimeError) and str(error) == 'session_interrupted'
+
+
+def _enter_gain(cfg, volume, timeout):
+    # Bounded camera contexts convert SIGINT/SIGTERM into
+    # CameraSessionError('session_interrupted'); give the CLI's interrupt
+    # handling its semantics back instead of reporting a failed operation
+    # with the gain possibly still applied. Enters the lease; the caller
+    # registers the exit itself (ExitStack.enter_context would enter twice).
+    try:
+        lease = _gain_lease(cfg, volume, timeout)
+        lease.__enter__()
+    except CameraSessionInterrupted:
+        raise
+    except Exception as error:
+        if _interrupted(error):
+            raise CameraSessionInterrupted from None
+        raise
+    return lease
+
+
+def _capture_once(source, path, seconds, deadline, *, log=None, started=None):
+    """One attempt. Lost samples raise ValueError; no partial file survives either way."""
+    from robot_audio.recording import PcmRecorder
+    recorder = PcmRecorder(path, seconds=seconds)
+    first_chunk = True
+    try:
+        while not recorder.complete:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('camera did not provide a complete recording')
+            try:
+                recorder.feed(source.get_chunk(min(.5, remaining)))
+                if first_chunk and log is not None:
+                    # Log at the first audio, not before it: the wait for the
+                    # decoder warmup (up to ~2 s after a gain reload) happens
+                    # inside this loop, and probing here would spend a chunk.
+                    first_chunk = False
+                    stream_id = ''
+                    if hasattr(source, 'state'):
+                        stream_id = str(source.state().get('stream_id', ''))[:8]
+                    log(f'stream is live ({stream_id}…), first audio after '
+                        f'{time.monotonic() - started:.1f}s; recording {seconds}s')
+            except queue.Empty:
+                continue
+        return recorder.frames
+    finally:
+        recorder.close()
+
+
+def _run_capture(args):
+    from robot_audio.acoustics import analyze_pcm
+    from robot_audio.capture import CameraAudioSource, CaptureConfig
+    # Unlike `audio run`, capture may fall back to the user's default profile:
+    # it is a standalone test command, so the user default is the expected way
+    # to consent. An explicit --config still wins; the refusal for a disabled
+    # input must keep naming that switch.
+    if args.config is None:
+        base = os.environ.get('XDG_CONFIG_HOME') or '~/.config'
+        default = Path(base, 'robot', 'audio.json').expanduser()
+        args.config = default if default.is_file() else None
+    config = load_config(args.config)
+    cfg = config['input']
+    if not cfg['enabled']:
+        raise ValueError('capture requires an explicitly enabled microphone source: '
+                         'pass --config with a profile where input.enabled is true')
+    path = args.wav.expanduser()
+    if path.exists() or path.is_symlink():
+        raise ValueError(f'output already exists: {path} (recording never overwrites)')
+
+    started = time.monotonic()
+
+    def log(message):
+        # Progress goes to stderr; stdout stays a single JSON report.
+        print(f'[{time.monotonic() - started:.1f}s] {message}', file=sys.stderr, flush=True)
+
+    report = {}
+    host = urlsplit(cfg['url']).hostname
+    log(f'config {args.config or "built-in defaults"}; output {path}')
+    with contextlib.ExitStack() as stack:
+        if args.gain is not None:
+            # Gain first: applying it reloads the camera audio and drops a live stream.
+            log(f'raising camera gain to {args.gain} on {host} '
+                f'(3 SSH steps + audio reload; the slow part, ~5 s)')
+            lease = _enter_gain(cfg, args.gain, args.timeout)
+            stack.callback(lease.__exit__, None, None, None)
+            report['camera_volume'] = {'original': lease.original_volume,
+                                       'active': lease.volume}
+            log(f'gain {lease.original_volume}->{lease.volume} confirmed by readback')
+        log(f'connecting to {cfg["url"]}')
+        source = CameraAudioSource(CaptureConfig(
+            url=cfg['url'], netrc_path=cfg['netrc'], frame_ms=cfg['chunk_ms'],
+            queue_size=cfg['queue_size'], connect_timeout=cfg['timeout_s'],
+            stall_timeout=cfg['timeout_s']))
+        source.start()
+        stack.callback(source.stop)
+        deadline = time.monotonic() + args.timeout
+        while True:
+            try:
+                log(f'recording {args.seconds}s from the live stream')
+                frames = _capture_once(source, path, args.seconds, deadline,
+                                       log=log, started=started)
+                break
+            except ValueError as error:
+                # A reconnect or dropped block invalidates the interval, not the source:
+                # start the recording again while the explicit timeout still allows it.
+                log(f'recording invalidated ({error}); retrying within the timeout')
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(str(error)) from None
+    log(f'wrote {frames} frames to {path}')
+    with wave.open(str(path)) as handle:
+        level = analyze_pcm(handle.readframes(handle.getnframes()))
+    report.update({'file': str(path), 'frames': frames, 'sample_rate': 16000,
+                   'channels': 1, 'sample_format': 's16le',
+                   'level': {key: level[key] for key in ('ac_dbfs', 'peak', 'clipping_fraction')}})
+    print(json.dumps(report))
+    return 0
 
 
 def _ros_request(args):
@@ -275,8 +423,10 @@ def main(argv=None):
     try:
         if hasattr(args, 'timeout') and (not math.isfinite(args.timeout) or not 0 < args.timeout <= 180):
             raise ValueError('timeout must be between zero and 180 seconds')
-        if args.command == 'record' and (not math.isfinite(args.seconds) or not .1 <= args.seconds <= 30):
+        if args.command in ('record', 'capture') and (not math.isfinite(args.seconds) or not .1 <= args.seconds <= 30):
             raise ValueError('recording duration must be .1..30 seconds')
+        if args.command == 'capture' and args.gain is not None and not 0 <= args.gain <= 90:
+            raise ValueError('camera gain must be 0..90; measured 100 returns digital zeros')
         if args.command in ('play', 'say'):
             if not math.isfinite(args.volume) or not 0 <= args.volume <= 1:
                 raise ValueError('volume must be between zero and one')
@@ -298,6 +448,8 @@ def main(argv=None):
             return 0
         if args.command == 'companion':
             return _run_companion(args)
+        if args.command == 'capture':
+            return _run_capture(args)
         if args.command == 'run':
             config = load_config(args.config)
             import rclpy
@@ -343,6 +495,10 @@ def main(argv=None):
             return run_local(args)
         return _ros_request(args)
     except KeyboardInterrupt:
+        return 130
+    except CameraSessionInterrupted:
+        # The bounded camera contexts turn SIGINT/SIGTERM into a sanitized
+        # error; restore the interrupt semantics of every other command.
         return 130
     except (ValueError, TypeError) as error:
         print(f'robot audio: {error}', file=sys.stderr)
