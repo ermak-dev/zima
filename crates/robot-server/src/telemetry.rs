@@ -128,8 +128,11 @@ pub fn scan(msg: &Message) -> Result<Option<Value>, Failure> {
             {
                 return None;
             }
-            let angle = a as f64 + 97.6f64.to_radians();
-            Some([-0.1 + r as f64 * angle.cos(), r as f64 * angle.sin()])
+            let angle = a as f64 + player_bridge::scan::LDS_YAW_DEG.to_radians();
+            Some([
+                player_bridge::scan::LDS_X + r as f64 * angle.cos(),
+                r as f64 * angle.sin(),
+            ])
         })
         .collect();
     let mut out = json!({"points":points,"range_max":s.max_range,"frame":"base_link"});
