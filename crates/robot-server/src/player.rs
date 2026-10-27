@@ -39,7 +39,23 @@ async fn write(stream: &mut TcpStream, h: MsgHeader, p: &[u8]) -> Result<(), Fai
 }
 pub async fn connect(c: &Config) -> Result<(Reader, Writer), Failure> {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut stream = TcpStream::connect((c.player_host.as_str(), c.player_port)).await?;
+        let mut waiting = false;
+        let mut stream = loop {
+            match TcpStream::connect((c.player_host.as_str(), c.player_port)).await {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    if !waiting {
+                        eprintln!(
+                            "robot-server: waiting for Player at {}:{} (startup timeout 10 s)",
+                            c.player_host, c.player_port
+                        );
+                        waiting = true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         stream.set_nodelay(true)?;
         let mut banner = [0; 32];
         stream.read_exact(&mut banner).await?;
@@ -103,7 +119,7 @@ pub async fn connect(c: &Config) -> Result<(Reader, Writer), Failure> {
         Ok((Reader { stream, pending }, Arc::new(AsyncMutex::new(wr))))
     })
     .await
-    .map_err(|_| -> Failure { "Player startup timed out".into() })?
+    .map_err(|_| -> Failure { "Player startup timed out after 10 s".into() })?
 }
 pub async fn velocity(writer: &mut Writer, v: f64, w: f64) -> Result<(), Failure> {
     let mut p = [0; 28];

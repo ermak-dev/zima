@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::mpsc,
     time::{sleep, timeout},
 };
@@ -28,6 +28,7 @@ struct Session {
     input: mpsc::Sender<Vec<u8>>,
     cmds: mpsc::Receiver<(Instant, f64, f64)>,
     fake: tokio::task::JoinHandle<()>,
+    listening_at: tokio::sync::oneshot::Receiver<Instant>,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -71,18 +72,33 @@ fn bumper(pressed: bool) -> Vec<u8> {
 }
 impl Session {
     async fn start(extra: &[&str], hb: Option<String>, optional: bool) -> Self {
+        Self::start_delayed(extra, hb, optional, Duration::ZERO).await
+    }
+    async fn start_delayed(
+        extra: &[&str],
+        hb: Option<String>,
+        optional: bool,
+        delay: Duration,
+    ) -> Self {
         // Serialize port reservation until the child binds: parallel tests must not
         // accidentally discover another child's listener during the bind handoff.
         static STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _startup = STARTUP.lock().await;
-        let player = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let player = TcpSocket::new_v4().unwrap();
+        player.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let pp = player.local_addr().unwrap().port();
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = http.local_addr().unwrap().port();
         drop(http);
         let (input, mut incoming) = mpsc::channel::<Vec<u8>>(32);
         let (log, cmds) = mpsc::channel(1024);
+        let (listening, listening_at) = tokio::sync::oneshot::channel();
         let fake = tokio::spawn(async move {
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+            let player = player.listen(128).unwrap();
+            let _ = listening.send(Instant::now());
             let (mut s, _) = player.accept().await.unwrap();
             let mut banner = [0; 32];
             banner[..9].copy_from_slice(b"Player v.");
@@ -179,6 +195,7 @@ impl Session {
             input,
             cmds,
             fake,
+            listening_at,
         };
         let end = Instant::now() + WAIT;
         loop {
@@ -522,6 +539,148 @@ async fn player_loss_and_corrupt_frame_fail_session() {
         s.exited().await;
     }
 }
+// BUG: watchdog restart can leave Player's TCP port temporarily refusing connections.
+// HYPOTHESIS: the single startup connect exits before the healthy Player begins listening.
+// SOLUTION: retry only refused initial TCP connects within the shared startup deadline.
+// RESULT: FIXED — delayed listeners recover with heartbeat; timeout and protocol failures abort.
+// STATUS: FIXED
+#[tokio::test]
+async fn delayed_player_listener_recovers_while_heartbeat_continues() {
+    let supervisor = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = supervisor.local_addr().unwrap().to_string();
+    let (beats, mut received) = mpsc::channel(8);
+    let start = Instant::now();
+    let supervisor_task = tokio::spawn(async move {
+        let (mut stream, _) = supervisor.accept().await.unwrap();
+        let mut activate = [0; 9];
+        stream.read_exact(&mut activate).await.unwrap();
+        assert_eq!(&activate, b"ACTIVATE\n");
+        stream.write_all(b"ACTIVATED\n").await.unwrap();
+        let mut beat = [0; 2];
+        while stream.read_exact(&mut beat).await.is_ok() {
+            assert_eq!(&beat, b"hb");
+            if beats.send(Instant::now()).await.is_err() {
+                break;
+            }
+        }
+    });
+    let delay = Duration::from_millis(1600);
+    let mut session = Session::start_delayed(&[], Some(address), false, delay).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= delay,
+        "Player must initially refuse TCP connections"
+    );
+    let first_beat = timeout(WAIT, received.recv()).await.unwrap().unwrap();
+    let listening_at = (&mut session.listening_at).await.unwrap();
+    assert!(
+        first_beat < listening_at,
+        "heartbeat must precede Player readiness"
+    );
+    let mut ws = session.ws().await;
+    assert!(frame(&mut ws, "state").await["sensors"].is_object());
+    session.quiet(100).await;
+    assert!(session.child.try_wait().unwrap().is_none());
+    eprintln!("delayed Player: HTTP ready after {elapsed:?}, same server process alive");
+    drop(ws);
+    drop(session);
+    supervisor_task.await.unwrap();
+}
+
+struct StartupChild(Child);
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn unavailable_player_has_bounded_startup_wait() {
+    let player = TcpSocket::new_v4().unwrap();
+    player.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_robot-server"))
+        .env_remove("ROBOT_SERVER_HEARTBEAT")
+        .args([
+            "--player-host",
+            "127.0.0.1",
+            "--player-port",
+            &player.local_addr().unwrap().port().to_string(),
+            "--port",
+            "0",
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = StartupChild(child);
+    let start = Instant::now();
+    let status = timeout(Duration::from_secs(13), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unavailable Player must not leave startup waiting forever");
+    assert!(!status.success());
+    let mut log = String::new();
+    std::io::Read::read_to_string(child.0.stderr.as_mut().unwrap(), &mut log).unwrap();
+    assert!(
+        log.contains("Player startup timed out"),
+        "missing startup deadline error: {log}"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_secs(9),
+        "initial refusal must wait for readiness"
+    );
+}
+
+#[tokio::test]
+async fn bad_player_banner_is_not_retried() {
+    let player = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_robot-server"))
+        .env_remove("ROBOT_SERVER_HEARTBEAT")
+        .args([
+            "--player-host",
+            "127.0.0.1",
+            "--player-port",
+            &player.local_addr().unwrap().port().to_string(),
+            "--port",
+            "0",
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = StartupChild(child);
+    let (mut stream, _) = timeout(WAIT, player.accept()).await.unwrap().unwrap();
+    stream.write_all(&[b'x'; 32]).await.unwrap();
+    timeout(WAIT, async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut log = String::new();
+    std::io::Read::read_to_string(child.0.stderr.as_mut().unwrap(), &mut log).unwrap();
+    assert!(
+        log.contains("bad Player banner"),
+        "protocol failure must be preserved: {log}"
+    );
+    assert!(
+        timeout(Duration::from_millis(100), player.accept())
+            .await
+            .is_err(),
+        "a protocol failure must never reconnect"
+    );
+}
+
 // BUG: the real supervisor replies ACTIVATED before monitoring heartbeat.
 // HYPOTHESIS: treating every received byte as EOF terminates a valid session.
 // SOLUTION: accept acknowledgment bytes; only EOF or an I/O failure loses supervision.
