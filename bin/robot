@@ -32,7 +32,7 @@ ssh_wrap() {
     esac
 }
 
-usage() { sed -n '2,17s/^# //p' "$0"; }
+usage() { sed -n '2,18s/^# //p' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
 
