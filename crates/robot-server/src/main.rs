@@ -1,6 +1,7 @@
 mod camera;
 mod player;
 mod safety;
+mod slam;
 mod telemetry;
 
 use axum::{

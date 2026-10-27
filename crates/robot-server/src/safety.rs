@@ -9,6 +9,7 @@ pub struct Safety {
     hold: Option<Instant>,
     pressed: bool,
     current: (f64, f64),
+    slam_ok: bool,
 }
 impl Safety {
     pub fn new() -> Self {
@@ -20,6 +21,19 @@ impl Safety {
             hold: None,
             pressed: false,
             current: (0., 0.),
+            slam_ok: true,
+        }
+    }
+    /// SLAM verdict for the drive gate. Without a SLAM subsystem the verdict
+    /// stays true (open gate); a lost localization stops and holds driving.
+    pub fn slam(&mut self, ok: bool, now: Instant) {
+        if self.slam_ok == ok {
+            return;
+        }
+        self.slam_ok = ok;
+        if !ok {
+            self.drive = DriveCommand::new(Duration::from_secs(1));
+            self.drive.set(0., 0., now);
         }
     }
     pub fn command(&mut self, id: u64, v: f64, w: f64, now: Instant) {
@@ -28,6 +42,7 @@ impl Safety {
         }
         self.owner = Some(id);
         if self.pressed
+            || !self.slam_ok
             || self.backoff.is_running(now)
             || self.hold.is_some_and(|until| now < until)
         {
@@ -109,5 +124,34 @@ mod tests {
         assert_eq!(s.next(Instant::now()), Some((0., 0.)));
         s.command(2, -1., 1., now + Duration::from_secs(5));
         assert_eq!(s.next(now + Duration::from_secs(5)), Some((-0.1, 0.4)));
+    }
+    // FEATURE: SLAM gate on manual driving.
+    // SPEC: when localization is not confirmed, commands are ignored and any
+    // active drive is stopped; re-confirmation re-enables; without SLAM the
+    // gate is open and behavior is unchanged.
+    // IMPLEMENTATION: a slam_ok flag in Safety, cleared drive on losing it.
+    // RESULT: IMPLEMENTED — block, stop, resume and default-open verified.
+    // STATUS: DONE
+    #[test]
+    fn slam_loss_blocks_and_stops_manual_commands() {
+        let now = Instant::now();
+        let mut s = Safety::new();
+        s.command(1, 0.1, 0., now);
+        assert_eq!(s.next(now), Some((0.1, 0.0)));
+        s.slam(false, now);
+        assert_eq!(
+            s.next(now + Duration::from_millis(10)),
+            Some((0., 0.)),
+            "losing localization must stop the active drive"
+        );
+        s.command(1, 0.1, 0., now + Duration::from_millis(20));
+        assert_eq!(
+            s.next(now + Duration::from_millis(20)),
+            None,
+            "commands must be ignored while localization is lost"
+        );
+        s.slam(true, now + Duration::from_millis(30));
+        s.command(1, 0.1, 0., now + Duration::from_millis(40));
+        assert_eq!(s.next(now + Duration::from_millis(40)), Some((0.1, 0.0)));
     }
 }
