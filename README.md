@@ -489,10 +489,13 @@ bash tests/test_robot_camera.sh
 python3 tests/test_robot_bug.py
 python3 tests/test_web_panel.py
 python3 tests/test_camera_transport.py
-python3 tests/test_panel_http.py
+python3 tests/test_panel_ws.py
 # Аудио без устройств; ROS-тесты требуют собранного robot_audio_interfaces:
 python3 -m unittest discover -s tests -p 'test_audio*.py'
-node tests/test_panel_frontend.cjs
+# фронтенд-тесты панели (vitest + happy-dom, сведение утечек)
+(cd tools/panel-ui && npm run test)
+# пересборка одностраничного ros2/panel.html после изменения фронтенда
+(cd tools/panel-ui && npm run build && cp dist/index.html ../../ros2/panel.html)
 # ROS-интеграция панели: локальные фейки в отдельном DDS-домене
 source /opt/ros/jazzy/setup.bash
 python3 tests/test_panel_ros.py

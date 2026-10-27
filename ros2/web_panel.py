@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """Single-port ROS panel: occupancy map, MJPEG camera, sensors and teleop.
 
-ROS imports live inside main so the HTTP proxy and pure conversions can be
-verified offline. The panel never takes ownership of the bridge session.
+Transport is one aiohttp server: the page loads over HTTP, everything else
+streams through a push WebSocket (state/scan/map on change, cmd_vel back).
+ROS imports stay inside main so the camera proxy and pure conversions can
+be verified offline. The panel never takes ownership of the bridge session.
 """
+import asyncio
 import base64
-import http.server
 import json
 import math
 import struct
-import threading
 import time
 import urllib.parse
 import zlib
 from pathlib import Path
 
+import aiohttp
+from aiohttp import web
+
 MAX_LINEAR = 0.1
 MAX_ANGULAR = 0.4
+STATE_INTERVAL = 0.25  # seconds between state pushes even without changes
+SCAN_INTERVAL = 0.1
+CAMERA_RETRY = 'http://127.0.0.1:1/mjpeg'  # unreachable placeholder
 
 
 def state_to_json(state):
@@ -105,51 +112,169 @@ def clamp_cmd(v, w):
 INDEX_HTML = Path(__file__).with_name('panel.html').read_text(encoding='utf-8')
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    panel = None
+def json_frame(kind, data):
+    return json.dumps({'type': kind, 'data': data}, separators=(',', ':'))
 
-    def log_message(self, *args):
-        pass
 
-    def do_GET(self):
-        self.panel.dispatch(self, 'GET')
+class PanelBroadcaster:
+    """Bounded-rate push fan-out of panel snapshots to all WebSocket clients."""
 
-    def do_POST(self):
-        self.panel.dispatch(self, 'POST')
+    def __init__(self, source):
+        self.source = source
+        self.clients = set()
+        self.versions = {}  # per-client: what this client has already seen
+        self.sent_state = None
+        self.sent_scan = None
+        self.sent_map_version = None
 
-    def send(self, code, ctype, body):
-        self.send_response(code)
-        self.send_header('Content-Type', ctype)
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'no-store')
-        self.end_headers()
-        self.wfile.write(body)
+    async def start(self):
+        self.task = asyncio.get_running_loop().create_task(self.run())
 
-    def proxy_mjpeg(self, url, netrc_path):
-        from camera_mjpeg import open_mjpeg
+    async def stop(self):
+        self.task.cancel()
         try:
-            upstream = open_mjpeg(url, netrc_path)
-        except (OSError, ValueError):
-            self.send(503, 'text/plain; charset=utf-8', b'Camera unavailable')
-            return
-        try:
-            with upstream:
-                self.send_response(200)
-                self.send_header('Content-Type', upstream.headers['Content-Type'])
-                self.send_header('Cache-Control', 'no-store')
-                self.end_headers()
-                while True:
-                    chunk = upstream.read1(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-        except OSError:
+            await self.task
+        except asyncio.CancelledError:
             pass
+
+    async def run(self):
+        try:
+            while True:
+                await asyncio.sleep(0)
+                await self.broadcast()
+                await asyncio.sleep(STATE_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+
+    async def broadcast(self):
+        state = state_to_json(self.source.state_snapshot())
+        scan = self.source.scan_snapshot()
+        grid = self.source.map_snapshot()
+        clients = list(self.clients)
+        for ws in clients:
+            per = self.versions.setdefault(ws, {})
+            try:
+                if state != per.get('state'):
+                    await ws.send_str(json_frame('state', state))
+                    per['state'] = state
+                if scan is not None and scan != per.get('scan'):
+                    await ws.send_str(json_frame('scan', scan))
+                    per['scan'] = scan
+                if grid is not None and grid.get('version') != per.get('map_version'):
+                    await ws.send_str(json_frame('map', grid))
+                    per['map_version'] = grid['version']
+            except (ConnectionResetError, RuntimeError):
+                self.clients.discard(ws)
+
+    def attach(self, ws):
+        self.clients.add(ws)
+
+    def detach(self, ws):
+        self.clients.discard(ws)
+        self.versions.pop(ws, None)
+
+    def handle_cmd(self, raw):
+        try:
+            cmd = json.loads(raw, parse_constant=lambda _: None)
+            v = float(cmd['v'])
+            w = float(cmd['w'])
+            if not (math.isfinite(v) and math.isfinite(w)):
+                return
+        except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            return
+        self.source.publish_cmd(*clamp_cmd(v, w))
+
+
+async def ws_handler(request):
+    broadcaster = request.app['broadcaster']
+    ws = web.WebSocketResponse(heartbeat=10)
+    await ws.prepare(request)
+    broadcaster.attach(ws)
+    try:
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                broadcaster.handle_cmd(msg.data)
+    finally:
+        broadcaster.detach(ws)
+    return ws
+
+
+async def camera_proxy(request):
+    """Stream the OpenIPC MJPEG endpoint through unchanged."""
+    import netrc
+    import os
+
+    import urllib.request
+    camera_url = request.app['camera_url']
+    headers = {}
+    try:
+        entry = netrc.netrc(os.path.expanduser(request.app['netrc'])).authenticators(
+            urllib.parse.urlsplit(camera_url).hostname)
+        if entry:
+            token = base64.b64encode(f'{entry[0]}:{entry[2]}'.encode()).decode()
+            headers['Authorization'] = f'Basic {token}'
+    except (FileNotFoundError, netrc.NetrcParseError):
+        pass  # camera may be open on the LAN
+    try:
+        upstream = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: urllib.request.urlopen(
+                urllib.request.Request(camera_url, headers=headers), timeout=10))
+    except OSError:
+        return web.Response(status=503, text='Camera unavailable')
+    response = web.StreamResponse(
+        headers={'Content-Type': upstream.headers.get('Content-Type', 'application/octet-stream'),
+                 'Cache-Control': 'no-store'})
+    await response.prepare(request)
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            chunk = await loop.run_in_executor(None, upstream.read1, 65536)
+            if not chunk:
+                break
+            await response.write(chunk)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        upstream.close()
+        await response.write_eof()
+    return response
+
+
+def make_app(source, index_html=INDEX_HTML, camera_url=CAMERA_RETRY,
+             netrc='~/.config/robot/camera.netrc'):
+    broadcaster = PanelBroadcaster(source)
+
+    async def index(request):
+        return web.Response(body=index_html, content_type='text/html', charset='utf-8')
+
+    async def favicon(request):
+        return web.Response(
+            body=b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+                 b'<circle cx="8" cy="8" r="7" fill="#2a78d6"/></svg>',
+            content_type='image/svg+xml')
+
+    app = web.Application()
+    app['broadcaster'] = broadcaster
+    app['camera_url'] = camera_url
+    app['netrc'] = netrc
+    app.router.add_get('/', index)
+    app.router.add_get('/favicon.svg', favicon)
+    app.router.add_get('/ws', ws_handler)
+    app.router.add_get('/camera.mjpeg', camera_proxy)
+    async def on_start(_app):
+        await broadcaster.start()
+
+    async def on_stop(_app):
+        await broadcaster.stop()
+    app.on_startup.append(on_start)
+    app.on_cleanup.append(on_stop)
+    return app
 
 
 def main():
     import sys
+    import threading
+
     import rclpy
     from geometry_msgs.msg import Twist
     from nav_msgs.msg import OccupancyGrid, Odometry
@@ -164,6 +289,7 @@ def main():
     class Panel(Node):
         def __init__(self):
             super().__init__('web_panel')
+            self.lock = threading.Lock()
             self.state = {}
             self.scan = None
             self.pending_scan = None
@@ -201,6 +327,25 @@ def main():
             self.create_timer(0.05, self.transform_scan)
             self.create_timer(0.1, self.update_map_pose)
 
+        # Snapshots consumed by the broadcaster; deep copies so the async
+        # server never races a ROS callback mutating these fields mid-send.
+        def state_snapshot(self):
+            with self.lock:
+                return dict(self.state)
+
+        def scan_snapshot(self):
+            with self.lock:
+                return dict(self.scan) if self.scan else None
+
+        def map_snapshot(self):
+            with self.lock:
+                return dict(self.map) if self.map else None
+
+        def publish_cmd(self, v, w):
+            t = Twist()
+            t.linear.x, t.angular.z = v, w
+            self.cmd_pub.publish(t)
+
         def on_map(self, msg):
             p, q = msg.info.origin.position, msg.info.origin.orientation
             yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
@@ -212,27 +357,34 @@ def main():
                 self.get_logger().warning('Ignoring invalid occupancy grid')
                 return
             self.map_version += 1
-            self.map_received = time.monotonic()
-            self.map = grid
+            with self.lock:
+                self.map_received = time.monotonic()
+                self.map = grid
             self.update_map_pose()
 
         def update_map_pose(self):
-            self.state['map_pose'] = None
-            if self.map is None:
-                return
-            try:
-                transform = self.tf_buffer.lookup_transform(self.map['frame'], self.base_frame, Time())
-                age = (self.get_clock().now() - Time.from_msg(transform.header.stamp)).nanoseconds / 1e9
-                if age > 2.0 or age < -0.5:
-                    return
-                tf = transform.transform
-            except TransformException:
-                return
-            q = tf.rotation
-            self.state['map_pose'] = {
-                'x': tf.translation.x, 'y': tf.translation.y,
-                'yaw': math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)),
-                'frame': self.map['frame']}
+            pose = None
+            if self.map is not None:
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.map['frame'], self.base_frame, Time())
+                    age = (self.get_clock().now()
+                           - Time.from_msg(transform.header.stamp)).nanoseconds / 1e9
+                    if age > 2.0 or age < -0.5:
+                        transform = None
+                    tf = transform.transform if transform else None
+                except TransformException:
+                    tf = None
+                if tf is not None:
+                    q = tf.rotation
+                    pose = {'x': tf.translation.x, 'y': tf.translation.y,
+                            'yaw': math.atan2(2 * (q.w * q.z + q.x * q.y),
+                                              1 - 2 * (q.y * q.y + q.z * q.z)),
+                            'frame': self.map['frame']}
+            with self.lock:
+                self.state['map_pose'] = pose
+                self.state['map_age_s'] = (time.monotonic() - self.map_received
+                                           if self.map_received is not None else None)
 
         def on_bumper(self, msg):
             self.state['bumper'] = bool(msg.data)
@@ -261,7 +413,7 @@ def main():
             self.base_frame = msg.child_frame_id or 'base_link'
             self.state['odom'] = (p.x, p.y, msg.twist.twist.linear.x, msg.twist.twist.angular.z)
             self.state['odom_yaw'] = math.atan2(2 * (q.w * q.z + q.x * q.y),
-                                               1 - 2 * (q.y * q.y + q.z * q.z))
+                                                1 - 2 * (q.y * q.y + q.z * q.z))
 
         def on_scan(self, msg):
             self.pending_scan = msg
@@ -281,66 +433,37 @@ def main():
                                        msg.ranges, msg.range_max)
             q = tf.rotation
             yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-            self.scan = {'points': points_in_odom(points, tf.translation.x, tf.translation.y, yaw),
-                         'range_max': msg.range_max, 'frame': frame}
-            self.pending_scan = None
-
-        def dispatch(self, handler, method):
-            path = urllib.parse.urlsplit(handler.path).path
-            if method == 'GET':
-                if path == '/':
-                    handler.send(200, 'text/html; charset=utf-8', INDEX_HTML.encode())
-                    return
-                if path == '/favicon.svg':
-                    handler.send(200, 'image/svg+xml', b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#2a78d6"/></svg>')
-                    return
-                if path == '/map.json':
-                    grid = self.map
-                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
-                    if grid and query.get('version') == [str(grid['version'])]:
-                        grid = {'version': grid['version']}
-                    handler.send(200, 'application/json', json.dumps(grid or {}).encode())
-                    return
-                if path in ('/state.json', '/scan.json', '/odom.json'):
-                    snapshot = self.state.copy()
-                    snapshot['map_age_s'] = (time.monotonic() - self.map_received
-                                             if self.map_received is not None else None)
-                    state = state_to_json(snapshot)
-                    body = {'/state.json': state, '/scan.json': self.scan or {},
-                            '/odom.json': state.get('odom', {})}[path]
-                    handler.send(200, 'application/json', json.dumps(body).encode())
-                    return
-                if path == '/camera.mjpeg':
-                    handler.proxy_mjpeg(self.camera_url, self.netrc_path)
-                    return
-            if method == 'POST' and path == '/cmd_vel':
-                length = int(handler.headers.get('Content-Length', 0))
-                try:
-                    cmd = json.loads(handler.rfile.read(length))
-                    v, w = clamp_cmd(float(cmd.get('v', 0)), float(cmd.get('w', 0)))
-                except (ValueError, TypeError, AttributeError):
-                    handler.send(400, 'application/json', b'{"error":"bad cmd"}')
-                    return
-                t = Twist()
-                t.linear.x, t.angular.z = v, w
-                self.cmd_pub.publish(t)
-                handler.send(200, 'application/json', json.dumps({'v': v, 'w': w}).encode())
-                return
-            handler.send_error(404)
+            scan = {'points': points_in_odom(points, tf.translation.x, tf.translation.y, yaw),
+                    'range_max': msg.range_max, 'frame': frame,
+                    'stamp': msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9}
+            with self.lock:
+                self.scan = scan
+                self.pending_scan = None
 
     rclpy.init(args=sys.argv)
     panel = Panel()
-    Handler.panel = panel
-    server = http.server.ThreadingHTTPServer(('0.0.0.0', panel.port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    app = make_app(panel, INDEX_HTML, camera_url=panel.camera_url,
+                   netrc=panel.netrc_path)
+    broadcaster = app['broadcaster']
+    # A short shutdown timeout: Ctrl-C/SIGTERM must not wait on a browser
+    # tab holding the socket open.
+    runner = web.AppRunner(app, shutdown_timeout=2)
+
+    async def serve():
+        await runner.setup()
+        await web.TCPSite(runner, '0.0.0.0', panel.port).start()
+
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    asyncio.run_coroutine_threadsafe(serve(), loop).result(10)
     panel.get_logger().info(f'web panel on http://0.0.0.0:{panel.port}/')
     try:
         rclpy.spin(panel)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        server.shutdown()
-        server.server_close()
+        asyncio.run_coroutine_threadsafe(runner.cleanup(), loop).result(10)
+        loop.call_soon_threadsafe(loop.stop)
         panel.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
