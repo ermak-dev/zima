@@ -1,8 +1,7 @@
 """Lexical phrase matching and configurable pronunciation metadata.
 
 Text normalization deliberately ignores stress. Positive/negative pronunciations
-are metadata for ASR/TTS matching and acoustic evaluation, not an acoustic KWS
-implementation or proof that a speaker used the requested stress.
+are metadata for TTS matching, not proof that a speaker used the requested stress.
 """
 from dataclasses import dataclass
 import unicodedata
@@ -43,45 +42,9 @@ def normalize_phrase(text: str) -> str:
     return _lexical(text)
 
 
-def _separator(char):
-    return char.isspace() or unicodedata.category(char).startswith('P')
-
-
-def strip_wake_prefix(transcript: str, phrase: str, *, allow_asr_substitution=False) -> str:
-    """Remove one complete lexical wake prefix, otherwise return stripped input.
-
-    Punctuation/whitespace surrounding the matched prefix is consumed. The
-    remaining command keeps its original case, Unicode spelling and punctuation
-    (apart from surrounding whitespace). Empty lexical phrases are a no-op.
-    Stress cannot be checked here: both pronunciations have the same words.
-    After acoustic activation, allow_asr_substitution may tolerate one replaced
-    letter in the last word (at least four letters, at least two phrase words).
-    Earlier words must match exactly; this never edits the remaining command.
-    """
-    expected = normalize_phrase(phrase).split()
-    spans = list(_words(transcript))
-    if not expected or len(spans) < len(expected):
-        return transcript.strip()
-    if not all(_separator(char) for char in transcript[:spans[0][0]]):
-        return transcript.strip()
-    for index, (word, (start, end)) in enumerate(zip(expected, spans)):
-        actual = normalize_phrase(transcript[start:end])
-        if actual != word:
-            substitution = (allow_asr_substitution is True and len(expected) >= 2 and
-                            index == len(expected) - 1 and 4 <= len(word) <= 32 and
-                            len(actual) == len(word) and word.isalpha() and actual.isalpha() and
-                            sum(a != b for a, b in zip(actual, word)) == 1)
-            if not substitution:
-                return transcript.strip()
-    end = spans[len(expected) - 1][1]
-    while end < len(transcript) and _separator(transcript[end]):
-        end += 1
-    return transcript[end:].strip()
-
-
 @dataclass(frozen=True)
 class PhraseSpec:
-    """Explicit phrase and contrasting pronunciations; no global wake default.
+    """Explicit phrase and contrasting pronunciations; no global default.
 
     Pronunciation strings retain their supplied stress marks and Unicode form.
     All variants must contain the same lexical words, and negative variants must

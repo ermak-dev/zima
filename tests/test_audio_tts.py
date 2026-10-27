@@ -13,7 +13,7 @@ import unittest
 import urllib.error
 import wave
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.playback import AudioError
 from robot_audio.tts import OpenRouterTTS
 

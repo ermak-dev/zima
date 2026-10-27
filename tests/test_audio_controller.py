@@ -7,7 +7,7 @@ from pathlib import Path
 import sys,tempfile,threading,time,unittest
 from types import SimpleNamespace
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'ros2'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'python'))
 from robot_audio.commands import BatterySnapshot
 
 

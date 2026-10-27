@@ -299,16 +299,6 @@ case $cmd in
         exec python3 "$(repo_root)/bin/audio/cli.py" capture "$@" ;;
     audio)
         if [[ -n ${ROBOT_AUDIO_BIN:-} ]]; then exec "$ROBOT_AUDIO_BIN" "$@"; fi
-        case ${1:---help} in
-            run|status|play|say|stop|listen|mute|record)
-                source_ros
-                if [[ -n ${ROBOT_AUDIO_SETUP:-} ]]; then
-                    set +u
-                    # shellcheck source=/dev/null
-                    source "$ROBOT_AUDIO_SETUP" || { set -u; fail 'audio interface overlay not found'; }
-                    set -u
-                fi ;;
-        esac
         exec python3 "$(repo_root)/bin/audio/cli.py" "$@" ;;
     say)
         # Local or SpeechKit TTS through the playback helper; no ROS, no controller.

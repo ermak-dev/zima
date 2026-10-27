@@ -1,6 +1,5 @@
 """Bounded local speech recognition and an explicit voice-session state machine."""
 import array
-from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 import math
@@ -11,8 +10,7 @@ import threading
 import time
 import uuid
 
-from .wake import ConfigurationRequired, _finite, validate_chunk
-from .phrases import strip_wake_prefix
+from .validation import ConfigurationRequired, _finite, validate_chunk
 
 
 def _samples(pcm):
@@ -114,12 +112,11 @@ class Transcript:
 
 
 class SpeechSession:
-    def __init__(self, recognizer, *, vad=None, wake_phrase='', silence_s=.6,
+    def __init__(self, recognizer, *, vad=None, silence_s=.6,
                  wait_s=3, max_command_s=12, asr_timeout_s=15, echo_tail_s=.3,
                  clock=time.monotonic, on_transcript=None):
         self.recognizer = recognizer
         self.vad = vad if vad is not None else RmsVad()
-        self.wake_phrase = wake_phrase
         self.silence_s = _finite(silence_s, 'silence timeout', .05, 5)
         self.wait_s = _finite(wait_s, 'speech wait', .1, 15)
         self.max_command_s = _finite(max_command_s, 'command timeout', .1, 30)
@@ -130,7 +127,6 @@ class SpeechSession:
         self.state = 'waiting'
         self.last_error = ''
         self.transcripts = []
-        self._seen = deque(maxlen=256)
         self._future = None
         self._session_id = None
         self._stream_id = None
@@ -186,20 +182,13 @@ class SpeechSession:
     def source_lost(self):
         self._fail('source_lost')
 
-    def on_wake(self, event, *, now=None):
+    def begin_utterance(self, *, now=None):
+        """Arm one explicit utterance; bind its stream on the first PCM chunk."""
         now = self._now(now)
-        if event.event_id in self._seen:
-            return False
         if self.state != 'waiting' or self.playback_active or now < self._hold_until:
             return False
-        if not event.event_id or not event.stream_id or len(event.pre_roll_pcm) % 2:
-            raise ValueError('invalid wake event')
-        self._seen.append(event.event_id)
+        self._clear_command()
         self._session_id = uuid.uuid4().hex
-        self._stream_id, self._sequence = event.stream_id, event.sequence
-        self._stamp_ns = event.stamp_ns
-        self._audio = bytearray(event.pre_roll_pcm[-64000:])
-        self._heard_speech = bool(self._audio and self.vad(bytes(self._audio)))
         self._started = self._last_speech = now
         self.last_error = ''
         self.state = 'listening'
@@ -210,7 +199,11 @@ class SpeechSession:
         now = self._now(now)
         if self.state not in ('listening', 'transcribing'):
             return
-        if chunk.stream_id != self._stream_id or chunk.discontinuity:
+        first = self._stream_id is None and self.state == 'listening'
+        if first:
+            self._stream_id = chunk.stream_id
+            self._sequence = chunk.sequence - 1
+        if chunk.stream_id != self._stream_id or (chunk.discontinuity and not first):
             self._fail('audio_gap')
             return
         if chunk.sequence <= self._sequence:
@@ -240,9 +233,6 @@ class SpeechSession:
         self._asr_started = now
         self.state = 'transcribing'
 
-    def _strip_wake(self, text):
-        return strip_wake_prefix(text, self.wake_phrase, allow_asr_substitution=True)
-
     def tick(self, *, now=None):
         now = self._now(now)
         if self.state == 'listening':
@@ -263,7 +253,7 @@ class SpeechSession:
             text = self._future.result()
             if not isinstance(text, str) or len(text) > 8192:
                 raise ValueError('invalid transcript')
-            text = self._strip_wake(text)
+            text = text.strip()
         except Exception:
             self._fail('asr_failed')
             return []
@@ -302,18 +292,6 @@ class SpeechSession:
         self._playback_id = None
         self._hold_until = now + self.echo_tail_s
         self.state = 'waiting'
-
-    def barge_in(self, event, cancel_playback, *, now=None):
-        now = self._now(now)
-        if not self.playback_active or event.event_id in self._seen:
-            return False
-        if cancel_playback(self._playback_id) is not True:
-            return False
-        self._playback_id = None
-        self._hold_until = now
-        self._clear_command()
-        self.state = 'waiting'
-        return self.on_wake(event, now=now)
 
     def close(self):
         self.cancel()

@@ -22,8 +22,6 @@ _DEFAULTS = {
             'require_verbatim': True, 'timeout_s': 30.0,
             'max_text_chars': 2000, 'max_audio_bytes': 4_000_000,
             'cache_ttl_s': 3600.0},
-    'wake': {'enabled': False, 'manifest': '', 'threshold': .5,
-             'refractory_s': 2.0, 'preroll_s': 1.5},
     'speech': {'enabled': False, 'asr_model_path': '', 'language': 'ru',
                'mode': 'half_duplex', 'max_command_s': 15.0,
                'end_silence_s': .8, 'listen_timeout_s': 5.0,
@@ -85,9 +83,6 @@ def validate_config(patch):
         ('tts', 'pcm_sample_rate'): (8000, 96000, True),
         ('tts', 'max_audio_bytes'): (1024, 16_000_000, True),
         ('tts', 'cache_ttl_s'): (0, 86400, False),
-        ('wake', 'threshold'): (0, 1, False),
-        ('wake', 'refractory_s'): (.1, 30, False),
-        ('wake', 'preroll_s'): (.08, 2, False),
         ('speech', 'max_command_s'): (.5, 30, False),
         ('speech', 'end_silence_s'): (.1, 5, False),
         ('speech', 'listen_timeout_s'): (.1, 15, False),
@@ -114,8 +109,6 @@ def validate_config(patch):
         raise ValueError('TTS requires external consent and an explicit model and voice')
     if not isinstance(tts['piper_model'], str):
         raise ValueError('tts.piper_model must be a string path')
-    if config['wake']['enabled'] and not config['wake']['manifest'].strip():
-        raise ValueError('wake word requires an explicit local model manifest')
     speech = config['speech']
     if speech['language'] not in ('ru', 'en'):
         raise ValueError('speech language must be ru or en')

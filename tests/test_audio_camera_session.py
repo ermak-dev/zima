@@ -14,7 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.camera_session import (CameraSession, CameraGainLease, CameraSSH,
                                         CameraSessionError)
 

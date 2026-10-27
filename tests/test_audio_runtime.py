@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FEATURE: Complete host audio wiring without devices, model downloads or API spend.
 
-SPEC: Capture/wake/sessions/playback are bounded, cancellable and independently gated.
+SPEC: Capture/manual sessions/playback are bounded, cancellable and independently gated.
 """
 import io
 from pathlib import Path
@@ -14,7 +14,7 @@ import unittest
 import wave
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'ros2'))
+sys.path.insert(0, str(ROOT / 'python'))
 
 
 def wait_for(test, timeout=3):
@@ -63,7 +63,7 @@ class AudioRuntimeTests(unittest.TestCase):
         self.Runtime = AudioRuntime
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.events = {key: [] for key in ('chunk', 'input_state', 'wake', 'transcript',
+        self.events = {key: [] for key in ('chunk', 'input_state', 'transcript',
                                            'playback', 'reference', 'speech_state', 'diagnostic')}
 
     def runtime(self, config=None, **kwargs):
@@ -180,25 +180,17 @@ class AudioRuntimeTests(unittest.TestCase):
         self.assertTrue(self.events['playback'][-1]['speaking'])
         self.assertEqual(self.transport_calls, 1)
 
-    def test_wake_to_local_transcript_and_matching_completion(self):
+    def test_manual_utterance_to_local_transcript_and_matching_completion(self):
         from robot_audio.types import AudioChunk
-        from robot_audio.wake import WakeDetector
         from robot_audio.speech import BoundedRecognizer, SpeechSession, RmsVad
-        class Backend:
-            def predict(self, pcm): return .9
-            def reset(self): pass
         source = Source()
-        detector = WakeDetector(Backend(), phrase='эй робот')
-        session = SpeechSession(BoundedRecognizer(lambda pcm: 'эй робот проверь коридор'),
-                                vad=RmsVad(-40), wake_phrase='эй робот', silence_s=.05)
-        runtime = self.runtime({'input': {'enabled': True, 'microphone_verified': True}},
-                               source=source, detector=detector, session=session)
+        session = SpeechSession(BoundedRecognizer(lambda pcm: 'проверь коридор'),
+                                vad=RmsVad(-40), silence_s=.05)
+        runtime = self.runtime({'input': {'enabled': True}}, source=source, session=session)
+        self.assertTrue(runtime.begin_utterance()['success'])
         for i in range(4):
             source.queue.put(AudioChunk('test', i, 1_000_000_000 + i * 20_000_000,
                                         b'\x10\x27' * 320))
-        self.assertTrue(wait_for(lambda: self.events['wake']))
-        self.assertEqual(self.events['wake'][-1]['start_frame'], 0)
-        self.assertEqual(self.events['wake'][-1]['end_frame'], 1280)
         self.assertTrue(wait_for(lambda: self.events['transcript']))
         transcript = self.events['transcript'][-1]
         self.assertEqual(transcript['text'], 'проверь коридор')

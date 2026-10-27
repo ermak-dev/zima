@@ -1,4 +1,4 @@
-"""PCM boundary shared by capture, recognition and ROS adapters."""
+"""PCM boundary shared by capture, recognition and the native service."""
 from dataclasses import dataclass
 
 

@@ -108,7 +108,7 @@ def is_battery_command(text):
 def handle_command(text: str, reader: Callable[[], BatterySnapshot], *, allow_reported=False) -> str:
     """Handle only exact normalized battery questions; never invoke unknown intents.
 
-    Wake-prefix removal belongs to the caller (robot_audio.phrases). Exceptions
+    Exceptions
     from a reader are contained; exception text is never spoken.
     """
     if not is_battery_command(text):

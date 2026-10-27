@@ -15,12 +15,8 @@ _TERMINAL = {'completed', 'cancelled', 'expired', 'failed', 'unknown'}
 
 
 class AudioRuntime:
-    def __init__(self, config=None, *, source=None, detector=None, session=None,
-                 playback=None, tts=None, echo=None, output_policy=None, clock=time.monotonic,
-                 allow_experimental_wake=False):
-        if type(allow_experimental_wake) is not bool:
-            raise ValueError('experimental wake consent must be boolean')
-        self.allow_experimental_wake = allow_experimental_wake
+    def __init__(self, config=None, *, source=None, session=None,
+                 playback=None, tts=None, echo=None, output_policy=None, clock=time.monotonic):
         self.config = validate_config(config or {})
         self.clock = clock
         from .policy import OutputPolicy
@@ -28,7 +24,7 @@ class AudioRuntime:
         self.output_policy = output_policy or OutputPolicy(muted=output['muted'],
             quiet_hours=output['quiet_hours'], timezone_name=output['timezone'])
         self._last_inhibited = self.output_policy.inhibited
-        self.source, self.detector, self.session = source, detector, session
+        self.source, self.session = source, session
         self.playback, self.tts, self.echo = playback, tts, echo
         self._callbacks = {}
         self._lock = threading.RLock()
@@ -47,7 +43,6 @@ class AudioRuntime:
         self._tts_slot = threading.BoundedSemaphore(1)
         self._results = OrderedDict()
         self._errors = {}
-        self._barge = None
         self._last_input_state = self._last_speech_state = None
         self._configure()
 
@@ -58,32 +53,13 @@ class AudioRuntime:
             self.source = CameraAudioSource(CaptureConfig(
                 url=cfg['url'], netrc_path=cfg['netrc'], frame_ms=cfg['chunk_ms'],
                 queue_size=cfg['queue_size'], connect_timeout=cfg['timeout_s'], stall_timeout=cfg['timeout_s']))
-        if self.detector is None and self.config['wake']['enabled']:
-            try:
-                from .wake import load_wake_manifest, OpenWakeWordBackend, WakeDetector
-                cfg = self.config['wake']
-                manifest = load_wake_manifest(cfg['manifest'])
-                russian = (manifest['language'].lower() == 'ru' or
-                    (self.config['speech']['enabled'] and self.config['speech']['language'] == 'ru'))
-                if russian:
-                    manifest = load_wake_manifest(cfg['manifest'], require_russian=True,
-                                                  allow_experimental=self.allow_experimental_wake)
-                if manifest.get('experimental'):
-                    self._errors['wake'] = 'experimental_model'
-                if russian and abs(cfg['threshold'] - manifest['evaluation_threshold']) > 1e-9:
-                    raise ValueError('wake threshold differs from held-out evaluation')
-                self.detector = WakeDetector(OpenWakeWordBackend(manifest), phrase=manifest['phrase'],
-                    model=manifest.get('model_name', 'local'), threshold=cfg['threshold'],
-                    debounce_s=cfg['refractory_s'], pre_roll_s=cfg['preroll_s'])
-            except (ValueError, ImportError, OSError):
-                self._errors['wake'] = 'configuration_required'
         if self.session is None and self.config['speech']['enabled']:
             try:
                 from .speech import FasterWhisperASR, BoundedRecognizer, SpeechSession, RmsVad
                 cfg = self.config['speech']
                 self.session = SpeechSession(
                     BoundedRecognizer(FasterWhisperASR(cfg['asr_model_path'], language=cfg['language'])),
-                    wake_phrase=self.detector.phrase if self.detector else '', vad=RmsVad(cfg['vad_threshold_dbfs']),
+                    vad=RmsVad(cfg['vad_threshold_dbfs']),
                     silence_s=cfg['end_silence_s'], wait_s=cfg['listen_timeout_s'],
                     max_command_s=cfg['max_command_s'], asr_timeout_s=cfg['asr_timeout_s'],
                     echo_tail_s=cfg['echo_tail_s'], clock=self.clock)
@@ -181,7 +157,6 @@ class AudioRuntime:
             except Exception:
                 with self._lock:
                     self._errors['speech'] = 'processing_failed'
-                    self.detector = None
                     if self.session:
                         self.session.source_lost()
                     self._emit('diagnostic', {'name': 'recognition', 'state': 'processing_failed'})
@@ -193,53 +168,23 @@ class AudioRuntime:
             if self._source_failed or (self._stream_id is not None and chunk.stream_id != self._stream_id):
                 if self.session:
                     self.session.reset()
-                if self.detector:
-                    self.detector.reset()
                 if self.echo:
                     self.echo.reset()
             self._source_failed = False
             self._stream_id = chunk.stream_id
             active = self._active_playback is not None
-            allow_wake, allow_barge = not active, False
             clean = chunk
             if self.echo is not None and len(chunk.pcm) == 640:
                 result = self.echo.process_capture(chunk, playback_active=active)
                 clean = replace(chunk, pcm=result.pcm)
-                allow_wake, allow_barge = result.allow_wake, result.allow_barge_in
-                self._echo_mode = 'full_duplex' if (allow_barge and
+                self._echo_mode = 'full_duplex' if (result.allow_barge_in and
                     self.config['speech']['mode'] == 'full_duplex') else 'half_duplex'
                 reason = getattr(result, 'reason', '')
                 if reason and reason != self._echo_reason:
                     self._emit('diagnostic', {'name': 'echo', 'state': reason})
                 self._echo_reason = reason
-            if active and self.config['speech']['mode'] != 'full_duplex':
-                allow_wake = allow_barge = False
-            if self._barge is not None:
-                buffered = self._barge['chunks']
-                if sum(len(item[0].pcm) for item in buffered) + len(clean.pcm) <= 160000:
-                    buffered.append((clean, self.clock()))
-                else:
-                    self._barge['overflow'] = True
-            elif self.session is not None:
+            if self.session is not None:
                 self.session.feed(clean, now=self.clock())
-            if self.detector is not None:
-                allowed = (self._listening and self.config['input']['microphone_verified'] and
-                           allow_wake and self.clock() >= self._hold_until and self._barge is None)
-                self.detector.set_enabled(allowed)
-                if allowed:
-                    for event in self.detector.feed(clean):
-                        end_frame = (event.sequence + 1) * chunk.frames
-                        self._emit('wake', {'event_id': event.event_id, 'stream_id': event.stream_id,
-                            'phrase': event.phrase, 'model_id': event.model, 'score': event.score,
-                            'stamp_ns': event.stamp_ns, 'start_frame': max(0, end_frame - len(event.pre_roll_pcm) // 2),
-                            'end_frame': end_frame})
-                        if self.session:
-                            if active and allow_barge:
-                                self._begin_barge(event)
-                            else:
-                                if self.session.state == 'fault':
-                                    self.session.reset()
-                                self.session.on_wake(event, now=self.clock())
             self._publish_speech()
 
     def _monitor(self):
@@ -250,7 +195,7 @@ class AudioRuntime:
                     return
                 self._enforce_quiet()
                 self._flush_reference()
-                if self.session is not None and self._barge is None:
+                if self.session is not None:
                     for transcript in self.session.tick(now=self.clock()):
                         self._emit('transcript', {'session_id': transcript.session_id,
                             'stream_id': transcript.stream_id, 'text': transcript.text,
@@ -263,8 +208,6 @@ class AudioRuntime:
                         self._source_failed = True
                         if self.session:
                             self.session.source_lost()
-                        if self.detector:
-                            self.detector.reset()
                         if self.echo:
                             self.echo.reset()
                     self._publish_speech()
@@ -273,13 +216,11 @@ class AudioRuntime:
     def _publish_speech(self):
         state = {'state': self.session.state if self.session else 'disabled',
                  'session_id': self.session.session_id or '' if self.session else '',
-                 'listening': self._listening, 'wake_ready': self.detector is not None,
+                 'listening': self._listening,
                  'asr_ready': self.session is not None,
                  'duplex_mode': self._echo_mode,
                  'error': (self.session.last_error if self.session else '') or
-                          self._errors.get('wake', '') or self._errors.get('speech', '')}
-        if self.detector and not self.config['input']['microphone_verified']:
-            state['error'] = 'microphone_unverified'
+                          self._errors.get('speech', '')}
         if state != self._last_speech_state:
             self._last_speech_state = dict(state)
             self._emit('speech_state', state)
@@ -303,7 +244,7 @@ class AudioRuntime:
                     self._hold_until = self.clock() + self.config['speech']['echo_tail_s']
                     if self.echo:
                         self.echo.playback_finished(job.task_id)
-                    if self.session and not (self._barge and self._barge['playback_id'] == job.task_id):
+                    if self.session:
                         self.session.playback_finished(job.task_id, now=self.clock())
             self._emit('playback', {'state': job.state, 'task_id': self._active_playback or job.task_id,
                 'speaking': self._active_playback is not None, 'volume': job.volume, 'error': job.error_code})
@@ -333,41 +274,6 @@ class AudioRuntime:
                 self.echo.push_reference(chunk, playback_id=reference['playback_id'], actual_playback=True)
             reference['position'] += 640
             reference['sequence'] += 1
-
-    def _begin_barge(self, event):
-        if self._barge is not None or self.playback is None:
-            return
-        pending = {'event': event, 'playback_id': self._active_playback, 'chunks': [],
-                   'overflow': False, 'started': self.clock()}
-        self._barge = pending
-
-        def cancel_then_listen():
-            target = pending['playback_id']
-            self.playback.cancel(target)
-            end = time.monotonic() + 5
-            job = self.playback.get(target)
-            while not self._stop.is_set() and time.monotonic() < end and job and job.state not in _TERMINAL:
-                self._stop.wait(.01)
-                job = self.playback.get(target)
-            with self._lock:
-                if self._barge is not pending:
-                    return
-                self._barge = None
-                stopped = job is not None and job.state in ('completed', 'cancelled')
-                if stopped and not pending['overflow'] and not self._closed and self.session:
-                    self._hold_until = 0
-                    accepted = self.session.barge_in(event, lambda target: True, now=pending['started'])
-                    if accepted:
-                        for chunk, arrived_at in pending['chunks']:
-                            self.session.feed(chunk, now=arrived_at)
-                else:
-                    self._emit('diagnostic', {'name': 'barge_in', 'state': 'cancel_not_confirmed'})
-                    if stopped and self.session:
-                        self.session.playback_finished(target, now=self.clock())
-                self._publish_speech()
-        thread = threading.Thread(target=cancel_then_listen, name='audio-barge-in', daemon=True)
-        self._threads.append(thread)
-        thread.start()
 
     def _enforce_quiet(self):
         inhibited = self.output_policy.inhibited
@@ -399,13 +305,10 @@ class AudioRuntime:
         with self._lock:
             self._listening = enabled
             self._stream_id = None
-            if self.detector:
-                self.detector.reset()
             if self.session:
                 self.session.cancel()
             if self.echo:
                 self.echo.reset()
-            self._barge = None
         if self.source:
             if enabled:
                 self.source.start()
@@ -414,6 +317,19 @@ class AudioRuntime:
         self._emit('input_state', self._input_state())
         self._publish_speech()
         return {'success': True, 'message': 'enabled' if enabled else 'disabled'}
+
+    def begin_utterance(self):
+        with self._lock:
+            if self._closed or not self._listening or self.source is None or self.session is None:
+                return {'success': False, 'message': 'input and local ASR must be enabled'}
+            if self._active_playback is not None or self.clock() < self._hold_until:
+                return {'success': False, 'message': 'speaker is active or settling'}
+            if self.session.state == 'fault':
+                self.session.reset()
+            accepted = self.session.begin_utterance(now=self.clock())
+            self._publish_speech()
+            return {'success': accepted, 'session_id': self.session.session_id or '',
+                    'message': 'listening' if accepted else 'speech session busy'}
 
     def response_finished(self, session_id):
         with self._lock:
@@ -539,5 +455,3 @@ class AudioRuntime:
                 self.session.close()
             if self.echo:
                 self.echo.close()
-            if self.detector:
-                self.detector.reset()

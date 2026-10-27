@@ -11,7 +11,7 @@ import threading
 import unittest
 import wave
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.playback import AudioError, AssetStore, PlaybackQueue, TransportResult, SSHPlaybackTransport
 
 

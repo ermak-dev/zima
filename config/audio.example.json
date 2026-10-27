@@ -37,13 +37,6 @@
     "max_audio_bytes": 4000000,
     "cache_ttl_s": 3600.0
   },
-  "wake": {
-    "enabled": false,
-    "manifest": "~/.config/robot/wake/manifest.json",
-    "threshold": 0.5,
-    "refractory_s": 2.0,
-    "preroll_s": 1.5
-  },
   "speech": {
     "enabled": false,
     "asr_model_path": "~/.local/share/robot/models/whisper",

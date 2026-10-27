@@ -1,8 +1,8 @@
 """Local text-to-speech played through the robot's existing playback helper.
 
-No ROS and no cloud provider: Piper synthesizes chunk by chunk, every chunk
+No cloud provider: Piper synthesizes chunk by chunk, every chunk
 becomes a 16 kHz mono PCM16 WAV, and playback goes through the same SSH
-helper transport the ROS Say action uses. Piper is imported lazily, so its
+helper transport as the audio service. Piper is imported lazily, so its
 absence is a configuration error naming the fix, never a silent fallback.
 """
 import json

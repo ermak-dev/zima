@@ -5,7 +5,7 @@ import ctypes.util
 from dataclasses import dataclass
 import threading
 
-from .wake import ConfigurationRequired, _finite, validate_chunk
+from .validation import ConfigurationRequired, _finite, validate_chunk
 
 
 class SpeexEchoCanceller:
@@ -91,7 +91,6 @@ class EchoResult:
     pcm: bytes
     mode: str
     reason: str
-    allow_wake: bool
     allow_barge_in: bool = False
     playback_id: str = ''
 
@@ -151,7 +150,7 @@ class EchoController:
 
     def _fallback(self, chunk, reason, playback_active):
         self.engine.reset()
-        return EchoResult(chunk.pcm, 'half_duplex', reason, not playback_active)
+        return EchoResult(chunk.pcm, 'half_duplex', reason)
 
     def process_capture(self, chunk, *, playback_active):
         validate_chunk(chunk)
@@ -164,7 +163,7 @@ class EchoController:
             self._references.clear()
             return self._fallback(chunk, 'audio_gap', playback_active)
         if not playback_active:
-            return EchoResult(chunk.pcm, 'idle', '', True)
+            return EchoResult(chunk.pcm, 'idle', '')
         if not self.calibrated:
             return self._fallback(chunk, 'calibration_required', True)
         if not self._references:
@@ -176,7 +175,7 @@ class EchoController:
         while self._references and self._references[0][0] <= reference[0]:
             self._references.popleft()
         clean = self.engine.process(chunk.pcm, reference[1])
-        return EchoResult(clean, 'full_duplex', '', True, True, reference[2])
+        return EchoResult(clean, 'full_duplex', '', True, reference[2])
 
     def playback_finished(self, playback_id):
         if playback_id == self._playback_id:

@@ -16,7 +16,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'ros2'))
+sys.path.insert(0, str(ROOT / 'python'))
 
 from robot_audio.config import load_config
 from robot_audio.playback import AssetStore, AudioError, SSHPlaybackTransport

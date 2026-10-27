@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'ros2'))
+sys.path.insert(0, str(ROOT / 'python'))
 
 
 class AudioConfigTests(unittest.TestCase):
@@ -24,7 +24,7 @@ class AudioConfigTests(unittest.TestCase):
 
     def test_defaults_do_not_touch_hardware_or_external_services(self):
         config = self.defaults()
-        for section in ('input', 'output', 'tts', 'wake', 'speech', 'echo'):
+        for section in ('input', 'output', 'tts', 'speech', 'echo'):
             self.assertFalse(config[section]['enabled'])
         self.assertFalse(config['tts']['allow_external'])
         self.assertFalse(config['input']['microphone_verified'])
@@ -50,7 +50,6 @@ class AudioConfigTests(unittest.TestCase):
             {'output': {'helper': '/tmp/helper; unsafe'}},
             {'output': {'volume': float('nan')}}, {'output': {'max_volume': 1.1}},
             {'output': {'max_duration_s': 3600}},
-            {'wake': {'threshold': -1}}, {'wake': {'threshold': True}},
             {'speech': {'max_command_s': 1000}}, {'speech': {'language': 'not-a-language'}},
         ]
         for value in invalid:
@@ -79,7 +78,7 @@ class AudioConfigTests(unittest.TestCase):
     def test_limits_match_the_capture_recognizer_and_native_helper(self):
         for patch in ({'input': {'chunk_ms': 15}}, {'output': {'max_duration_s': 31}},
                       {'speech': {'max_command_s': 31}}, {'speech': {'listen_timeout_s': 16}},
-                      {'wake': {'preroll_s': .01}}, {'echo': {'max_drift_ms': 101}},
+                      {'echo': {'max_drift_ms': 101}},
                       {'echo': {'enabled': True}, 'input': {'chunk_ms': 40}}):
             with self.subTest(patch=patch):
                 with self.assertRaises(ValueError):
@@ -117,7 +116,7 @@ class AudioConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.validate({'controller':{'reply_cache':{'ответ':'../file'}}})
 
     def test_recognition_requires_explicit_local_models(self):
-        for patch in ({'wake': {'enabled': True}}, {'speech': {'enabled': True}}):
+        for patch in ({'speech': {'enabled': True}},):
             with self.subTest(patch=patch):
                 with self.assertRaises(ValueError):
                     self.validate(patch)
