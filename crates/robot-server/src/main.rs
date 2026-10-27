@@ -246,8 +246,7 @@ async fn run(c: Config) -> Result<(), Failure> {
         // Without a saved map the only meaningful mode is mapping; with one,
         // localize unless mapping is explicitly requested.
         let map_path = std::env::var("ROBOT_SLAM_MAP").ok();
-        let mapping =
-            map_path.is_none() || std::env::var_os("ROBOT_SLAM_MAPPING").is_some();
+        let mapping = map_path.is_none() || std::env::var_os("ROBOT_SLAM_MAPPING").is_some();
         let safety = safety.clone();
         let states_tx = states.clone();
         match slam::SlamThread::start(
@@ -255,7 +254,10 @@ async fn run(c: Config) -> Result<(), Failure> {
             mapping,
             map_path,
             Box::new(move |slam_state, localized| {
-                safety.lock().unwrap().slam(localized, std::time::Instant::now());
+                safety
+                    .lock()
+                    .unwrap()
+                    .slam(localized, std::time::Instant::now());
                 states_tx.send_if_modified(|old| {
                     let mut next = old.clone();
                     next["slam"] = slam_state.clone();
@@ -294,7 +296,13 @@ async fn run(c: Config) -> Result<(), Failure> {
             return Err(e);
         }
     };
-    let mut read_task = tokio::spawn(player::read(reader, states.clone(), scans, safety.clone(), slam_tx));
+    let mut read_task = tokio::spawn(player::read(
+        reader,
+        states.clone(),
+        scans,
+        safety.clone(),
+        slam_tx,
+    ));
     let mut drive_task = tokio::spawn(player::drive(writer.clone(), safety.clone()));
     let app = App {
         safety,

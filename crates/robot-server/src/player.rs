@@ -229,10 +229,7 @@ pub async fn read(
                 }
                 if let Some(tx) = &slam {
                     let scan = decode_laser_scanangle(&m.payload)?;
-                    let _ = tx.send(crate::slam::Observation::from_scan(
-                        &scan,
-                        odom_pose,
-                    ));
+                    let _ = tx.send(crate::slam::Observation::from_scan(&scan, odom_pose));
                 }
             }
             (BUMPER_CODE, 0, BUMPER_DATA_STATE) => {

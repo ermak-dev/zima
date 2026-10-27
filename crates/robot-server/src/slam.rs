@@ -38,7 +38,8 @@ pub struct SlamStatus {
 }
 
 pub fn parse_status(line: &str) -> Result<SlamStatus, String> {
-    let v: Value = serde_json::from_str(line).map_err(|e| format!("adapter reply is not JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_str(line).map_err(|e| format!("adapter reply is not JSON: {e}"))?;
     let obj = v
         .as_object()
         .ok_or_else(|| "adapter reply is not an object".to_string())?;
@@ -136,10 +137,7 @@ pub struct Observation {
 impl Observation {
     /// Convert a raw Player scan (bearings relative to the LDS zero) into
     /// base_link bearings by adding the LDS mounting yaw.
-    pub fn from_scan(
-        s: &player_bridge::LaserScanAngle,
-        odom: Option<(f64, f64, f64)>,
-    ) -> Self {
+    pub fn from_scan(s: &player_bridge::LaserScanAngle, odom: Option<(f64, f64, f64)>) -> Self {
         let offset = player_bridge::scan::LDS_YAW_DEG.to_radians() as f32;
         // Normalize to [-pi, pi): the adapter bins beams into fixed angular
         // slots starting at -pi.
@@ -242,8 +240,7 @@ impl SlamThread {
                 // how the map gets drawn); localize requires a trusted pose.
                 let mode = state["mode"].as_str().unwrap_or("lost");
                 let localized = mode == "mapping"
-                    || (mode == "localize"
-                        && state["quality"].as_f64().is_some_and(|q| q >= 0.5));
+                    || (mode == "localize" && state["quality"].as_f64().is_some_and(|q| q >= 0.5));
                 on_state(state, localized);
             }
         });
@@ -339,8 +336,10 @@ impl<T: Backend> SlamCore<T> {
             }
         };
         if !status.ok {
-            self.log
-                .push(format!("adapter error: {}", status.error.unwrap_or_default()));
+            self.log.push(format!(
+                "adapter error: {}",
+                status.error.unwrap_or_default()
+            ));
             return self.state_json(None);
         }
         if let Some(p) = status.pose.clone() {
@@ -364,7 +363,8 @@ impl<T: Backend> SlamCore<T> {
                 } else {
                     "global_reset"
                 };
-                self.log.push(format!("{op} issued after {} bad updates", self.bad));
+                self.log
+                    .push(format!("{op} issued after {} bad updates", self.bad));
                 let _ = self.backend.call(&request(op, json!({})));
                 self.resets += 1;
             }
@@ -384,7 +384,9 @@ impl<T: Backend> SlamCore<T> {
     }
     #[allow(dead_code)]
     pub fn save_map(&mut self, path: &str) -> Result<(), String> {
-        let s = self.backend.call(&request("save_map", json!({"path": path})))?;
+        let s = self
+            .backend
+            .call(&request("save_map", json!({"path": path})))?;
         if s.ok {
             Ok(())
         } else {
@@ -393,10 +395,7 @@ impl<T: Backend> SlamCore<T> {
     }
     /// Track absolute odom poses; emit the delta for this observation and
     /// whether it is usable at all (first pose yields a zero delta).
-    pub fn feed_odom(
-        &mut self,
-        odom: Option<(f64, f64, f64)>,
-    ) -> ((f64, f64, f64), bool) {
+    pub fn feed_odom(&mut self, odom: Option<(f64, f64, f64)>) -> ((f64, f64, f64), bool) {
         match (self.odom, odom) {
             (Some(p), Some(c)) => {
                 self.odom = Some(c);
@@ -487,7 +486,10 @@ mod tests {
         assert!((a0 - 97.6f64.to_radians()).abs() < 1e-3);
         let a1 = v["scan"]["angles"][1].as_f64().unwrap();
         let expected = 3.0 + 97.6f64.to_radians() - 2. * std::f64::consts::PI;
-        assert!((a1 - expected).abs() < 1e-3, "bearing must wrap into [-pi,pi)");
+        assert!(
+            (a1 - expected).abs() < 1e-3,
+            "bearing must wrap into [-pi,pi)"
+        );
     }
     // FEATURE: line JSON protocol with the MRPT adapter child process.
     // SPEC: requests carry an op plus merged fields; replies parse into a
@@ -548,11 +550,8 @@ mod tests {
     // RESULT: IMPLEMENTED — happy path, adapter error and crash verified.
     // STATUS: DONE
     fn shell_fake(script: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "slam-fake-{}-{}",
-            std::process::id(),
-            script.len()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("slam-fake-{}-{}", std::process::id(), script.len()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("adapter");
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
@@ -572,7 +571,9 @@ mod tests {
         let ok = a.call(&request("update", json!({}))).unwrap();
         assert!(ok.ok);
         assert_eq!(ok.mode.as_deref(), Some("mapping"));
-        let bad = a.call(&request("load_map", json!({"path": "/none"}))).unwrap();
+        let bad = a
+            .call(&request("load_map", json!({"path": "/none"})))
+            .unwrap();
         assert!(!bad.ok);
         assert_eq!(bad.error.as_deref(), Some("map not loaded"));
         assert!(a.call(&request("crash", json!({}))).is_err());
