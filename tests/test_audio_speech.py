@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """FEATURE: One bounded, cancelable voice-command session with local recognition.
-SPEC: No replay after gaps/restart; actual playback gates wake; no motion authority.
+SPEC: No replay after gaps/restart; actual playback gates manual start; no motion authority.
+STATUS: Wake activation, wake-prefix stripping and barge-in were removed; sessions start only by begin_utterance.
 """
 from concurrent.futures import Future
 from pathlib import Path
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.speech import (BoundedRecognizer, FasterWhisperASR, RecognizerBusy,
                                 RmsVad, SpeechSession)
 
@@ -22,12 +23,6 @@ def block(seq=1, *, stream='one', speech=True, discontinuity=False):
                            pcm=struct.pack('<h', 3000 if speech else 0)*320,
                            sample_rate=16000, channels=1, sample_format='s16le',
                            discontinuity=discontinuity)
-
-
-def wake(event_id='w1', stream='one', sequence=0):
-    return SimpleNamespace(event_id=event_id, phrase='эй робот', model='test',
-                           stream_id=stream, sequence=sequence, stamp_ns=20_000_000,
-                           pre_roll_pcm=struct.pack('<h', 3000)*320)
 
 
 class ManualRecognizer:
@@ -40,73 +35,73 @@ class ManualRecognizer:
 class SpeechTests(unittest.TestCase):
     def session(self, **kwargs):
         recognizer = ManualRecognizer()
-        return SpeechSession(recognizer, vad=RmsVad(-40), wake_phrase='эй робот',
+        return SpeechSession(recognizer, vad=RmsVad(-40),
                              silence_s=.2, wait_s=1, max_command_s=2,
                              asr_timeout_s=1, echo_tail_s=.2, **kwargs), recognizer
 
-    def test_stressed_name_strips_only_the_full_lexical_wake_prefix(self):
-        session,recognizer=self.session()
-        session.wake_phrase='Привет, Зи́ма'
-        self.assertEqual(session._strip_wake('Привет, Зима! Какой у тебя заряд?'),'Какой у тебя заряд?')
-        self.assertEqual(session._strip_wake('Привет, Зи́ма'),'')
-        self.assertEqual(session._strip_wake('Привет, Зимарь, привет'),'Привет, Зимарь, привет')
-
-    def test_confirmed_wake_session_cleans_one_asr_name_substitution(self):
-        session, recognizer = self.session()
-        session.wake_phrase = 'Привет, Зима'
-        self.assertTrue(session.on_wake(wake(), now=0))
-        session.feed(block(speech=False), now=.3)
-        recognizer.future.set_result('Привет, Сима. Какое тебя заряд?')
-        transcript, = session.tick(now=.4)
-        self.assertEqual(transcript.text, 'Какое тебя заряд?')
-
-    def test_one_command_preserves_preroll_and_strips_initial_wake_phrase(self):
-        session, recognizer = self.session()
-        self.assertTrue(session.on_wake(wake(), now=0))
-        self.assertEqual(session.state, 'listening')
-        session.feed(block(), now=.02)
-        session.feed(block(2, speech=False), now=.25)
+    def spoken(self, session, recognizer):
+        """Start a manual utterance, hear speech, then silence: ASR is submitted."""
+        self.assertTrue(session.begin_utterance(now=0))
+        session.feed(block(1), now=.05)
+        session.feed(block(2, speech=False), now=.3)
         self.assertEqual(session.state, 'transcribing')
-        self.assertTrue(recognizer.calls[0].startswith(wake().pre_roll_pcm))
+
+    def test_removed_wake_api_is_absent(self):
+        session, _ = self.session()
+        for name in ('on_wake', 'barge_in', '_strip_wake', 'wake_phrase'):
+            self.assertFalse(hasattr(session, name), name)
+        with self.assertRaises(TypeError):
+            SpeechSession(ManualRecognizer(), wake_phrase='x')
+
+    def test_transcript_is_returned_verbatim_without_prefix_removal(self):
+        session, recognizer = self.session()
+        self.spoken(session, recognizer)
         recognizer.future.set_result('Эй, робот, осмотрись в коридоре')
-        transcript, = session.tick(now=.3)
-        self.assertEqual(transcript.text, 'осмотрись в коридоре')
+        transcript, = session.tick(now=.4)
+        self.assertEqual(transcript.text, 'Эй, робот, осмотрись в коридоре')
         self.assertTrue(transcript.final)
         self.assertEqual(transcript.stream_id, 'one')
         self.assertEqual(session.state, 'processing')
         session.response_finished(transcript.session_id)
         self.assertEqual(session.state, 'waiting')
 
-    def test_duplicate_wake_and_source_gap_do_not_start_two_commands(self):
+    def test_manual_audio_has_no_preroll(self):
         session, recognizer = self.session()
-        self.assertTrue(session.on_wake(wake(), now=0))
-        self.assertFalse(session.on_wake(wake(), now=.01))
-        session.feed(block(4), now=.02)
+        self.spoken(session, recognizer)
+        self.assertEqual(recognizer.calls[0], block(1).pcm + block(2, speech=False).pcm)
+
+    def test_second_start_and_source_gap_do_not_start_two_commands(self):
+        session, recognizer = self.session()
+        self.assertTrue(session.begin_utterance(now=0))
+        self.assertFalse(session.begin_utterance(now=.01))
+        session.feed(block(1), now=.02)
+        session.feed(block(4), now=.03)
         self.assertEqual(session.state, 'fault')
         self.assertEqual(session.last_error, 'audio_gap')
         self.assertEqual(recognizer.calls, [])
 
     def test_source_change_and_discontinuity_cancel_current_command(self):
-        for changed in (block(stream='two'), block(discontinuity=True)):
-            session, _ = self.session(); session.on_wake(wake(), now=0)
+        for changed in (block(2, stream='two'), block(2, discontinuity=True)):
+            session, _ = self.session(); session.begin_utterance(now=0)
+            session.feed(block(1), now=.01)
             session.feed(changed, now=.02)
             self.assertEqual(session.state, 'fault')
 
     def test_no_speech_and_maximum_duration_are_bounded(self):
         session, _ = self.session()
-        quiet_wake = wake(); quiet_wake.pre_roll_pcm=b'\x00\x00'*320
-        session.on_wake(quiet_wake, now=0)
+        session.begin_utterance(now=0)
+        session.feed(block(1, speech=False), now=.01)
         session.tick(now=1.1)
         self.assertEqual(session.last_error, 'no_speech')
-        session, recognizer = self.session(); session.on_wake(wake(), now=0)
+        session, recognizer = self.session(); session.begin_utterance(now=0)
+        session.feed(block(1), now=0)
         session.tick(now=2.1)
         self.assertEqual(session.state, 'transcribing')
         self.assertEqual(len(recognizer.calls), 1)
 
     def test_asr_timeout_and_cancel_discard_late_result(self):
         for cancel in (False, True):
-            session, recognizer = self.session(); session.on_wake(wake(), now=0)
-            session.feed(block(1, speech=False), now=.3)
+            session, recognizer = self.session(); self.spoken(session, recognizer)
             old = recognizer.future
             if cancel: session.cancel()
             else: session.tick(now=1.4)
@@ -114,36 +109,27 @@ class SpeechTests(unittest.TestCase):
             self.assertEqual(session.tick(now=1.5), [])
             self.assertEqual(session.transcripts, [])
 
-    def test_only_actual_playback_blocks_wake_and_tail_is_respected(self):
+    def test_only_actual_playback_blocks_start_and_tail_is_respected(self):
         session, _ = self.session()
         session.playback_started('p1', now=0)
-        self.assertFalse(session.on_wake(wake(), now=.1))
+        self.assertFalse(session.begin_utterance(now=.1))
         session.playback_finished('other', now=.2)
         self.assertTrue(session.playback_active)
         session.playback_finished('p1', now=.3)
-        self.assertFalse(session.on_wake(wake(), now=.4))
-        self.assertTrue(session.on_wake(wake('w2'), now=.6))
+        self.assertFalse(session.begin_utterance(now=.4))
+        self.assertTrue(session.begin_utterance(now=.6))
 
-    def test_barge_in_requires_confirmed_cancellation(self):
-        session, _ = self.session(); session.playback_started('p1', now=0)
-        self.assertFalse(session.barge_in(wake(), lambda _: False, now=.1))
-        self.assertEqual(session.state, 'speaking')
-        calls=[]
-        self.assertTrue(session.barge_in(wake('w2'), lambda p: calls.append(p) or True, now=.2))
-        self.assertEqual(calls, ['p1'])
-        self.assertEqual(session.state, 'listening')
-
-    def test_fault_can_be_reset_without_replaying_old_wake(self):
-        session, _ = self.session(); session.on_wake(wake(), now=0)
+    def test_fault_can_be_reset_and_a_new_utterance_started(self):
+        session, _ = self.session(); session.begin_utterance(now=0)
         session.source_lost()
+        self.assertEqual(session.state, 'fault')
+        self.assertFalse(session.begin_utterance(now=1))
         session.reset()
-        self.assertFalse(session.on_wake(wake(), now=1))
-        self.assertTrue(session.on_wake(wake('new'), now=1))
+        self.assertTrue(session.begin_utterance(now=1))
 
-    def test_wake_only_transcript_does_not_become_command(self):
-        session, recognizer = self.session(); session.on_wake(wake(), now=0)
-        session.feed(block(speech=False), now=.3)
-        recognizer.future.set_result('Эй робот!')
+    def test_empty_transcript_does_not_become_command(self):
+        session, recognizer = self.session(); self.spoken(session, recognizer)
+        recognizer.future.set_result('  ')
         self.assertEqual(session.tick(now=.4), [])
         self.assertEqual(session.last_error, 'empty_command')
 

@@ -20,7 +20,7 @@ import wave
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'ros2'))
+sys.path.insert(0, str(ROOT / 'python'))
 ROBOT = ROOT / 'bin' / 'robot'
 
 from robot_audio.types import AudioChunk

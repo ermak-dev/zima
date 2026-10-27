@@ -259,9 +259,9 @@ pub struct Rollback {
 }
 
 /// Execute the rollback in the safety-relevant order:
-/// 1. zero velocity over Player TCP (reaches the MCU immediately),
-/// 2. standby mask over the FIFO (disables the wheel permission — an
-///    independent second stop path that also zeroes the saved command),
+/// 1. attempt zero velocity over Player TCP,
+/// 2. standby mask over the FIFO (removes wheel permission; physical stopping
+///    time and clearing of the driver's saved velocity are not established),
 /// 3. controller-restore command.
 /// Steps are best-effort in sequence: a failure in an earlier step is
 /// logged and the later steps still run, but the function reports the

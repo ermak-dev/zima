@@ -12,7 +12,7 @@ from unittest.mock import patch
 import wave
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'ros2'))
+sys.path.insert(0, str(ROOT / 'python'))
 from robot_audio.playback import AssetStore, AudioError, PlaybackQueue, TransportResult
 from robot_audio.tts import OpenRouterTTS
 
@@ -57,7 +57,7 @@ class AudioHardeningTests(unittest.TestCase):
         import os
         self.asset.path.unlink()
         os.mkfifo(self.asset.path, 0o600)
-        code = ('import sys;sys.path.insert(0,' + repr(str(ROOT / 'ros2')) + ');'
+        code = ('import sys;sys.path.insert(0,' + repr(str(ROOT / 'python')) + ');'
                 'from robot_audio.playback import AssetStore,AudioError;'
                 's=AssetStore(' + repr(self.tmp.name) + ');'
                 '\ntry:s.get(' + repr(self.asset.asset_id) + ')\nexcept AudioError:sys.exit(0)\nsys.exit(1)')
@@ -77,7 +77,7 @@ class AudioHardeningTests(unittest.TestCase):
         import os
         path = Path(self.tmp.name) / 'token.fifo'
         os.mkfifo(path, 0o600)
-        code = ('import sys;sys.path.insert(0,' + repr(str(ROOT / 'ros2')) + ');'
+        code = ('import sys;sys.path.insert(0,' + repr(str(ROOT / 'python')) + ');'
                 'from robot_audio.tts import OpenRouterTTS;from robot_audio.playback import AudioError;'
                 '\ntry:OpenRouterTTS(token_file=' + repr(str(path)) + ')._token()\nexcept AudioError:sys.exit(0)\nsys.exit(1)')
         process = subprocess.Popen([sys.executable, '-I', '-c', code], stdout=subprocess.DEVNULL,

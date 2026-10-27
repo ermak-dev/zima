@@ -1,0 +1,14 @@
+# Pinned MRPT 2.14.8 sources and the local build/install cache. Reproduce with:
+#   cd tools/mrpt-adapter/third_party
+#   git clone --depth 1 --branch 2.14.8 https://github.com/MRPT/mrpt.git mrpt
+#   cd mrpt && git submodule update --init \
+#     3rdparty/nanogui 3rdparty/rplidar_sdk 3rdparty/simpleini \
+#     3rdparty/zlib 3rdparty/nanoflann 3rdparty/libfyaml && cd ..
+#   cmake -S mrpt -B build -DCMAKE_BUILD_TYPE=Release \
+#     -DMRPT_BUILD_APPLICATIONS=OFF -DBUILD_mrpt-gui=OFF -DBUILD_mrpt-apps=OFF \
+#     -DBUILD_mrpt-graphslam=OFF -DBUILD_mrpt-hwdrivers=OFF -DMRPT_BUILD_nanogui=OFF \
+#     -DMRPT_DISABLE_PYTHON_BINDINGS=ON -DMRPT_WITH_KINECT=OFF \
+#     -DCMAKE_INSTALL_PREFIX=$PWD/install
+#   cmake --build build -j && cmake --install build
+/third_party/
+/adapter

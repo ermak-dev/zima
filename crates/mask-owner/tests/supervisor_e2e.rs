@@ -1,12 +1,12 @@
 //! End-to-end tests for robot-supervisor: the on-robot process that
-//! holds the session mask while the workstation bridge stays alive.
+//! holds the session mask while the workstation server stays alive.
 //!
 //! Lifecycle under test:
 //!   supervisor listen --heartbeat-port P --timeout T
 //!     - waits for ACTIVATE on the heartbeat connection
 //!     - applies the session mask, then rolls back when the connection
 //!       dies (EOF) or goes silent past the timeout
-//!   rollback order: zero velocity, standby mask, restore command
+//!   normal disconnect/timeout path: standby mask, restore command
 //!
 //! The FIFO/Player fakes are the same shape as rollback.rs; the restore
 //! command is a recording script.

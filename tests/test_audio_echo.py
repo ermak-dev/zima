@@ -14,7 +14,7 @@ import threading
 from unittest.mock import patch
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.echo import EchoController, SpeexEchoCanceller
 
 
@@ -37,7 +37,7 @@ class AlignmentTests(unittest.TestCase):
         controller=EchoController(FakeEcho(), delay_ms=100, calibrated=False)
         result=controller.process_capture(block(5), playback_active=True)
         self.assertEqual(result.mode,'half_duplex')
-        self.assertFalse(result.allow_wake)
+        self.assertFalse(result.allow_barge_in)
         self.assertEqual(result.reason,'calibration_required')
 
     def test_actual_aligned_reference_allows_full_duplex(self):
@@ -45,7 +45,6 @@ class AlignmentTests(unittest.TestCase):
         controller.push_reference(block(0,stream='p1'), playback_id='play1', actual_playback=True)
         result=controller.process_capture(block(5), playback_active=True)
         self.assertEqual(result.mode,'full_duplex')
-        self.assertTrue(result.allow_wake)
         self.assertTrue(result.allow_barge_in)
         self.assertEqual(len(engine.calls),1)
 
@@ -56,7 +55,7 @@ class AlignmentTests(unittest.TestCase):
 
     def test_missing_and_drifting_reference_fail_closed(self):
         engine=FakeEcho();controller=EchoController(engine,delay_ms=100,calibrated=True,max_drift_ms=5)
-        self.assertFalse(controller.process_capture(block(5),playback_active=True).allow_wake)
+        self.assertFalse(controller.process_capture(block(5),playback_active=True).allow_barge_in)
         controller.push_reference(block(0,stream='p1'),playback_id='p1',actual_playback=True)
         result=controller.process_capture(block(7),playback_active=True)
         self.assertEqual(result.mode,'half_duplex')
@@ -77,11 +76,10 @@ class AlignmentTests(unittest.TestCase):
         original=block(0,333)
         result=controller.process_capture(original,playback_active=False)
         self.assertEqual(result.pcm,original.pcm)
-        self.assertTrue(result.allow_wake)
         self.assertFalse(result.allow_barge_in)
         controller.push_reference(block(0,stream='p1'),playback_id='p1',actual_playback=True)
         controller.playback_finished('p1')
-        self.assertFalse(controller.process_capture(block(1),playback_active=True).allow_wake)
+        self.assertFalse(controller.process_capture(block(1),playback_active=True).allow_barge_in)
 
     def test_reference_storage_bounded(self):
         controller=EchoController(FakeEcho(),delay_ms=0,calibrated=True,max_reference_s=1)

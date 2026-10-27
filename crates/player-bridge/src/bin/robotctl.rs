@@ -204,7 +204,7 @@ fn main() {
             // The IR interface (vendor fan_motor_status, index 6) is not
             // part of the player-bridge core yet. Report unavailability
             // instead of guessing: the value is a raw, uncalibrated
-            // sensor anyway (see docs/player-platform-survey.md).
+            // sensor anyway (see HARDWARE.md).
             eprintln!("robotctl: fan telemetry is not implemented in the Rust client yet");
             1
         }

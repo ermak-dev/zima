@@ -147,6 +147,7 @@ class SayCliTests(unittest.TestCase):
         server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         config = self.dir / 'yandex.json'
         config.write_text(json.dumps({

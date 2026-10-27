@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import wave
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.types import AudioChunk
 
 

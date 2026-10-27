@@ -8,18 +8,17 @@ import time
 from types import SimpleNamespace
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from robot_audio.playback import AudioError, AssetStore, PlaybackQueue, TransportResult
 from robot_audio.runtime import AudioRuntime
 from robot_audio.types import AudioChunk
-from robot_audio.wake import WakeDetector
 from test_audio_runtime import Source, wav_bytes, wait_for
 
 
 class RuntimePolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.events = {key: [] for key in ('chunk', 'input_state', 'wake', 'playback', 'speech_state', 'diagnostic')}
+        self.events = {key: [] for key in ('chunk', 'input_state', 'playback', 'speech_state', 'diagnostic')}
         self.stop_output = threading.Event()
         parent = self
         class Transport:
@@ -82,19 +81,13 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertEqual(self.events['playback'][-1]['state'], 'failed')
         self.assertFalse(self.events['playback'][-1]['speaking'])
 
-    def test_half_duplex_policy_wins_even_when_echo_backend_allows_wake(self):
-        class Backend:
-            def predict(self, pcm): return .9
-            def reset(self): pass
-        class Echo:
-            def process_capture(self, chunk, playback_active):
-                return SimpleNamespace(pcm=chunk.pcm, allow_wake=True, allow_barge_in=True)
-            def reset(self): pass
-            def close(self): pass
-            def playback_finished(self, playback_id): pass
+    def test_manual_utterance_is_refused_while_the_speaker_is_active(self):
+        from robot_audio.speech import SpeechSession
+        from unittest.mock import Mock
         self.block_output = True
-        runtime = self.runtime({'input': {'enabled': True, 'microphone_verified': True},
-            'output': {'enabled': True}}, source=Source(), detector=WakeDetector(Backend(), phrase='test'), echo=Echo())
+        session = SpeechSession(Mock(), clock=time.monotonic)
+        runtime = self.runtime({'input': {'enabled': True}, 'output': {'enabled': True}},
+                               source=Source(), session=session)
         cancel = threading.Event(); result = []
         thread = threading.Thread(target=lambda: result.append(runtime.execute('play', {
             'asset_id': self.asset.asset_id, 'volume': .2, 'priority': 0, 'max_queue_wait': 2},
@@ -102,17 +95,15 @@ class RuntimePolicyTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(wait_for(lambda: any(value['speaking'] for value in self.events['playback'])))
-            for i in range(4):
-                runtime.process_chunk(AudioChunk('fixture', i, 1_000_000_000 + i * 20_000_000,
-                                                  b'\x10\x27' * 320))
+            self.assertFalse(runtime.begin_utterance()['success'])
+            self.assertEqual(session.state, 'speaking')
         finally:
             cancel.set(); thread.join(3)
-        self.assertEqual(self.events['wake'], [])
 
     def test_missing_echo_reference_is_reported_as_half_duplex_fallback(self):
         class Echo:
             def process_capture(self, chunk, playback_active):
-                return SimpleNamespace(pcm=chunk.pcm, allow_wake=False, allow_barge_in=False,
+                return SimpleNamespace(pcm=chunk.pcm, allow_barge_in=False,
                                        mode='half_duplex', reason='reference_missing')
             def reset(self): pass
             def close(self): pass
@@ -131,48 +122,6 @@ class RuntimePolicyTests(unittest.TestCase):
             runtime.process_chunk(AudioChunk('fixture', 0, time.time_ns(), b'\x10\x27' * 320))
             self.assertEqual(self.events['speech_state'][-1]['duplex_mode'], 'half_duplex')
             self.assertTrue(any(value.get('state') == 'reference_missing' for value in self.events['diagnostic']))
-        finally:
-            cancel.set(); thread.join(3)
-
-    def test_full_duplex_preserves_command_while_remote_cancel_is_pending(self):
-        from robot_audio.speech import SpeechSession, BoundedRecognizer, RmsVad
-        class Backend:
-            def predict(self, pcm): return .9
-            def reset(self): pass
-        class Echo:
-            def process_capture(self, chunk, playback_active):
-                return SimpleNamespace(pcm=chunk.pcm, allow_wake=True, allow_barge_in=True,
-                                       mode='full_duplex', reason='')
-            def reset(self): pass
-            def close(self): pass
-            def playback_finished(self, playback_id): pass
-        self.block_output = True
-        self.cancel_delay = .12
-        source = Source()
-        session = SpeechSession(BoundedRecognizer(lambda pcm: 'эй робот прерви ответ'),
-                                wake_phrase='эй робот', vad=RmsVad(-40), silence_s=.05)
-        transcripts = []
-        runtime = self.runtime({'input': {'enabled': True, 'microphone_verified': True},
-            'output': {'enabled': True}, 'speech': {'mode': 'full_duplex'},
-            'echo': {'enabled': True, 'verified': True}}, source=source, session=session,
-            detector=WakeDetector(Backend(), phrase='эй робот'), echo=Echo())
-        runtime._callbacks['transcript'] = transcripts.append
-        cancel = threading.Event(); result = []
-        thread = threading.Thread(target=lambda: result.append(runtime.execute('play', {
-            'asset_id': self.asset.asset_id, 'volume': .2, 'priority': 0, 'max_queue_wait': 2},
-            'barge-in', cancel, lambda value: None)))
-        thread.start()
-        try:
-            self.assertTrue(wait_for(lambda: any(value['speaking'] for value in self.events['playback'])))
-            epoch = time.time_ns()
-            for i in range(18):
-                source.queue.put(AudioChunk('fixture', i, epoch + i * 20_000_000,
-                    (b'\x10\x27' if i < 7 else b'\x00\x00') * 320))
-                time.sleep(.02)
-            self.assertTrue(wait_for(lambda: transcripts))
-            self.assertEqual(transcripts[-1]['text'], 'прерви ответ')
-            thread.join(2)
-            self.assertEqual(result[0]['error_code'], 3)
         finally:
             cancel.set(); thread.join(3)
 
@@ -230,17 +179,19 @@ class RuntimePolicyTests(unittest.TestCase):
         finally:
             cancel.set(); thread.join(3)
 
-    def test_model_exception_does_not_kill_pcm_delivery_silently(self):
-        class Backend:
-            def predict(self, pcm): raise RuntimeError('inference failed')
-            def reset(self): pass
+    def test_recognition_exception_does_not_kill_pcm_delivery_silently(self):
+        class Session:
+            state = 'listening'; session_id = 'x'; last_error = ''
+            def feed(self, chunk, now=None): raise RuntimeError('recognition failed')
+            def source_lost(self): pass
+            def tick(self, now=None): return []
+            def close(self): pass
         source = Source()
-        runtime = self.runtime({'input': {'enabled': True, 'microphone_verified': True}},
-            source=source, detector=WakeDetector(Backend(), phrase='test'))
+        runtime = self.runtime({'input': {'enabled': True}}, source=source, session=Session())
         for i in range(5):
             source.queue.put(AudioChunk('fixture', i, 1_000_000_000 + i * 20_000_000,
                                         b'\x10\x27' * 320))
-        self.assertTrue(wait_for(lambda: len(self.events['chunk']) >= 5), 'PCM capture must survive model failure')
+        self.assertTrue(wait_for(lambda: len(self.events['chunk']) >= 5), 'PCM capture must survive recognition failure')
         self.assertTrue(any(value.get('state') == 'processing_failed' for value in self.events['diagnostic']))
 
 

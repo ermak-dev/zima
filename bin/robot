@@ -9,12 +9,9 @@
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
-#        robot bridge            # full supervised session (sources ROS 2 itself)
-#        robot panel [--slam] [--port N]  # --slam: bridge + mapping + web panel, no Nav2/RViz
-#        robot run               # live RViz + teleop session (bridge + supervisor)
-#        robot run --sim         # offline Nav2 playground (Gazebo TB3 simulation)
-#        robot run --sim --slam  # playground + online SLAM: the map grows as you drive
-#        robot run --slam        # live: click goals in RViz, Nav2 drives, SLAM maps
+#        robot run [--port N] [--listen HOST]  # supervised server + lidar web panel
+#        robot panel [--port N] [--listen HOST]  # alias for run (hands over controller)
+#        robot bridge [--port N] [--listen HOST] # alias for run
 #        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
 set -euo pipefail
 
@@ -32,31 +29,9 @@ ssh_wrap() {
     esac
 }
 
-usage() { sed -n '2,18s/^# //p' "$0"; }
+usage() { sed -n '2,/^set /{ /^# /s/^# //p; }' "$0"; }
 fail() { echo "robot: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
-
-# Source the ROS 2 distro and the project workspace, so `robot bridge`
-# and `robot panel` work from a plain shell (running ros2 unsourced
-# leaves the controller disabled with nothing supervising it).
-# $1 = strict: also require the ros2 CLI on PATH (the bridge needs it;
-# the panel only needs rclpy inside python3).
-source_ros() {
-    local repo
-    repo=$(repo_root)
-    # The distro setup scripts reference unset vars (AMENT_TRACE_SETUP_FILES);
-    # relax nounset around them.
-    set +u
-    # shellcheck source=/dev/null
-    source "${ROBOT_ROS_SETUP:-/opt/ros/jazzy/setup.sh}" \
-        || { set -u; fail 'ROS setup not found; source a ROS 2 distro or set ROBOT_ROS_SETUP'; }
-    # shellcheck source=/dev/null
-    source "${ROBOT_WS_SETUP:-$HOME/robot/ros-ws/install/setup.sh}" 2>/dev/null || true
-    set -u
-    if [[ ${1:-} == strict ]] && ! command -v ros2 >/dev/null; then
-        fail 'ros2 is not in PATH after sourcing ROS'
-    fi
-}
 
 # Upload a file to the robot only when it differs (sha256 compare), via a
 # tmp+mv so a partial transfer never replaces the live remote file.
@@ -233,7 +208,7 @@ mask_owner_remote() {
 supervisor_start() {
     local binary timeout_ms=${2:-5000} port=${1:-7665} repo
     repo=$(repo_root)
-    binary=$repo/crates/target/armv7-unknown-linux-musleabihf/release/robot-supervisor
+    binary=${ROBOT_SUPERVISOR_BIN:-$repo/crates/target/armv7-unknown-linux-musleabihf/release/robot-supervisor}
     [[ -x $binary ]] || fail 'robot-supervisor binary is missing; build: (cd crates && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)'
     deploy_file "$binary" /tmp/mask-owner/robot-supervisor
     deploy_file "$repo/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh
@@ -274,6 +249,22 @@ REMOTE
     fi
 }
 
+server_cleanup() {
+    local rc=$? current
+    trap - EXIT INT TERM
+    if [[ -n $server_pid ]] && kill -0 "$server_pid" 2>/dev/null; then
+        kill -TERM "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    if (( handoff )); then
+        current=$(controller_status) || current=unknown
+        if [[ $current != enabled ]]; then
+            controller_enable >&2 || { echo 'robot: controller recovery failed' >&2; rc=1; }
+        fi
+    fi
+    exit "$rc"
+}
+
 cmd=${1:---help}
 (( $# == 0 )) || shift
 case $cmd in
@@ -299,16 +290,6 @@ case $cmd in
         exec python3 "$(repo_root)/bin/audio/cli.py" capture "$@" ;;
     audio)
         if [[ -n ${ROBOT_AUDIO_BIN:-} ]]; then exec "$ROBOT_AUDIO_BIN" "$@"; fi
-        case ${1:---help} in
-            run|status|play|say|stop|listen|mute|record)
-                source_ros
-                if [[ -n ${ROBOT_AUDIO_SETUP:-} ]]; then
-                    set +u
-                    # shellcheck source=/dev/null
-                    source "$ROBOT_AUDIO_SETUP" || { set -u; fail 'audio interface overlay not found'; }
-                    set -u
-                fi ;;
-        esac
         exec python3 "$(repo_root)/bin/audio/cli.py" "$@" ;;
     say)
         # Local or SpeechKit TTS through the playback helper; no ROS, no controller.
@@ -357,88 +338,60 @@ case $cmd in
                 ssh_wrap robot "$remote" restore ;;
             *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
         esac ;;
-    bridge)
-        (( $# == 0 )) || fail 'usage: robot bridge [--heartbeat-port N] [--timeout-ms M]'
-        heartbeat_port=7665 timeout_ms=5000
-        while [[ $# -gt 0 ]]; do
+    run|panel|bridge)
+        port=8085 listen=127.0.0.1 heartbeat_port=7665 timeout_ms=5000 slam_adapter=
+        while (( $# )); do
             case $1 in
-                --heartbeat-port) heartbeat_port=$2; shift 2 ;;
-                --timeout-ms) timeout_ms=$2; shift 2 ;;
-                *) fail "unknown bridge option: $1" ;;
+                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter)
+                    (( $# >= 2 )) || fail "missing value for $1"
+                    case $1 in
+                        --port) port=$2 ;;
+                        --listen) listen=$2 ;;
+                        --heartbeat-port) heartbeat_port=$2 ;;
+                        --timeout-ms) timeout_ms=$2 ;;
+                        --slam-adapter)
+                            [[ -f $2 ]] || fail "--slam-adapter: $2 is not a file"
+                            slam_adapter=$2 ;;
+                    esac
+                    shift 2 ;;
+                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE]' ;;
             esac
         done
-        repo=$(repo_root)
-        [[ -d $repo/crates ]] || fail 'crates/ not found'
-        source_ros strict
-        # 0. only one ROS session per host: next to the simulator this
-        #    bridge would forward the sim's Nav2 /cmd_vel to the wheels.
-        # shellcheck source=/dev/null
-        source "$repo/scripts/lib.sh"
-        if other=$(running_ros_session); then
-            fail "$other is already running on this host; end it first"
+        for number in "$port" "$heartbeat_port"; do
+            if [[ ! $number =~ ^[0-9]{1,5}$ ]] || (( 10#$number < 1 || 10#$number > 65535 )); then
+                fail 'port must be an integer in 1..65535'
+            fi
+        done
+        if [[ ! $timeout_ms =~ ^[0-9]{1,6}$ ]] || (( 10#$timeout_ms < 100 || 10#$timeout_ms > 300000 )); then
+            fail 'timeout must be an integer in 100..300000 milliseconds'
         fi
-        # 1. supervisor first (it must never be missing while masked)
-        supervisor_start "$heartbeat_port" "$timeout_ms"
-        # 2. hand over controller supervision
-        controller_disable >&2
-        # 3. run the bridge; its heartbeat activates the supervisor.
-        # `disable` restarts rrwatchdoge, which may bounce Player: wait
-        # for TCP 6665 to accept before launching the node.
+        [[ $listen =~ ^[a-zA-Z0-9_.:-]+$ ]] || fail 'invalid listen address'
+        repo=$(repo_root)
+        binary=${ROBOT_SERVER_BIN:-$repo/crates/target/release/robot-server}
+        if [[ -z ${ROBOT_SERVER_BIN:-} && ! -x $binary ]]; then
+            binary=$repo/crates/target/debug/robot-server
+        fi
+        [[ -x $binary ]] || fail 'robot-server binary is missing; build: cargo build --manifest-path crates/Cargo.toml --release'
+        lock=${ROBOT_SESSION_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/robot-server-$UID.lock}
+        exec 9>"$lock"
+        flock -n 9 || fail 'a robot server session is already running on this host'
         host=$(robot_host)
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            if timeout 1 bash -c "exec 3<>/dev/tcp/$host/6665" 2>/dev/null; then break; fi
-            sleep 1
-        done
+        server_pid='' handoff=0
+        trap server_cleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        supervisor_start "$heartbeat_port" "$timeout_ms"
+        handoff=1
+        controller_disable >&2
+        server_args=(--player-host "$host" --listen "$listen" --port "$port")
+        [[ -n $slam_adapter ]] && server_args+=(--slam-adapter "$slam_adapter")
+        ROBOT_SERVER_HEARTBEAT="$host:$heartbeat_port" \
+            "$binary" "${server_args[@]}" &
+        server_pid=$!
         status=0
-        ROBOT_BRIDGE_HEARTBEAT="$host:$heartbeat_port" \
-            ros2 run player_to_ros2 player_to_ros2 --ros-args -p "player_host:=$host" || status=$?
-        # 4. the supervisor rolls the robot back when the bridge dies;
-        #    surface its log so the rollback is visible.
-        sleep 1
-        ssh_wrap robot 'cat /tmp/robot-supervisor.log' >&2 || true
+        wait "$server_pid" || status=$?
+        server_pid=
         exit "$status" ;;
-    panel)
-        port=8085 slam=0
-        while [[ $# -gt 0 ]]; do
-            case $1 in
-                --slam) slam=1; shift ;;
-                --port)
-                    (( $# >= 2 )) || fail 'usage: robot panel [--slam] [--port N]'
-                    port=$2; shift 2 ;;
-                *) fail 'usage: robot panel [--slam] [--port N]' ;;
-            esac
-        done
-        if [[ ! $port =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
-            fail 'panel port must be an integer in 1..65535'
-        fi
-        repo=$(repo_root)
-        if (( slam )); then
-            script=${ROBOT_MAPPING_SCRIPT:-$repo/scripts/run-mapping.sh}
-            [[ -f $script ]] || fail "mapping wrapper not found: $script"
-            exec bash "$script" --port "$port"
-        fi
-        panel_bin=${ROBOT_PANEL_BIN:-$repo/ros2/web_panel.py}
-        [[ -f $panel_bin ]] || fail "panel node not found: $panel_bin"
-        source_ros
-        exec "$panel_bin" --ros-args -p "port:=$port" ;;
-    run)
-        mode=live
-        script_args=()
-        while [[ $# -gt 0 ]]; do
-            case $1 in
-                --sim) mode=sim; shift ;;
-                --slam) script_args+=(--slam); shift ;;
-                *) fail 'usage: robot run [--sim [--slam]]' ;;
-            esac
-        done
-        repo=$(repo_root)
-        if [[ $mode == sim ]]; then
-            script=${ROBOT_SIM_SCRIPT:-$repo/scripts/run-sim.sh}
-        else
-            script=${ROBOT_RUN_SCRIPT:-$repo/scripts/run-rviz.sh}
-        fi
-        [[ -f $script ]] || fail "run wrapper not found: $script"
-        exec bash "$script" "${script_args[@]}" ;;
     stop)
         (( $# == 0 )) || fail 'stop takes no arguments'
         robotctl stop ;;

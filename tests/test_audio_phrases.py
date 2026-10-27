@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lexical wake matching and pronunciation metadata, without audio or models."""
+"""Lexical matching and pronunciation metadata, without audio or models."""
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
@@ -7,8 +7,8 @@ import sys
 import unicodedata
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2'))
-from robot_audio.phrases import PhraseSpec, normalize_phrase, strip_wake_prefix
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
+from robot_audio.phrases import PhraseSpec, normalize_phrase
 
 
 class NormalizePhraseTests(unittest.TestCase):
@@ -29,53 +29,6 @@ class NormalizePhraseTests(unittest.TestCase):
     def test_no_stemming_or_fuzzy_match(self):
         self.assertNotEqual(normalize_phrase('Зимарь'), normalize_phrase('Зима'))
         self.assertNotEqual(normalize_phrase('приветзима'), normalize_phrase('Привет, Зима'))
-
-
-class StripWakePrefixTests(unittest.TestCase):
-    def test_full_prefix_preserves_original_command(self):
-        self.assertEqual(strip_wake_prefix(' «ПРИВЕТ, Зи́ма!» — Включи Ёлку, на 5%! ',
-                                          'Привет, Зима'), 'Включи Ёлку, на 5%!')
-        self.assertEqual(strip_wake_prefix('ЭЙ, Ёлка: Скажи «Да!»', 'эй ёлка'),
-                         'Скажи «Да!»')
-        command = unicodedata.normalize('NFD', 'Включи зелёный свет!')
-        self.assertEqual(strip_wake_prefix('Привет Зима, ' + command, 'Привет, Зима'), command)
-
-    def test_asr_cleanup_is_explicit_and_only_one_final_word_substitution(self):
-        text = 'Привет, Сима. Какое тебя заряд?'
-        self.assertEqual(strip_wake_prefix(text, 'Привет, Зима'), text)
-        self.assertEqual(strip_wake_prefix(text, 'Привет, Зима', allow_asr_substitution=True),
-                         'Какое тебя заряд?')
-        self.assertEqual(strip_wake_prefix('Привет Сима, НЕ включай свет!', 'Привет Зима',
-                                          allow_asr_substitution=True), 'НЕ включай свет!')
-        self.assertEqual(strip_wake_prefix('Привет Сима', 'Привет Зима',
-                                          allow_asr_substitution=True), '')
-        for text, phrase in (('Привет Зима2, команда', 'Привет Зима'),
-                             ('Привет Зимарь, команда', 'Привет Зима'),
-                             ('Привет Лира, команда', 'Привет Зима'),
-                             ('Прибет Сима, команда', 'Привет Зима'),
-                             ('Эй Привет Сима, команда', 'Привет Зима'),
-                             ('Сима, команда', 'Зима'),
-                             ('Привет ты, команда', 'Привет мы'),
-                             ('Привет Зим4, команда', 'Привет Зима')):
-            with self.subTest(text=text):
-                self.assertEqual(strip_wake_prefix(text, phrase, allow_asr_substitution=True), text)
-
-    def test_wake_only(self):
-        for text in ('Привет Зима', '«Привет, Зима!»', 'привет, зима́...'):
-            with self.subTest(text=text):
-                self.assertEqual(strip_wake_prefix(text, 'Привет, Зи́ма'), '')
-
-    def test_never_removes_partial_or_nonprefix_occurrence(self):
-        for text in ('Привет, Зимарь, включи свет', 'Привет Зима2, свет',
-                     'Приветзима, свет', 'Эй, Привет Зима, свет',
-                     'Скажи: Привет Зима', 'Привет, свет', ''):
-            with self.subTest(text=text):
-                self.assertEqual(strip_wake_prefix(text, 'Привет, Зима'), text)
-
-    def test_empty_phrase_is_noop_and_only_one_prefix_is_removed(self):
-        self.assertEqual(strip_wake_prefix('  Команда!  ', '...'), 'Команда!')
-        self.assertEqual(strip_wake_prefix('Привет Зима, Привет Зима!', 'Привет Зима'),
-                         'Привет Зима!')
 
 
 class PhraseSpecTests(unittest.TestCase):

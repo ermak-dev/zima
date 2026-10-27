@@ -70,6 +70,21 @@ describe('useMjpeg', () => {
     expect(result.current.src).toBeUndefined()
   })
 
+  // FEATURE: Camera source stays stable between actual connection attempts.
+  // SPEC: State updates and elapsed time must not reconnect the MJPEG stream.
+  // IMPLEMENTATION: Memoize the source by URL, active state and actual retry attempt.
+  // RESULT: IMPLEMENTED — unrelated renders do not reconnect the camera.
+  // STATUS: DONE
+  it('keeps its source stable across rerenders and elapsed time', () => {
+    vi.useFakeTimers()
+    const { result, rerender, unmount } = renderHook(() => useMjpeg({ url: '/camera.mjpeg', active: true }))
+    const src = result.current.src
+    act(() => vi.advanceTimersByTime(10000))
+    rerender()
+    expect(result.current.src).toBe(src)
+    unmount()
+  })
+
   it('unmount clears the retry timer and detaches handlers', () => {
     vi.useFakeTimers()
     const { result, unmount } = renderHook(() => useMjpeg({ url: '/camera.mjpeg', active: true }))

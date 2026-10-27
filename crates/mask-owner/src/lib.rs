@@ -1,6 +1,6 @@
 //! Library crate: packet codec and the owner/guard lifecycle.
 //!
-//! Wire format (see docs/player-platform-survey.md): 76-byte packets,
+//! Wire format (see HARDWARE.md): 76-byte packets,
 //! `+0 u16 event` (0x45 request, 0xa9 ack), `+2 src`, `+3 dst`,
 //! `+4 u32 sender sequence`, `+8 u32 payload length`, `+12 u32 bitmap`.
 

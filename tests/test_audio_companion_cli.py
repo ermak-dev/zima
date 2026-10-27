@@ -5,7 +5,7 @@ from pathlib import Path
 import sys,tempfile,unittest
 from unittest.mock import patch
 
-ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'ros2'))
+ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'python'))
 
 
 class CompanionCliTests(unittest.TestCase):
@@ -15,7 +15,7 @@ class CompanionCliTests(unittest.TestCase):
   spec=importlib.util.spec_from_file_location('companion_cli_test',ROOT/'bin/audio/cli.py')
   self.cli=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.cli)
 
- def test_normal_run_is_separate_and_companion_passes_explicit_experimental_flag(self):
+ def test_normal_run_is_separate_and_companion_owns_the_session(self):
   events=[];calls=[]
   class Process:
    pid=123
@@ -28,9 +28,9 @@ class CompanionCliTests(unittest.TestCase):
    def check(self):pass
   def popen(args,**kwargs):events.append('child');calls.append(args);return Process()
   with patch('robot_audio.camera_session.CameraSSH'),patch('robot_audio.camera_session.CameraGainLease'),patch('robot_audio.camera_session.CameraSession',Session),patch('subprocess.Popen',popen):
-   code=self.cli.main(['companion','--config',str(self.config),'--experimental-wake','--max-seconds','60'])
+   code=self.cli.main(['companion','--config',str(self.config),'--max-seconds','60'])
   self.assertEqual(code,0);self.assertEqual(events,['enter','child','restore'])
-  self.assertTrue(calls[0]['explicit']);self.assertIn('--experimental-wake',calls[1])
+  self.assertTrue(calls[0]['explicit']);self.assertNotIn('--experimental-wake',calls[1])
 
  def test_session_failure_stops_child_before_restoring_camera(self):
   from robot_audio.camera_session import CameraSessionError

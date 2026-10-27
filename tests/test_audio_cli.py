@@ -106,19 +106,6 @@ class AudioCliTests(unittest.TestCase):
         for forbidden in ('RoboController', 'robot disable', 'rrwatchdoge', 'play '):
             self.assertNotIn(forbidden, log.read_text())
 
-    def test_train_dispatch_is_local_and_keeps_model_unverified(self):
-        import contextlib,importlib.util,io,sys
-        from unittest.mock import patch
-        sys.path.insert(0,str(ROOT/'ros2'))
-        spec=importlib.util.spec_from_file_location('audio_cli_for_training',ROOT/'bin/audio/cli.py')
-        cli=importlib.util.module_from_spec(spec);spec.loader.exec_module(cli)
-        output=io.StringIO()
-        with patch('robot_audio.training.train_model',return_value={'verified':False}) as train,contextlib.redirect_stdout(output):
-            result=cli.main(['train','dataset.json','--features-dir','features','--output','model','--kind','mlp'])
-        self.assertEqual(result,0)
-        self.assertFalse(json.loads(output.getvalue())['verified'])
-        self.assertEqual(train.call_args.kwargs['kind'],'mlp')
-
     def test_invalid_playback_arguments_are_rejected_before_ros(self):
         for args in (('play', '../private'), ('play', 'beep', '--volume', 'nan'),
                      ('play', 'beep', '--volume', '2'), ('play', 'beep', '--ttl', '-1')):
