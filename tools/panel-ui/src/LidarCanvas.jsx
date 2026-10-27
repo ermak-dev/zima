@@ -1,15 +1,87 @@
 import { useEffect, useRef } from 'react'
 
+// Decode the adapter's CSV occupancy string ("50,-1,0,...") into per-cell
+// occupancy percent; unknown cells (-1) become 255.
+export function parseGrid(cells, w, h) {
+  const out = new Uint8Array(w * h)
+  if (typeof cells !== 'string') return out
+  const parts = cells.split(',')
+  const n = Math.min(parts.length, w * h)
+  for (let i = 0; i < n; i++) {
+    const v = Number(parts[i])
+    out[i] = Number.isFinite(v) && v >= 0 ? Math.min(100, Math.max(0, v)) : 255
+  }
+  return out
+}
+
+const WALL_RGBA = [34, 52, 70, 235]
+const FREE_RGBA = [42, 120, 214, 60]
+
+// Color of one occupancy cell; null keeps it transparent (unknown or not
+// yet decided either way).
+export function cellRGBA(occ) {
+  if (occ === 255) return null
+  if (occ >= 65) return WALL_RGBA
+  if (occ <= 35) return FREE_RGBA
+  return null
+}
+
+// Canvas affine [a,b,c,d,e,f] taking grid image pixels (u right, v down,
+// row 0 = highest y) through the map frame into base_link (inverse SLAM
+// pose) and onto the screen used by `at()`.
+export function gridTransform(grid, pose, { W, H, k, ox, oy }) {
+  const c = Math.cos(pose.yaw), s = Math.sin(pose.yaw)
+  const res = grid.res
+  const X0 = grid.x_min - pose.x
+  const Y0 = grid.y_min + grid.h * res - pose.y
+  return [
+    k * c * res,
+    k * s * res,
+    -k * s * res,
+    k * c * res,
+    W / 2 - ox * k + k * (c * X0 + s * Y0),
+    H / 2 + oy * k - k * (-s * X0 + c * Y0),
+  ]
+}
+
+// Rasterize the grid once per distinct payload; redraws only re-project it.
+function gridImage(cache, m) {
+  if (cache.cells === m.cells && cache.w === m.w && cache.h === m.h) return cache.image
+  cache.cells = m.cells
+  cache.w = m.w
+  cache.h = m.h
+  cache.image = null
+  const w = m.w | 0, h = m.h | 0
+  const image = w && h ? document.createElement('canvas') : null
+  const ictx = image?.getContext('2d')
+  if (!ictx) return null
+  image.width = w
+  image.height = h
+  const occ = parseGrid(m.cells, w, h)
+  const data = ictx.createImageData(w, h)
+  for (let j = 0; j < h; j++) {
+    const row = (h - 1 - j) * w
+    for (let i = 0; i < w; i++) {
+      const rgba = cellRGBA(occ[j * w + i])
+      if (rgba) data.data.set(rgba, (row + i) * 4)
+    }
+  }
+  ictx.putImageData(data, 0, 0)
+  cache.image = image
+  return image
+}
+
 // The canvas is an imperative island: React never renders into it. The
 // backing buffer is sized only when the element resizes (not on every
 // frame), and redraws happen on data/interaction, not on a fixed timer.
-export default function LidarCanvas({ scan, view, onView }) {
+export default function LidarCanvas({ scan, view, onView, slam }) {
   const canvasRef = useRef(null)
   const stateRef = useRef({})
-  stateRef.current = { scan, view, onView }
+  stateRef.current = { scan, view, onView, slam }
   const scheduleRef = useRef(null)
+  const gridCacheRef = useRef({})
 
-  useEffect(() => { scheduleRef.current?.() }, [scan, view])
+  useEffect(() => { scheduleRef.current?.() }, [scan, view, slam])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -57,6 +129,22 @@ export default function LidarCanvas({ scan, view, onView }) {
       ctx.fillStyle = '#576b7c'
       ctx.font = '11px system-ui'
       ctx.fillText(`${step} м`, W - 44, H - 12)
+
+      // SLAM occupancy grid under the live scan. The view is robot-centred,
+      // so the map is projected through the inverse of the SLAM pose; without
+      // a pose there is no consistent place to draw it.
+      const map = s.slam?.map, pose = s.slam?.pose
+      if (map?.cells && pose && [pose.x, pose.y, pose.yaw].every(Number.isFinite)) {
+        const image = gridImage(gridCacheRef.current, map)
+        if (image) {
+          const [a, b, c, d, e, f] = gridTransform(map, pose, { W, H, k, ox, oy })
+          ctx.save()
+          ctx.setTransform(dpr * a, dpr * b, dpr * c, dpr * d, dpr * e, dpr * f)
+          ctx.imageSmoothingEnabled = false
+          ctx.drawImage(image, 0, 0)
+          ctx.restore()
+        }
+      }
 
       // Points already include the static lidar mount correction.
       if (s.scan?.frame === 'base_link') {

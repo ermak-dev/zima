@@ -3,6 +3,7 @@ import usePanelSocket from './usePanelSocket.js'
 import useMjpeg from './useMjpeg.js'
 import useTeleop from './useTeleop.js'
 import LidarCanvas from './LidarCanvas.jsx'
+import SlamStatus from './SlamStatus.jsx'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
 const pair = (range, voltage) => {
@@ -119,13 +120,14 @@ export default function App() {
           </div>
           {!collapsed.lidar && (
             <div className="lidar-stage">
-              <LidarCanvas scan={scan} view={view} onView={setView} />
+              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} />
               <div className="legend">
                 <span><i className="dot" />Скан лидара</span>
                 <span><i className="robot-dot" />Робот · начало координат</span>
               </div>
             </div>
           )}
+          <SlamStatus slam={state.slam} />
           <div className="pose" id="odom" aria-label="Одометрия">
             <span>x <b id="pose-x">{Number.isFinite(odom.x) ? `${fmt(odom.x)} м` : '—'}</b></span>
             <span>y <b id="pose-y">{Number.isFinite(odom.y) ? `${fmt(odom.y)} м` : '—'}</b></span>
