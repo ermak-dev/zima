@@ -45,8 +45,8 @@ use player_bridge::{
 
 /// A decoded Player message handed from the reader thread to the ROS loop.
 enum BridgeEvent {
-    Scan(LaserScanAngle),
-    Odom(Position2dState),
+    Scan(LaserScanAngle, Time),
+    Odom(Position2dState, Time),
     /// Bumper segments pressed, on change only.
     Bumper(Vec<bool>),
     /// An ir array frame tagged with its Player index.
@@ -202,6 +202,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            let receive_clock = Clock::system();
+            let mut player_clock = player_bridge::timing::PlayerClock::default();
             loop {
                 // Between reads (Player streams odometry at 20+ Hz). The
                 // bumper back-off owns the drive while it runs; otherwise
@@ -215,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     client.send_velocity(0, vx, vyaw, 1)?;
                 }
                 let msg = client.read_message()?;
+                let mut received = receive_clock.now();
                 match (
                     msg.header.msg_type,
                     msg.header.addr.interf,
@@ -226,13 +229,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // conversion to a ROS LaserScan happens on the
                         // ROS side (see the Scan arm below).
                         let scan = decode_laser_scanangle(&msg.payload)?;
-                        if tx.send(BridgeEvent::Scan(scan)).is_err() {
+                        received.nsec = player_clock.map(msg.header.timestamp, received.nsec);
+                        if tx.send(BridgeEvent::Scan(scan, received)).is_err() {
                             return Ok(()); // ROS side went away
                         }
                     }
                     (MSGTYPE_DATA, POSITION2D_CODE, POSITION2D_DATA_STATE) => {
                         let state = decode_position2d(&msg.payload)?;
-                        if tx.send(BridgeEvent::Odom(state)).is_err() {
+                        received.nsec = player_clock.map(msg.header.timestamp, received.nsec);
+                        if tx.send(BridgeEvent::Odom(state, received)).is_err() {
                             return Ok(());
                         }
                     }
@@ -374,17 +379,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         loop {
             match rx.try_recv() {
-                Ok(BridgeEvent::Scan(scan)) => {
+                Ok(BridgeEvent::Scan(scan, measured)) => {
                     // Vendor per-beam bearings -> uniform ascending grid,
                     // with range_min that marks empty (0.0) and turret
                     // beams invalid (see player_bridge::scan).
-                    let grid = uniform_scan(&scan);
+                    let grid = match uniform_scan(&scan) {
+                        Ok(grid) => grid,
+                        Err(reason) => {
+                            log_warn!(node.logger(), "dropping laser scan: {}", reason);
+                            continue;
+                        }
+                    };
                     let mut ros_scan = LaserScan::default();
-                    // Stamp at local receive time: the Player scan carries
-                    // no portable timestamp, and an unstamped message is
-                    // unusable for TF-synced consumers (SLAM drops it).
-                    // The stamp then honestly reflects the data's age.
-                    if let Ok(stamp) = clock.now().to_ros_msg() {
+                    if let Ok(stamp) = measured.to_ros_msg() {
                         ros_scan.header.stamp = stamp;
                     }
                     ros_scan.header.frame_id = laser_frame.clone();
@@ -404,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     msg.data = pressed.iter().any(|&p| p);
                     let _ = bumper_pub.publish(&msg);
                 }
-                Ok(BridgeEvent::Odom(state)) => {
+                Ok(BridgeEvent::Odom(state, measured)) => {
                     let stalled = {
                         let mut sd = stall_reader.lock().unwrap();
                         sd.update(
@@ -425,7 +432,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut odom = Odometry::default();
                     odom.header.frame_id = odom_frame.clone();
                     odom.child_frame_id = "base_link".into();
-                    if let Ok(stamp) = clock.now().to_ros_msg() {
+                    if let Ok(stamp) = measured.to_ros_msg() {
                         odom.header.stamp = stamp;
                     }
                     odom.pose.pose.position.x = state.x;

@@ -19,6 +19,7 @@ pub mod bumper;
 pub mod drive;
 pub mod scan;
 pub mod sensors;
+pub mod timing;
 
 pub use bumper::{decode_bumper, BumperState, BUMPER_CODE, BUMPER_DATA_STATE};
 pub use sensors::{
