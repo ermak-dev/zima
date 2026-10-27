@@ -79,6 +79,14 @@ exit 0
         return subprocess.run([str(ROOT / 'bin/robot'), *args], env=self.env | overrides,
                               capture_output=True, text=True, timeout=10)
 
+    def test_slam_adapter_flag_reaches_server(self):
+        self.executable('slam-adapter', '#!/bin/sh\nexit 0\n')
+        result = self.run_cli('run', '--slam-adapter', str(self.directory / 'slam-adapter'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        server = next(line for line in self.log.read_text().splitlines()
+                      if line.startswith('server:'))
+        self.assertIn('--slam-adapter', server)
+
     def test_run_panel_and_bridge_use_same_native_server_and_restore(self):
         for command in ('run', 'panel', 'bridge'):
             with self.subTest(command=command):

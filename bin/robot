@@ -339,19 +339,22 @@ case $cmd in
             *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
         esac ;;
     run|panel|bridge)
-        port=8085 listen=127.0.0.1 heartbeat_port=7665 timeout_ms=5000
+        port=8085 listen=127.0.0.1 heartbeat_port=7665 timeout_ms=5000 slam_adapter=
         while (( $# )); do
             case $1 in
-                --port|--listen|--heartbeat-port|--timeout-ms)
+                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter)
                     (( $# >= 2 )) || fail "missing value for $1"
                     case $1 in
                         --port) port=$2 ;;
                         --listen) listen=$2 ;;
                         --heartbeat-port) heartbeat_port=$2 ;;
                         --timeout-ms) timeout_ms=$2 ;;
+                        --slam-adapter)
+                            [[ -f $2 ]] || fail "--slam-adapter: $2 is not a file"
+                            slam_adapter=$2 ;;
                     esac
                     shift 2 ;;
-                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M]' ;;
+                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE]' ;;
             esac
         done
         for number in "$port" "$heartbeat_port"; do
@@ -380,8 +383,10 @@ case $cmd in
         supervisor_start "$heartbeat_port" "$timeout_ms"
         handoff=1
         controller_disable >&2
+        server_args=(--player-host "$host" --listen "$listen" --port "$port")
+        [[ -n $slam_adapter ]] && server_args+=(--slam-adapter "$slam_adapter")
         ROBOT_SERVER_HEARTBEAT="$host:$heartbeat_port" \
-            "$binary" --player-host "$host" --listen "$listen" --port "$port" &
+            "$binary" "${server_args[@]}" &
         server_pid=$!
         status=0
         wait "$server_pid" || status=$?
