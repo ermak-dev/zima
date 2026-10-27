@@ -7,14 +7,9 @@ publish = false
 # Zero dependencies by design: the Player wire-protocol subset (XDR
 # 40-byte header, banner handshake, device subscribe, laser scan and
 # position2d state payloads) is decoded by hand. This keeps the core
-# testable against a real local Player server and cross-buildable for
-# the robot exactly like mask-owner. The ROS 2 layer is a separate
-# concern layered on top (see docs/player-platform-survey.md).
+# testable against a local Player fake and cross-buildable for the robot
+# exactly like mask-owner. robot-server provides the HTTP/WebSocket layer.
 
 [lib]
 name = "player_bridge"
 path = "src/lib.rs"
-
-[[bin]]
-name = "player_to_ros2"
-path = "src/main.rs"

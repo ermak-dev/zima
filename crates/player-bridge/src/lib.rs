@@ -19,7 +19,6 @@ pub mod bumper;
 pub mod drive;
 pub mod scan;
 pub mod sensors;
-pub mod timing;
 
 pub use bumper::{decode_bumper, BumperState, BUMPER_CODE, BUMPER_DATA_STATE};
 pub use sensors::{
@@ -147,10 +146,6 @@ fn be32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
 }
 
-fn be16(buf: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes(buf[off..off + 2].try_into().unwrap())
-}
-
 fn bef64(buf: &[u8], off: usize) -> f64 {
     f64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
 }
@@ -161,10 +156,6 @@ fn bef32(buf: &[u8], off: usize) -> f32 {
 
 fn put32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
-}
-
-fn put16(buf: &mut [u8], off: usize, v: u16) {
-    buf[off..off + 2].copy_from_slice(&v.to_be_bytes());
 }
 
 fn putf64(buf: &mut [u8], off: usize, v: f64) {

@@ -1,7 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["player-bridge", "player_to_ros2", "mask-owner"]
-# The ROS node (player_to_ros2) requires a sourced ROS 2 environment
-# (ros-env resolves generated message crates from it), so plain
-# `cargo build` in this workspace only touches the ROS-free crates.
-default-members = ["player-bridge", "mask-owner"]
+members = ["player-bridge", "mask-owner", "robot-server"]
+default-members = ["player-bridge", "mask-owner", "robot-server"]

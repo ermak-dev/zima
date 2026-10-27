@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 // MJPEG in an <img> decodes every frame even when hidden, so the stream is
 // paused (src released) while the panel is collapsed and fully stopped on
@@ -7,7 +7,9 @@ import { useEffect, useRef, useState } from 'react'
 export default function useMjpeg({ url, active }) {
   const [status, setStatus] = useState('connecting')
   const [attempt, setAttempt] = useState(0)
-  const src = active ? `${url}${url.includes('?') ? '&' : '?'}t=${attempt}-${Date.now()}` : undefined
+  const src = useMemo(() => active
+    ? `${url}${url.includes('?') ? '&' : '?'}t=${attempt}-${Date.now()}`
+    : undefined, [url, active, attempt])
 
   useEffect(() => {
     if (!active) {

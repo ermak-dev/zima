@@ -21,7 +21,7 @@ export default function useTeleop(send) {
       const [axis, dir] = KEYS[code]
       cmd[axis] = dir * LIMITS[axis]
     }
-    sendRef.current({ type: 'cmd', ...cmd })
+    sendRef.current(cmd)
   }
 
   useEffect(() => {
@@ -36,7 +36,8 @@ export default function useTeleop(send) {
         publish()
         return
       }
-      if (!KEYS[event.code] || isTyping(event.target)) return
+      if (!KEYS[event.code] || (add && isTyping(event.target))) return
+      if (!add && !held.current.has(event.code)) return
       event.preventDefault()
       if (add) held.current.add(event.code)
       else held.current.delete(event.code)

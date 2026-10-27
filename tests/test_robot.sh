@@ -137,72 +137,9 @@ for args in 'mask' 'mask unknown' 'mask hold --mask zzz' 'mask hold --mask 1f8ff
 done
 [[ ! -s $tmp/log ]] || fail 'invalid mask commands contacted robot'
 
-# --- robot bridge: supervisor first, then disable, then the ROS node ---
-mkdir -p "$tmp/fake-ros"
-cat > "$tmp/fake-ros/ros2" <<'ROSEOF'
-#!/usr/bin/env bash
-printf 'ros2:%s\n' "$*" >> "$ROBOT_TEST_LOG"
-[[ ${ROBOT_BRIDGE_FAIL:-0} != 1 ]]
-ROSEOF
-chmod +x "$tmp/fake-ros/ros2"
-# a no-op ROS setup: source_ros must not pull the real distro (nor the
-# real workspace, whose shim would shadow the fake ros2) into the test
-export ROBOT_TEST_ROS_LOG="$tmp/ros-log"
-cat > "$tmp/fake-ros/setup.sh" <<'EOF'
-printf 'setup:ros\n' >> "$ROBOT_TEST_ROS_LOG"
-EOF
-cat > "$tmp/fake-ros/ws.sh" <<'EOF'
-printf 'setup:ws\n' >> "$ROBOT_TEST_ROS_LOG"
-EOF
-# Every bridge case must use fake ROS, including failure paths.
-export PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
-    ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh"
-: > "$tmp/log"
-PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
-    ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh" \
-    ROBOT_TEST_CONTROLLER_STATE=disabled "$root/bin/robot" bridge
-grep -q "supervisor:.*listen" "$tmp/log" || fail 'supervisor not started for bridge'
-# disable travels as a stdin heredoc: count the bash -s dispatch between
-# the supervisor start and the ros2 launch
-[[ $(awk '/supervisor:/{s=1} /ros2:run/{e=1} s && !e && /bash -s/{n++} END{print n+0}' "$tmp/log") -ge 1 ]] || fail 'controller not disabled for bridge'
-grep -q 'ros2:run player_to_ros2' "$tmp/log" || fail 'bridge node not launched'
-: > "$tmp/log"
-PATH="$tmp/fake-ros:$PATH" ROBOT_ROS_SETUP="$tmp/fake-ros/setup.sh" \
-    ROBOT_WS_SETUP="$tmp/fake-ros/ws.sh" ROBOT_BRIDGE_FAIL=1 \
-    ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
-: > "$tmp/log"
-# A busy heartbeat port (stale never-activated supervisor) must stop the
-# bridge before it touches the controller.
-ROBOT_TEST_PORT_BUSY=1 ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
-grep -q 'heartbeat port 7665 is busy' "$tmp/out" || fail 'busy heartbeat port not reported'
-if grep -q 'bash -s' "$tmp/log"; then fail 'bridge touched the controller despite a busy port'; fi
-: > "$tmp/log"
-# A stale never-activated supervisor from an aborted session is reaped
-# before a new one starts; an activated one refuses the new session.
-PATH="$tmp/fake-ros:$PATH" ROBOT_TEST_CONTROLLER_STATE=disabled \
-    "$root/bin/robot" bridge >/dev/null 2>&1 &
-bpid=$!
-sleep 2
-kill -TERM "$bpid" 2>/dev/null || true
-wait "$bpid" 2>/dev/null || true
-grep -q 'pkill:stale-supervisor' "$tmp/log" || fail 'stale supervisor not reaped before a new session'
-first_stale=$(grep -n 'pkill:stale-supervisor' "$tmp/log" | head -1 | cut -d: -f1)
-first_sup=$(grep -n 'supervisor:' "$tmp/log" | head -1 | cut -d: -f1)
-[[ -n $first_stale && -n $first_sup && $first_stale -lt $first_sup ]] \
-    || fail 'stale supervisor reaped after starting the new one'
-: > "$tmp/log"
-: > "$tmp/ros-log"
-ROBOT_TEST_SUPERVISOR_ACTIVE=1 ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
-grep -Fqx 'setup:ros' "$tmp/ros-log" || fail 'active supervisor case did not source fake ROS'
-grep -Fqx 'setup:ws' "$tmp/ros-log" || fail 'active supervisor case did not source fake workspace'
-grep -q 'refusing to start another' "$tmp/out" || fail "activated supervisor session not refused: $(cat "$tmp/out")"
-if grep -q 'pkill:stale-supervisor' "$tmp/log"; then fail 'an activated supervisor was killed as stale'; fi
-if grep -q 'controller disabled' "$tmp/out"; then fail 'controller was disabled despite an active session'; fi
-: > "$tmp/log"
-# ssh -G failing after printing the hostname: the bridge must surface the
-# error instead of dying silently under set -e pipefail.
-ROBOT_TEST_SSHG_RC=1 ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
-grep -q 'cannot resolve SSH host' "$tmp/out" || fail 'ssh -G failure not reported'
+# FEATURE: Native server session without external launch middleware.
+# SPEC: Preserve handoff, refusal, recovery and signal contracts on local fakes.
+python3 "$root/tests/test_robot_server.py"
 : > "$tmp/log"
 # A hanging robot must not hang the CLI: every ssh call is bounded by a
 # timeout, so `status` fails fast instead of blocking forever.
@@ -217,72 +154,6 @@ ROBOT_SSH="$tmp/bin/hang-ssh" ROBOT_SSH_TIMEOUT_S=3 expect_failure "$root/bin/ro
 elapsed=$((SECONDS - start))
 (( elapsed < 30 )) || fail "status hung for ${elapsed}s on an unreachable robot"
 : > "$tmp/log"
-# The bridge refuses to start next to the simulator (it would forward the
-# sim's Nav2 /cmd_vel to the real wheels) or a second bridge, before it
-# contacts the robot at all.
-for stray_cmd in 'ros2 launch nav2_bringup tb3_simulation_launch.py' 'player_to_ros2'; do
-    : > "$tmp/log"
-    setsid bash -c "exec -a '$stray_cmd' sleep 600" >/dev/null 2>&1 &
-    stray=$!
-    ROBOT_TEST_CONTROLLER_STATE=disabled expect_failure "$root/bin/robot" bridge
-    kill -TERM "$stray" 2>/dev/null || true
-    wait "$stray" 2>/dev/null || true
-    grep -q 'already running' "$tmp/out" || fail "bridge next to '$stray_cmd' not refused: $(cat "$tmp/out")"
-    [[ ! -s $tmp/log ]] || fail "bridge next to '$stray_cmd' contacted the robot"
-done
-: > "$tmp/log"
-for args in 'bridge extra' 'bridge --heartbeat-port' 'bridge --timeout-ms x'; do
-    read -r -a argv <<< "$args"
-    expect_failure "$root/bin/robot" "${argv[@]}"
-done
-[[ ! -s $tmp/log ]] || fail 'invalid bridge commands contacted robot'
-: > "$tmp/log"
-
-# --- robot run: dispatches the live RViz/teleop session wrapper ---
-cat > "$tmp/fake-run.sh" <<'RUNEOF'
-#!/usr/bin/env bash
-printf 'run-script:%s\n' "$*" >> "$ROBOT_TEST_LOG"
-[[ ${ROBOT_RUN_FAIL:-0} != 1 ]]
-RUNEOF
-cat > "$tmp/fake-sim.sh" <<'SIMEOF'
-#!/usr/bin/env bash
-printf 'sim-script:%s\n' "$*" >> "$ROBOT_TEST_LOG"
-[[ ${ROBOT_SIM_FAIL:-0} != 1 ]]
-SIMEOF
-chmod +x "$tmp/fake-run.sh" "$tmp/fake-sim.sh"
-"$root/bin/robot" --help >"$tmp/out"
-grep -q 'robot run' "$tmp/out" || fail 'help is missing robot run'
-grep -q -- '--sim' "$tmp/out" || fail 'help is missing --sim'
-grep -q -- '--slam' "$tmp/out" || fail 'help is missing --slam'
-: > "$tmp/log"
-ROBOT_RUN_SCRIPT="$tmp/fake-run.sh" "$root/bin/robot" run
-assert_log 'run-script:'
-ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" "$root/bin/robot" run --sim
-assert_log 'sim-script:'
-# --slam rides on the sim wrapper (map grows while driving), either order.
-: > "$tmp/log"
-ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" "$root/bin/robot" run --sim --slam
-assert_log 'sim-script:--slam'
-: > "$tmp/log"
-ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" "$root/bin/robot" run --slam --sim
-assert_log 'sim-script:--slam'
-# Live: the run wrapper drives Nav2 + SLAM on the robot.
-: > "$tmp/log"
-ROBOT_RUN_SCRIPT="$tmp/fake-run.sh" "$root/bin/robot" run --slam
-assert_log 'run-script:--slam'
-grep -q -- 'robot run --slam' <("$root/bin/robot" --help) || fail 'help is missing live --slam'
-[[ -f $root/scripts/run-sim.sh ]] || fail 'default sim wrapper scripts/run-sim.sh is missing'
-: > "$tmp/log"
-ROBOT_RUN_SCRIPT="$tmp/fake-run.sh" ROBOT_RUN_FAIL=1 expect_failure "$root/bin/robot" run
-ROBOT_SIM_SCRIPT="$tmp/fake-sim.sh" ROBOT_SIM_FAIL=1 expect_failure "$root/bin/robot" run --sim
-: > "$tmp/log"
-expect_failure "$root/bin/robot" run extra
-expect_failure "$root/bin/robot" run --sim extra
-ROBOT_RUN_SCRIPT="$tmp/nonexistent.sh" expect_failure "$root/bin/robot" run
-ROBOT_SIM_SCRIPT="$tmp/nonexistent.sh" expect_failure "$root/bin/robot" run --sim
-[[ ! -s $tmp/log ]] || fail 'invalid run command started a session'
-: > "$tmp/log"
-
 "$root/bin/robot" stop
 assert_log 'robotctl:192.0.2.82 stop'
 "$root/bin/robot" fan
@@ -395,41 +266,3 @@ rm "$tmp/fail-restart"
 [[ -e $ROBOT_TEST_STATE ]] || fail 'controller did not recover after retry'
 
 printf 'robot controller tests passed\n'
-
-# FEATURE: `robot panel` — the web control panel without manual ROS sourcing.
-# SPEC: source the ROS setup(s), then exec the panel node; a missing panel
-# script is a clear error; extra arguments are rejected.
-panel_cases() {
-    local log="$ROBOT_TEST_LOG"
-    # sources both setups and execs the node; the setups echo markers
-    mkdir -p "$tmp/ros"
-    printf 'echo sourced-ros\n' > "$tmp/ros/setup.sh"
-    printf 'echo sourced-ws\n' > "$tmp/ros-ws.sh"
-    env ROBOT_ROS_SETUP="$tmp/ros/setup.sh" ROBOT_WS_SETUP="$tmp/ros-ws.sh" \
-        ROBOT_PANEL_BIN="$tmp/fake-panel" \
-        bash "$root/bin/robot" panel >"$tmp/out" 2>&1
-    grep -q 'panel:exec' "$log" || fail 'panel node was not execed'
-    grep -q 'sourced-ros' "$tmp/out" || fail 'panel did not source ROS setup'
-    grep -q 'sourced-ws' "$tmp/out" || fail 'panel did not source the workspace setup'
-
-    # rejects extra arguments
-    if bash "$root/bin/robot" panel extra >/dev/null 2>&1; then
-        fail 'robot panel must reject extra arguments'
-    fi
-
-    # a missing panel script fails clearly
-    if env ROBOT_PANEL_BIN="$tmp/missing-panel" \
-        bash "$root/bin/robot" panel >"$tmp/out" 2>&1; then
-        fail 'missing panel script must fail'
-    fi
-    grep -q 'panel node not found' "$tmp/out" \
-        || fail "expected clear error, got: $(cat "$tmp/out")"
-    echo 'robot panel tests passed'
-}
-
-cat > "$tmp/fake-panel" <<'EOF'
-#!/usr/bin/env bash
-printf 'panel:exec %s\n' "$*" >> "$ROBOT_TEST_LOG"
-EOF
-chmod +x "$tmp/fake-panel"
-panel_cases

@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import usePanelSocket from './usePanelSocket.js'
 import useMjpeg from './useMjpeg.js'
-import useOccupancyMap from './useOccupancyMap.js'
 import useTeleop from './useTeleop.js'
-import MapCanvas from './MapCanvas.jsx'
+import LidarCanvas from './LidarCanvas.jsx'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
 const pair = (range, voltage) => {
@@ -29,50 +28,25 @@ function SensorRow({ id, name, value }) {
 export default function App() {
   const [state, setState] = useState({})
   const [scan, setScan] = useState({})
-  const [view, setView] = useState({ radius: 3, center: null, fitRequest: 0 })
-  const [showScan, setShowScan] = useState(true)
-  const [collapsed, setCollapsed] = useState({ map: false, camera: false, sensors: false })
+  const [view, setView] = useState({ radius: 3, center: null })
+  const [collapsed, setCollapsed] = useState({ lidar: false, camera: false, sensors: false })
   const [expanded, setExpanded] = useState(null)
-  const showScanRef = useRef(showScan)
-  showScanRef.current = showScan
-  const redrawRef = useRef(null)
 
   const onMessage = useCallback((msg) => {
     if (msg.type === 'state') setState(msg.data)
     else if (msg.type === 'scan') setScan(msg.data)
-    else if (msg.type === 'map') applyMapRef.current?.(msg.data)
   }, [])
   const { connected, send } = usePanelSocket(onMessage)
-
-  const { applyMap, bitmap, meta } = useOccupancyMap()
-  const applyMapRef = useRef(applyMap)
-  applyMapRef.current = applyMap
-
   const { stop } = useTeleop(send)
-  const cameraActive = !collapsed.camera && expanded !== 'map' && expanded !== 'sensors'
+  const cameraActive = !collapsed.camera && expanded !== 'lidar' && expanded !== 'sensors'
   const { status: camStatus, src: camSrc } = useMjpeg({ url: '/camera.mjpeg', active: cameraActive })
 
-  const fitMap = useCallback(() => {
-    setView((v) => ({ ...v, fitRequest: v.fitRequest + 1 }))
-  }, [])
-
-  // Redraw map data changes through the imperative handle.
-  const occupancy = meta ? { ...state.mapMetaExtra, ...stripImage(meta) } : null
-  const mapMeta = useMemo(() => ({ bitmap }), [bitmap])
-
+  // Odometry is telemetry only; the lidar view stays in the robot frame.
   const odom = state.odom || {}
-  const pose = occupancy
-    ? (state.map_pose?.frame === occupancy.frame ? state.map_pose : null)
-    : odom
   const sensors = state.sensors || {}
   const battery = sensors.battery
-  const mapAge = state.map_age_s
-  const message =
-    meta?.error ||
-    (!occupancy ? 'Ожидание карты /map · запустите SLAM'
-      : !pose ? 'Нет свежего TF карты → робот'
-        : mapAge > 5 ? `Нет обновлений карты ${Math.round(mapAge)} с` : '')
-  const frameLabel = occupancy?.frame || 'odom'
+  const batteryKnown = battery && (Number.isFinite(battery.percent) || Number.isFinite(battery.volts) || typeof battery.charging === 'boolean')
+  const batteryText = batteryKnown ? `${Number.isFinite(battery.percent) ? battery.percent : '—'}% / ${Number.isFinite(battery.volts) ? battery.volts : '—'} V${battery.charging === true ? ' · заряд' : ''}` : null
 
   const toggle = (id) => {
     setCollapsed((c) => ({ ...c, [id]: !c[id] }))
@@ -125,51 +99,37 @@ export default function App() {
           <svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="13" stroke="currentColor" strokeWidth="1.5" /><circle cx="12" cy="16" r="4" stroke="currentColor" strokeWidth="1.5" /><path d="M22 10v12M25 13v6" stroke="currentColor" strokeWidth="1.5" /></svg>
           Roborock<span className="meta">V1</span><small>Рабочая панель</small>
         </div>
-        <span id="connection" role="status">{connected ? 'Данные ROS' : 'Нет связи с панелью'}</span>
+        <span id="connection" role="status">{connected ? 'Связь с роботом' : 'Нет связи с панелью'}</span>
       </header>
-      <main id="workspace" data-expanded={expanded || ''}>
-        <section id="panel-map" className={`map${collapsed.map ? ' is-collapsed' : ''}${expanded === 'map' ? ' is-expanded' : ''}`} aria-labelledby="map-title">
+      <main id="workspace" data-expanded={expanded || ''}
+        data-lidar-collapsed={collapsed.lidar} data-camera-collapsed={collapsed.camera} data-sensors-collapsed={collapsed.sensors}>
+        <section id="panel-lidar" className={`lidar${collapsed.lidar ? ' is-collapsed' : ''}${expanded === 'lidar' ? ' is-expanded' : ''}`} aria-labelledby="lidar-title">
           <div className="heading">
-            <h1 id="map-title">Карта помещения</h1>
+            <h1 id="lidar-title">Лидар</h1>
             <div className="heading-end">
-              <span className="meta map-meta" title="Колесо мыши над картой меняет масштаб">
+              <span className="meta lidar-meta" title="Колесо мыши меняет масштаб">
                 <span className="zoom-hint">Колесо · </span><span id="scale-value">{fmt(view.radius, view.radius < 1 ? 2 : 1)} м</span>
-                <span className="frame-label"> · <span id="frame-label">{frameLabel}</span></span>
+                <span className="frame-label"> · <span id="frame-label">base_link</span></span>
               </span>
               <div className="panel-actions">
-                <button id="map-fit" type="button" title="Показать всю карту" onClick={fitMap}>Вся карта</button>
-                <button id="map-scan" type="button" aria-pressed={showScan} title="Показать или скрыть текущий скан"
-                  onClick={() => setShowScan((s) => !s)}>Скан</button>
-                {panelBtn('map', 'Карта')}
+                <button id="lidar-center" type="button" title="Вернуть обзор к роботу" onClick={() => setView({ radius: 3, center: null })}>К роботу</button>
+                {panelBtn('lidar', 'Лидар')}
               </div>
             </div>
           </div>
-          {!collapsed.map && (
-            <div className="map-stage">
-              <MapCanvas
-                occupancy={occupancy}
-                mapMeta={mapMeta}
-                pose={pose}
-                scan={showScan ? scan : { points: [] }}
-                odomFallback={odom}
-                showScan={showScan}
-                view={view}
-                onView={setView}
-                onFit={view.fitRequest}
-              />
-              <span id="map-message" role="status">{message}</span>
+          {!collapsed.lidar && (
+            <div className="lidar-stage">
+              <LidarCanvas scan={scan} view={view} onView={setView} />
               <div className="legend">
-                <span><i className="cell free" />Свободно</span>
-                <span><i className="cell occupied" />Стены</span>
-                <span><i className="cell unknown" />Неизвестно</span>
-                <span><i className="robot-dot" />Робот</span>
+                <span><i className="dot" />Скан лидара</span>
+                <span><i className="robot-dot" />Робот · начало координат</span>
               </div>
             </div>
           )}
-          <div className="pose" id="odom">
-            <span>x <b id="pose-x">{pose ? `${fmt(pose.x)} м` : '—'}</b></span>
-            <span>y <b id="pose-y">{pose ? `${fmt(pose.y)} м` : '—'}</b></span>
-            <span>θ <b id="pose-yaw">{pose && Number.isFinite(pose.yaw) ? `${fmt(pose.yaw * 180 / Math.PI)} °` : '—'}</b></span>
+          <div className="pose" id="odom" aria-label="Одометрия">
+            <span>x <b id="pose-x">{Number.isFinite(odom.x) ? `${fmt(odom.x)} м` : '—'}</b></span>
+            <span>y <b id="pose-y">{Number.isFinite(odom.y) ? `${fmt(odom.y)} м` : '—'}</b></span>
+            <span>θ <b id="pose-yaw">{Number.isFinite(odom.yaw) ? `${fmt(odom.yaw * 180 / Math.PI)} °` : '—'}</b></span>
             <span>v <b id="pose-v">{Number.isFinite(odom.vx) ? `${fmt(odom.vx)} м/с` : '—'}</b></span>
             <span>ω <b id="pose-w">{Number.isFinite(odom.yaw_rate) ? `${fmt(odom.yaw_rate)} рад/с` : '—'}</b></span>
           </div>
@@ -204,7 +164,7 @@ export default function App() {
             </div>
             {!collapsed.sensors && (
               <table className="sensor-table" aria-label="Все датчики шасси"><tbody>
-                <tr><td>Батарея</td><td id="battery" className={battery ? '' : 'missing'}>{battery ? `${battery.percent}% / ${battery.volts} V${battery.charging ? ' · заряд' : ''}` : 'нет данных'}</td></tr>
+                <tr><td>Батарея</td><td id="battery" className={batteryText === null ? 'missing' : ''}>{batteryText ?? 'нет данных'}</td></tr>
                 <tr><td>Бампер</td><td id="bumper" className={sensors.bumper === 'PRESSED' ? 'alert' : sensors.bumper ? '' : 'missing'}>{sensors.bumper ? (sensors.bumper === 'PRESSED' ? 'Нажат' : 'Свободен') : 'нет данных'}</td></tr>
                 <tr><td>Стена</td><td id="wall" className={pair(sensors.wall_ir, sensors.wall_voltages?.[0]) ? '' : 'missing'}>{pair(sensors.wall_ir, sensors.wall_voltages?.[0]) ?? 'нет данных'}</td></tr>
                 <tr className="group"><td colSpan="2">Обрыв · расстояние / напряжение</td></tr>
@@ -233,9 +193,4 @@ export default function App() {
       </footer>
     </>
   )
-}
-
-function stripImage(meta) {
-  const { image, ...rest } = meta || {}
-  return rest
 }
