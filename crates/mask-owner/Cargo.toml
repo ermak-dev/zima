@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Dependencies stay workspace-local only: player-bridge provides the XDR
-# velocity command used by the rollback path, keeping the ARM cross-build
-# fully static with no external crates (see tools/arm-lld.sh).
+# Dependencies stay workspace-local: player-bridge provides rollback XDR.
+# The legacy mask-owner musl build stays static; the single-ELF supervisor
+# uses GNU/glibc so its embedded C guard can load the robot's ALSA library.
+[features]
+audio-testing = []
+
 [dependencies]
 player-bridge = { path = "../player-bridge" }
 
