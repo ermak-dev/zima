@@ -1,0 +1,47 @@
+# Copy to etc/robot.toml and chmod 600 before use. Never commit that file.
+# Paths are relative to this file's directory. CLI > environment > TOML > defaults.
+[robot]
+ssh_host = "robot"
+player_host = "" # Empty: resolve the SSH alias for Player.
+player_port = 6665
+
+[server]
+listen = "127.0.0.1"
+port = 8085
+
+[supervisor]
+host = "" # Empty: use the resolved robot host.
+port = 7665
+timeout_ms = 5000
+listen = "0.0.0.0"
+binary = "../crates/target/armv7-unknown-linux-gnueabihf/release/robot-supervisor"
+# Generate a private random token before explicitly deploying with robot daemon start.
+token = ""
+
+[run]
+slam_adapter = "../tools/mrpt-adapter/adapter"
+yolo_adapter = "../tools/yolo/adapter"
+
+[camera]
+netrc = "~/.config/robot/camera.netrc"
+snapshot_url = "http://cam/image.jpg"
+mjpeg_url = "http://cam/mjpeg"
+audio_url = "http://cam/audio.opus"
+
+[audio]
+profile = "" # Optional legacy JSON profile; audio --config remains a JSON flag.
+# endpoint = "http://127.0.0.1:8085" # Optional remote API; otherwise follows [server].
+volume = 0.35
+max_volume = 0.9
+
+[yandex]
+# A key is not consent. Explicitly enable cloud TTS when desired.
+enabled = false
+api_key = ""
+url = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
+voice = "filipp"
+folder_id = ""
+
+[providers]
+# Only string *_api_key entries; exports ROBOT_PROVIDER_<UPPERCASE_KEY>.
+openrouter_api_key = ""

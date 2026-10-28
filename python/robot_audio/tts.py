@@ -62,6 +62,8 @@ class OpenRouterTTS:
     def _token(self):
         if self._api_key:
             token = self._api_key
+        elif os.environ.get('ROBOT_PROVIDER_OPENROUTER_API_KEY'):
+            token = os.environ['ROBOT_PROVIDER_OPENROUTER_API_KEY']
         elif self.token_file:
             try:
                 fd = os.open(Path(self.token_file).expanduser(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

@@ -7,6 +7,10 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin"
+# Never load workstation credentials in offline CLI tests.
+: > "$tmp/robot.toml"
+chmod 600 "$tmp/robot.toml"
+export ROBOT_CONFIG="$tmp/robot.toml"
 export ROBOT_SSH="$tmp/bin/ssh" ROBOT_TEST_LOG="$tmp/log" ROBOT_MASK_OWNER_BIN="$tmp/bin/mask-owner" ROBOT_ROBOTCTL_BIN="$tmp/bin/robotctl"
 cat > "$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash

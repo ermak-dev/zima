@@ -6,6 +6,7 @@
 # STATUS: DONE
 import fcntl
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,7 +26,11 @@ class ServerCliTests(unittest.TestCase):
         self.state = self.directory / 'state'
         self.state.write_text('enabled\n')
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('ROBOT_')}
-        self.env.update(ROBOT_TEST_LOG=str(self.log), ROBOT_TEST_STATE=str(self.state),
+        config = self.directory / 'robot.toml'
+        config.write_text('')
+        config.chmod(0o600)
+        self.env.update(ROBOT_CONFIG=str(config),
+                        ROBOT_TEST_LOG=str(self.log), ROBOT_TEST_STATE=str(self.state),
                         ROBOT_SESSION_LOCK=str(self.directory / 'session.lock'),
                         ROBOT_ROS_SETUP='/nonexistent/ros-setup',
                         ROBOT_WS_SETUP='/nonexistent/workspace')
@@ -47,9 +52,17 @@ fi
 if [[ "$*" == 'robot bash -s' ]]; then
     script=$(cat)
     case "$script" in
-        *ROBOT_STALE_SUPERVISOR*)
-            echo stale-check >> "$ROBOT_TEST_LOG"
-            [[ ${SUPERVISOR_ACTIVE:-0} == 0 ]] || { echo 'refusing to start another' >&2; exit 1; } ;;
+        *ROBOT_SUPERVISOR_START*)
+            echo supervisor >> "$ROBOT_TEST_LOG"
+            [[ ${SUPERVISOR_ACTIVE:-0} == 0 && ${SUPERVISOR_BUSY:-0} == 0 ]] || { echo 'refusing to use busy or unavailable supervisor' >&2; exit 2; }
+            [[ ${SUPERVISOR_FOREIGN:-0} == 0 ]] || exit 4
+            if [[ $script == *mode=check* && ${SUPERVISOR_MISSING:-0} == 1 ]]; then exit 3; fi
+            if [[ $script == *mode=auto* || $script == *mode=start* ]]; then
+                echo supervisor-start >> "$ROBOT_TEST_LOG"
+                [[ ${FAIL_SUPERVISOR_START:-0} == 0 ]] || exit 1
+            elif [[ ${SUPERVISOR_MISSING:-0} == 1 ]]; then
+                exit 3
+            fi ;;
         *ROBOT_DISABLE_CONTROLLER*)
             echo disable >> "$ROBOT_TEST_LOG"
             echo disabled > "$ROBOT_TEST_STATE"
@@ -63,6 +76,8 @@ elif [[ "$*" == *'robot-supervisor listen'* ]]; then
     echo supervisor >> "$ROBOT_TEST_LOG"
     [[ ${SUPERVISOR_BUSY:-0} == 0 ]] || { echo 'Address already in use' >&2; exit 1; }
 elif [[ "$*" == *'cat > '* ]]; then
+    echo upload >> "$ROBOT_TEST_LOG"
+    [[ ${FAIL_UPLOAD:-0} == 0 ]] || exit 1
     cat >/dev/null
 fi
 exit 0
@@ -99,6 +114,9 @@ exit 0
         cli = repo / 'bin/robot'
         cli.write_text((ROOT / 'bin/robot').read_text())
         cli.chmod(0o700)
+        shutil.copy2(ROOT / 'bin/config.py', repo / 'bin/config.py')
+        (repo / 'python').mkdir()
+        shutil.copy2(ROOT / 'python/robot_config.py', repo / 'python/robot_config.py')
         env = self.env.copy()
         env.pop('ROBOT_SLAM_ADAPTER')
         result = subprocess.run([str(cli), 'run'], env=env,
@@ -160,6 +178,9 @@ exit 0
         cli = repo / 'bin/robot'
         cli.write_text((ROOT / 'bin/robot').read_text())
         cli.chmod(0o700)
+        shutil.copy2(ROOT / 'bin/config.py', repo / 'bin/config.py')
+        (repo / 'python').mkdir()
+        shutil.copy2(ROOT / 'python/robot_config.py', repo / 'python/robot_config.py')
         env = self.env.copy()
         env.pop('ROBOT_YOLO_ADAPTER')
         result = subprocess.run([str(cli), 'run'], env=env,
@@ -257,6 +278,55 @@ exit 0
         self.assertIn('already running', result.stderr)
         self.assertEqual(self.log.read_text(), '')
 
+    # BUG: robot run lost its automatic supervisor bootstrap after adding TTS.
+    # HYPOTHESIS: run selects probe-only mode and requires a separate daemon command.
+    # SOLUTION: probe first; only an absent listener permits automatic deployment/start.
+    # RESULT: FIXED — bootstrap precedes handoff; reuse and foreign-session refusal are preserved.
+    # STATUS: FIXED
+    def test_run_bootstraps_missing_supervisor_before_controller_handoff(self):
+        for command in ('run', 'panel', 'bridge'):
+            with self.subTest(command=command):
+                self.log.write_text('')
+                result = self.run_cli(command, SUPERVISOR_MISSING='1')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = self.log.read_text().splitlines()
+                self.assertIn('upload', lines)
+                self.assertIn('supervisor-start', lines)
+                self.assertLess(lines.index('upload'), lines.index('supervisor-start'))
+                self.assertLess(lines.index('supervisor-start'), lines.index('disable'))
+                self.assertTrue(any(line.startswith('server:') for line in lines))
+                self.assertEqual(self.state.read_text().strip(), 'enabled')
+
+    def test_run_reuses_idle_supervisor_without_upload_or_local_binary(self):
+        result = self.run_cli('run', ROBOT_SUPERVISOR_BIN=str(self.directory / 'missing'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertLess(lines.index('supervisor'), lines.index('disable'))
+        self.assertNotIn('supervisor-start', lines)
+        self.assertNotIn('upload', lines[:lines.index('disable')])
+
+    def test_failed_bootstrap_never_changes_controller(self):
+        for override in ({'FAIL_UPLOAD':'1'}, {'FAIL_SUPERVISOR_START':'1'},
+                         {'ROBOT_SUPERVISOR_BIN':str(self.directory / 'missing')}):
+            with self.subTest(override=override):
+                self.log.write_text('')
+                result = self.run_cli('run', SUPERVISOR_MISSING='1', **override)
+                self.assertNotEqual(result.returncode, 0)
+                lines = self.log.read_text().splitlines()
+                self.assertNotIn('disable', lines)
+                self.assertNotIn('enable', lines)
+                self.assertFalse(any(line.startswith('server:') for line in lines))
+                self.assertEqual(self.state.read_text().strip(), 'enabled')
+
+    def test_foreign_supervisor_is_not_uploaded_over_or_used_for_handoff(self):
+        result = self.run_cli('run', SUPERVISOR_FOREIGN='1')
+        self.assertNotEqual(result.returncode, 0)
+        lines = self.log.read_text().splitlines()
+        self.assertNotIn('upload', lines)
+        self.assertNotIn('supervisor-start', lines)
+        self.assertNotIn('disable', lines)
+        self.assertNotIn('enable', lines)
+
     def test_supervisor_refusal_does_not_disable_or_restore_someone_elses_session(self):
         for flag in ('SUPERVISOR_ACTIVE', 'SUPERVISOR_BUSY'):
             with self.subTest(flag=flag):
@@ -267,6 +337,18 @@ exit 0
                 self.assertNotIn('disable', lines)
                 self.assertNotIn('enable', lines)
                 self.assertFalse(any(line.startswith('server:') for line in lines))
+
+    # FEATURE: Persistent-daemon liveness is not permission to steal a session.
+    # SPEC: A pre-existing disabled controller must not be disabled or restored.
+    def test_existing_controller_handoff_is_not_disturbed(self):
+        self.state.write_text('disabled\n')
+        result = self.run_cli('run')
+        self.assertNotEqual(result.returncode, 0)
+        lines = self.log.read_text().splitlines()
+        self.assertNotIn('disable', lines)
+        self.assertNotIn('enable', lines)
+        self.assertFalse(any(line.startswith('server:') for line in lines))
+        self.assertEqual(self.state.read_text(), 'disabled\n')
 
     def test_failed_disable_still_runs_controller_recovery(self):
         result = self.run_cli('run', FAIL_DISABLE='1')
@@ -299,10 +381,10 @@ exit 0
         self.assertEqual(self.state.read_text().strip(), 'enabled')
 
     def test_audio_dispatch_does_not_source_ros(self):
-        self.executable('python3', '#!/bin/sh\nprintf "python:%s\\n" "$*" >> "$ROBOT_TEST_LOG"\n')
-        result = self.run_cli('audio', 'status', PATH=str(self.directory) + ':' + self.env['PATH'])
+        audio = self.executable('audio', '#!/bin/sh\nprintf "audio:%s\\n" "$*" >> "$ROBOT_TEST_LOG"\n')
+        result = self.run_cli('audio', 'status', ROBOT_AUDIO_BIN=str(audio))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('bin/audio/cli.py status', self.log.read_text())
+        self.assertIn('audio:status', self.log.read_text())
 
 
 if __name__ == '__main__':

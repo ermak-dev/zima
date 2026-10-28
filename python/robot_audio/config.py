@@ -2,6 +2,7 @@
 import copy
 import json
 import math
+import os
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
@@ -131,10 +132,31 @@ def validate_config(patch):
 
 
 def load_config(path=None):
-    if path is None:
-        return default_config()
-    file = Path(path).expanduser()
-    if file.stat().st_size > 65536:
-        raise ValueError('audio configuration is too large')
-    with file.open(encoding='utf-8') as handle:
-        return validate_config(json.load(handle))
+    config = default_config()
+    settings = {
+        'ROBOT_CAMERA_AUDIO_URL': ('input', 'url', str),
+        'ROBOT_CAMERA_NETRC': ('input', 'netrc', str),
+        'ROBOT_SSH_HOST': ('output', 'host', str),
+        'ROBOT_AUDIO_VOLUME': ('output', 'volume', float),
+        'ROBOT_AUDIO_MAX_VOLUME': ('output', 'max_volume', float),
+    }
+    for name, (section, key, convert) in settings.items():
+        if name in os.environ:
+            try:
+                config[section][key] = convert(os.environ[name])
+            except ValueError:
+                raise ValueError(f'invalid {name}') from None
+    path = path or os.environ.get('ROBOT_AUDIO_CONFIG')
+    if path:
+        file = Path(path).expanduser()
+        if file.stat().st_size > 65536:
+            raise ValueError('audio configuration is too large')
+        with file.open(encoding='utf-8') as handle:
+            profile = json.load(handle)
+        if not isinstance(profile, dict):
+            raise ValueError('audio configuration must be an object')
+        for section, values in profile.items():
+            if section not in config or not isinstance(values, dict):
+                raise ValueError('invalid audio configuration section')
+            config[section].update(values)
+    return validate_config(config)

@@ -29,9 +29,9 @@ trap cleanup EXIT
 
 start=$(date +%s%3N)
 "${ROBOT_CURL:-curl}" --fail --silent --show-error --connect-timeout 2 --max-time 6 \
-    --max-filesize 5242880 --noproxy cam --proto '=http' \
+    --max-filesize 5242880 --noproxy '*' --proto '=http,https' \
     --netrc-file "$netrc" --header 'Cache-Control: no-cache' \
-    --output "$temp" http://cam/image.jpg || fail 'camera request failed (check connectivity and credentials)'
+    --output "$temp" "${ROBOT_CAMERA_SNAPSHOT_URL:-http://cam/image.jpg}" || fail 'camera request failed (check connectivity and credentials)'
 size=$(stat -c %s -- "$temp")
 (( size > 512 && size <= 5242880 )) || fail "invalid JPEG size: $size bytes"
 first=$(head -c 2 "$temp" | od -An -tx1 | tr -d ' \n')

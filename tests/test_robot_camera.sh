@@ -43,7 +43,7 @@ output="$tmp/output/frame.jpg"
 [[ $(stat -c %a "$output") == 600 ]] || fail 'JPEG permissions are not private'
 grep -Fq "$output" "$tmp/stdout" || fail 'output path was not reported'
 grep -q -- '--netrc-file' "$ROBOT_TEST_LOG" || fail 'netrc was not passed'
-grep -q -- '--noproxy cam' "$ROBOT_TEST_LOG" || fail 'camera traffic could use a proxy'
+grep -Fq -- '--noproxy *' "$ROBOT_TEST_LOG" || fail 'camera traffic could use a proxy'
 expect_failure "$command" "$output"
 
 rm "$output"; chmod 644 "$ROBOT_CAMERA_NETRC"

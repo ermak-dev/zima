@@ -1,22 +1,31 @@
 #!/usr/bin/env bash
 # Control the rooted vacuum through Player without starting cleaning.
+# Usage: robot [--config FILE] <command>  # private mode-0600 TOML; paths relative to FILE
+#        robot serve [--config FILE] [--port N] [--listen HOST]  # host HTTP/audio, no controller handoff
+#        robot daemon start [--config FILE]  # explicitly deploy/start persistent supervisor
 # Usage: robot enable|disable|status        # stock controller handoff
 #        robot position|fan|battery|stop   # battery: read-only power:0 JSON
 #        robot snapshot [output.jpg]
 #        robot record <output.wav> [--seconds N] [--gain 0..90]  # test WAV, no ROS
-#        robot say "text" [--yandex-env FILE]  # speak on the robot (no ROS)
+#        robot say "text" [--volume V]  # shared web TTS API; settings from TOML
 #        robot audio <command>   # capture, playback, speech (see audio --help)
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
 #        robot run [--port N] [--listen HOST] [--no-slam] [--no-yolo]  # MRPT + YOLO by default
-#                  [--slam-adapter EXE] [--yolo-adapter EXE]
+#                  [--slam-adapter EXE] [--yolo-adapter EXE] [--supervisor HOST:PORT]
 #        robot panel [--port N] [--listen HOST]  # alias for run (hands over controller)
 #        robot bridge [--port N] [--listen HOST] # alias for run
 #        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
 set -euo pipefail
 
+# Config values cross this boundary only as environment data, never shell code.
+if [[ ${_ROBOT_CONFIG_LOADED:-} != 1 && ${1:-} != --help && ${1:-} != -h && ${1:-} != help && ${1:-} != bug ]]; then
+    exec python3 "$(dirname "$(realpath "$0")")/config.py" "$@"
+fi
+unset _ROBOT_CONFIG_LOADED
 ssh_cmd=${ROBOT_SSH:-ssh}
+ssh_host=${ROBOT_SSH_HOST:-robot}
 
 # Wrap ssh with hard limits: a dead robot (or flaky Wi-Fi) must fail fast
 # instead of hanging a session (or its teardown) forever. Disable/enable
@@ -39,17 +48,23 @@ repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
 # <local_path> <remote_path>
 deploy_file() {
     local local_path=$1 remote_path=$2 remote_sha local_sha
-    ssh_wrap robot mkdir -p -- "$(dirname "$remote_path")" >&2
-    remote_sha=$(ssh_wrap robot "sha256sum $remote_path 2>/dev/null | cut -d' ' -f1") || true
+    ssh_wrap "$ssh_host" mkdir -p -- "$(dirname "$remote_path")" >&2
+    remote_sha=$(ssh_wrap "$ssh_host" "sha256sum $remote_path 2>/dev/null | cut -d' ' -f1") || true
     local_sha=$(sha256sum "$local_path" | cut -d' ' -f1)
     if [[ $remote_sha != "$local_sha" ]]; then
-        ssh_wrap robot "cat > $remote_path.tmp && chmod 700 $remote_path.tmp && mv $remote_path.tmp $remote_path" <"$local_path" >&2 \
+        ssh_wrap "$ssh_host" "for executable in /proc/[0-9]*/exe; do
+            if test \"\$executable\" -ef $remote_path; then
+                printf '%s\\n' 'robot: executable is in use; refusing to replace it' >&2
+                exit 1
+            fi
+        done
+        cat > $remote_path.tmp && chmod 700 $remote_path.tmp && mv $remote_path.tmp $remote_path" <"$local_path" >&2 \
             || fail "could not upload $(basename "$remote_path")"
     fi
 }
 
 controller_status() {
-    ssh_wrap robot bash -s <<'REMOTE'
+    ssh_wrap "$ssh_host" bash -s <<'REMOTE'
 set -e
 # ROBOT_STATUS_COMMANDS
 list=/opt/rockrobo/watchdog/ProcessList.conf
@@ -65,7 +80,7 @@ REMOTE
 }
 
 controller_disable() {
-    ssh_wrap robot bash -s <<'REMOTE'
+    ssh_wrap "$ssh_host" bash -s <<'REMOTE'
 set -euo pipefail
 # ROBOT_DISABLE_CONTROLLER
 list=${ROBOT_PROCESS_LIST:-/opt/rockrobo/watchdog/ProcessList.conf}
@@ -141,7 +156,7 @@ controller_enable() {
     # the script is idempotent and validates its own preconditions.
     # deploy_file's sha compare makes the common path one cheap ssh call.
     deploy_file "$(repo_root)/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh
-    ssh_wrap robot bash -s <<'REMOTE'
+    ssh_wrap "$ssh_host" bash -s <<'REMOTE'
 set -euo pipefail
 # ROBOT_ENABLE_CONTROLLER
 exec /tmp/mask-owner/controller-restore.sh
@@ -150,7 +165,7 @@ REMOTE
 
 robot_host() {
     local out
-    if ! out=$(ssh_wrap -G robot 2>/dev/null | awk '$1 == "hostname" { print $2 }'); then
+    if ! out=$(ssh_wrap -G "$ssh_host" 2>/dev/null | awk '$1 == "hostname" { print $2 }'); then
         fail 'cannot resolve SSH host robot (ssh -G failed)'
     fi
     [[ -n $out ]] || fail 'cannot resolve SSH host robot'
@@ -166,12 +181,13 @@ robotctl() {
         [[ -x $binary ]] || binary=$repo/crates/target/debug/robotctl
         [[ -x $binary ]] || fail 'robotctl binary is missing; build: (cd crates && cargo build --release)'
     fi
-    local host
-    host=$(robot_host)
+    local host=${ROBOT_PLAYER_HOST:-}
+    [[ -n $host ]] || host=$(robot_host)
     [[ -n $host ]] || fail 'cannot resolve SSH host robot'
+    export ROBOTCTL_PORT=${ROBOTCTL_PORT:-${ROBOT_PLAYER_PORT:-6665}}
     if [[ ${1:-} == move ]]; then
         local guard
-        guard=$(ssh_wrap robot bash -s <<'REMOTE'
+        guard=$(ssh_wrap "$ssh_host" bash -s <<'REMOTE'
 set -e
 marker=$(mktemp /tmp/robot-drive-guard.XXXXXX)
 nohup sh -c 'sleep 10; if test -f "$1"; then pkill -TERM -x player; rm -f "$1"; fi' robot-guard "$marker" </dev/null >/dev/null 2>&1 &
@@ -180,7 +196,7 @@ REMOTE
 )
         [[ $guard == /tmp/robot-drive-guard.* && $guard != *[!a-zA-Z0-9_./-]* ]] || fail 'could not arm on-robot stop guard'
         if "$binary" "$host" "$@"; then
-            ssh_wrap robot rm -f -- "$guard"
+            ssh_wrap "$ssh_host" rm -f -- "$guard"
         else
             echo 'robot: movement failed; on-robot guard will restart Player after 10 seconds' >&2
             return 1
@@ -203,51 +219,85 @@ mask_owner_remote() {
     printf '%s\n' "$remote"
 }
 
-# Deploy the ARM robot-supervisor binary and controller-restore script,
-# then start the supervisor listening for the bridge heartbeat. Prints
-# nothing; the supervisor log goes to stderr paths on the robot.
+supervisor_request() {
+    local port=$1 timeout_ms=$2 mode=$3
+    # %q assignments travel over SSH stdin. Neither token nor any derived
+    # credential is placed in SSH argv, logs, or a remote shell command string.
+    {
+        printf 'port=%q\ntimeout_ms=%q\nmode=%q\nlisten=%q\n' "$port" "$timeout_ms" "$mode" "${ROBOT_SUPERVISOR_LISTEN:-0.0.0.0}"
+        printf 'export ROBOT_SUPERVISOR_TOKEN=%q\n' "${ROBOT_SUPERVISOR_TOKEN:-}"
+        cat <<'REMOTE'
+set -euo pipefail
+# ROBOT_SUPERVISOR_START
+probe() {
+    # A separate bounded subshell avoids leaving a blocked socket on failures.
+    (
+        exec 3<>"/dev/tcp/127.0.0.1/$port" || exit 3
+        printf 'AUTH %s\n' "$ROBOT_SUPERVISOR_TOKEN" >&3 || exit 4
+        IFS= read -r -t 3 reply <&3 || exit 4
+        [[ $reply == AUTHENTICATED ]] || exit 4
+        printf 'PING\n' >&3 || exit 4
+        IFS= read -r -t 3 reply <&3 || exit 4
+        case $reply in
+            'PONG IDLE') exit 0 ;;
+            'PONG ACTIVE') exit 2 ;;
+            *) exit 4 ;;
+        esac
+    ) 2>/dev/null
+}
+if probe; then
+    exit 0
+else
+    status=$?
+    [[ $mode == check ]] && exit "$status"
+    if [[ $status == 2 ]]; then
+        [[ $mode == start ]] && exit 0
+        echo 'robot: supervisor has an active session; refusing to disturb it' >&2
+        exit 2
+    fi
+    [[ $status == 3 ]] || exit "$status"
+fi
+# Never kill or replace a daemon holding the port. Bind failure is authoritative.
+nohup /tmp/mask-owner/robot-supervisor listen --listen "$listen" --heartbeat-port "$port" --timeout-ms "$timeout_ms" >> /tmp/robot-supervisor.log 2>&1 < /dev/null &
+pid=$!
+for attempt in {1..30}; do
+    kill -0 "$pid" 2>/dev/null || { echo 'robot: supervisor failed to start' >&2; exit 1; }
+    if probe; then
+        exit 0
+    else
+        status=$?
+        if [[ $status == 2 ]]; then
+            [[ $mode == start ]] && exit 0
+            exit 2
+        fi
+    fi
+    sleep 0.1
+done
+echo 'robot: supervisor did not become ready' >&2
+exit 1
+REMOTE
+    } | ssh_wrap "$ssh_host" bash -s >&2
+}
+
 supervisor_start() {
-    local binary timeout_ms=${2:-5000} port=${1:-7665} repo
+    local port=${1:-7665} timeout_ms=${2:-5000} mode=${3:-auto} status
+    if supervisor_request "$port" "$timeout_ms" check; then
+        return
+    else
+        status=$?
+    fi
+    if [[ $status == 2 ]]; then
+        [[ $mode == start ]] && return
+        fail 'supervisor has an active session; controller was not changed'
+    fi
+    [[ $status == 3 ]] || fail 'cannot authenticate supervisor; controller was not changed'
+    local repo binary=${ROBOT_SUPERVISOR_BIN:-}
     repo=$(repo_root)
-    binary=${ROBOT_SUPERVISOR_BIN:-$repo/crates/target/armv7-unknown-linux-musleabihf/release/robot-supervisor}
-    [[ -x $binary ]] || fail 'robot-supervisor binary is missing; build: (cd crates && cargo build -p mask-owner --release --target armv7-unknown-linux-musleabihf)'
+    [[ -x $binary ]] || fail 'robot-supervisor binary is missing; build: tools/build-supervisor.sh'
     deploy_file "$binary" /tmp/mask-owner/robot-supervisor
     deploy_file "$repo/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh
-    # Reap a stale supervisor left by an aborted session: it holds the
-    # heartbeat port but never got ACTIVATE (no bridge ever connected), so
-    # it is sitting in accept() and is safe to kill. A supervisor with an
-    # activated session means a bridge is alive: refuse instead.
-    if ! ssh_wrap robot bash -s > >(cat >&2) <<'REMOTE'
-set -euo pipefail
-# ROBOT_STALE_SUPERVISOR
-if pgrep -f 'robot-supervisor listen' >/dev/null; then
-    if grep -q '\[supervisor\] activated' /tmp/robot-supervisor.log 2>/dev/null; then
-        echo 'robot: supervisor reports an activated session; refusing to start another' >&2
-        exit 1
-    fi
-    pkill -TERM -f 'robot-supervisor listen'
-    for i in $(seq 1 30); do
-        pgrep -f 'robot-supervisor listen' >/dev/null || break
-        sleep 1
-    done
-    if pgrep -f 'robot-supervisor listen' >/dev/null; then
-        echo 'robot: stale supervisor refused to die; refusing to continue' >&2
-        exit 1
-    fi
-fi
-REMOTE
-    then
-        fail 'cannot clear a previous supervisor on the robot'
-    fi
-    # Fresh log each session; the wrapper tails it on exit.
-    ssh_wrap robot ': > /tmp/robot-supervisor.log' >&2
-    # Start and confirm it stays up: a stale never-activated supervisor
-    # holding the port makes the new one exit immediately (the ssh wrapper
-    # itself succeeds, so the PID must be checked). Refuse before the
-    # controller is touched.
-    if ! ssh_wrap robot "nohup /tmp/mask-owner/robot-supervisor listen --heartbeat-port $port --timeout-ms $timeout_ms > /tmp/robot-supervisor.log 2>&1 < /dev/null & pid=\$!; sleep 1; kill -0 \$pid 2>/dev/null || { cat /tmp/robot-supervisor.log >&2; exit 1; }" >&2; then
-        fail "heartbeat port $port is busy on the robot; a stale supervisor may be left from an aborted session (kill it: ssh robot 'pkill -f robot-supervisor')"
-    fi
+    supervisor_request "$port" "$timeout_ms" "$mode" \
+        || fail 'cannot start authenticated supervisor; controller was not changed'
 }
 
 server_cleanup() {
@@ -293,7 +343,6 @@ case $cmd in
         if [[ -n ${ROBOT_AUDIO_BIN:-} ]]; then exec "$ROBOT_AUDIO_BIN" "$@"; fi
         exec python3 "$(repo_root)/bin/audio/cli.py" "$@" ;;
     say)
-        # Local or SpeechKit TTS through the playback helper; no ROS, no controller.
         exec python3 "$(repo_root)/bin/audio/say.py" "$@" ;;
     bug)
         exec "${ROBOT_BUG_BIN:-$(dirname "$(realpath "$0")")/bug}" "$@" ;;
@@ -331,26 +380,36 @@ case $cmd in
                 state=$(controller_status)
                 [[ $state == disabled ]] || fail 'stop the stock controller first: the mask owner must be the sole IPC party'
                 remote=$(mask_owner_remote)
-                ssh_wrap robot "$remote" hold --mask "$mask" --timeout "$timeout" ;;
+                ssh_wrap "$ssh_host" "$remote" hold --mask "$mask" --timeout "$timeout" ;;
             restore)
                 shift
                 (( $# == 0 )) || fail 'usage: robot mask restore'
                 remote=$(mask_owner_remote)
-                ssh_wrap robot "$remote" restore ;;
+                ssh_wrap "$ssh_host" "$remote" restore ;;
             *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
         esac ;;
-    run|panel|bridge)
-        port=8085 listen=127.0.0.1 heartbeat_port=7665 timeout_ms=5000
-        slam_adapter=${ROBOT_SLAM_ADAPTER:-$(repo_root)/tools/mrpt-adapter/adapter}
-        yolo_adapter=${ROBOT_YOLO_ADAPTER:-$(repo_root)/tools/yolo/adapter}
+    daemon)
+        [[ $# == 1 && $1 == start ]] || fail 'usage: robot daemon start [--config FILE]'
+        supervisor_start "${ROBOT_SUPERVISOR_PORT:-7665}" "${ROBOT_SUPERVISOR_TIMEOUT_MS:-5000}" start ;;
+    run|panel|bridge|serve)
+        port=${ROBOT_SERVER_PORT:-8085} listen=${ROBOT_SERVER_LISTEN:-127.0.0.1}
+        heartbeat_port=${ROBOT_SUPERVISOR_PORT:-7665} timeout_ms=${ROBOT_SUPERVISOR_TIMEOUT_MS:-5000}
+        supervisor_host=${ROBOT_SUPERVISOR_HOST:-}
+        slam_adapter=${ROBOT_SLAM_ADAPTER-$(repo_root)/tools/mrpt-adapter/adapter}
+        yolo_adapter=${ROBOT_YOLO_ADAPTER-$(repo_root)/tools/yolo/adapter}
+        if [[ $cmd == serve ]]; then slam_adapter=; yolo_adapter=; fi
         while (( $# )); do
             case $1 in
-                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter|--yolo-adapter)
+                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter|--yolo-adapter|--supervisor)
                     (( $# >= 2 )) || fail "missing value for $1"
                     case $1 in
                         --port) port=$2 ;;
                         --listen) listen=$2 ;;
                         --heartbeat-port) heartbeat_port=$2 ;;
+                        --supervisor)
+                            [[ $2 =~ ^([a-zA-Z0-9_.-]+|\[[a-fA-F0-9:]+\]):[0-9]+$ ]] || fail 'invalid supervisor address; expected HOST:PORT'
+                            supervisor_host=${2%:*}
+                            heartbeat_port=${2##*:} ;;
                         --timeout-ms) timeout_ms=$2 ;;
                         --yolo-adapter)
                             [[ -f $2 && -x $2 ]] || fail "YOLO adapter is missing or not executable: $2"
@@ -386,6 +445,12 @@ case $cmd in
         if [[ -n $yolo_adapter && ( ! -f $yolo_adapter || ! -x $yolo_adapter ) ]]; then
             fail "YOLO adapter is missing or not executable: $yolo_adapter; see tools/yolo/README.md or use --no-yolo"
         fi
+        if [[ $cmd == serve ]]; then
+            host=${supervisor_host:-${ROBOT_PLAYER_HOST:-}}
+            [[ -n $host ]] || host=$(robot_host)
+            export ROBOT_SUPERVISOR_ADDR="$host:$heartbeat_port"
+            exec "$binary" --audio-only --listen "$listen" --port "$port"
+        fi
         lock=${ROBOT_SESSION_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/robot-server-$UID.lock}
         exec 9>"$lock"
         flock -n 9 || fail 'a robot server session is already running on this host'
@@ -395,12 +460,14 @@ case $cmd in
         trap 'exit 130' INT
         trap 'exit 143' TERM
         supervisor_start "$heartbeat_port" "$timeout_ms"
+        [[ $(controller_status) == enabled ]] || fail 'controller already handed off; refusing to disturb another session'
         handoff=1
         controller_disable >&2
-        server_args=(--player-host "$host" --listen "$listen" --port "$port")
+        server_args=(--player-host "${ROBOT_PLAYER_HOST:-$host}" --player-port "${ROBOT_PLAYER_PORT:-6665}" --listen "$listen" --port "$port")
         [[ -n $slam_adapter ]] && server_args+=(--slam-adapter "$slam_adapter")
         [[ -n $yolo_adapter ]] && server_args+=(--yolo-adapter "$yolo_adapter")
-        ROBOT_SERVER_HEARTBEAT="$host:$heartbeat_port" \
+        export ROBOT_SUPERVISOR_ADDR="${supervisor_host:-$host}:$heartbeat_port"
+        ROBOT_SERVER_HEARTBEAT="$ROBOT_SUPERVISOR_ADDR" \
             "$binary" "${server_args[@]}" &
         server_pid=$!
         status=0
