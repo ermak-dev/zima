@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Stdlib launcher: exec SSH to a prepared YOLOE GPU worker (no camera access)."""
+import argparse
+import os
+from pathlib import Path
+import shlex
+import sys
+
+CONFIG_KEYS = ('YOLO_MODEL', 'YOLO_CLASSES', 'YOLO_CONF', 'YOLO_DEVICE')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        'Environment: YOLO_SSH_HOST=gpu, YOLO_REMOTE_DIR=robot-yolo (relative to '
+        'remote home, or absolute), YOLO_LOCAL=1 (use this Python and local worker), '
+        'YOLO_MODEL=yoloe-26l-seg.pt, YOLO_CLASSES=JSON list, YOLO_CONF=0.25, '
+        'YOLO_DEVICE=0. Requires explicit setup; never installs or downloads.'))
+    parser.parse_args()
+    if os.environ.get('YOLO_LOCAL') == '1':
+        worker = Path(__file__).resolve().with_name('worker.py')
+        os.execv(sys.executable, [sys.executable, str(worker), '--stdin'])
+    host = os.environ.get('YOLO_SSH_HOST', 'gpu')
+    directory = os.environ.get('YOLO_REMOTE_DIR', 'robot-yolo')
+    if not host or host.startswith('-') or any(c.isspace() for c in host):
+        parser.error('YOLO_SSH_HOST must be a non-option SSH host')
+    if not directory or '\x00' in directory:
+        parser.error('YOLO_REMOTE_DIR must not be empty')
+    if directory.startswith('~/'):
+        directory = directory[2:]
+    remote_dir = shlex.quote(directory) if directory.startswith('/') else '"$HOME"/' + shlex.quote(directory)
+    assignments = ' '.join(shlex.quote(key + '=' + os.environ[key])
+                           for key in CONFIG_KEYS if key in os.environ)
+    command = (f'cd {remote_dir} && exec env {assignments} '
+               './venv/bin/python worker.py --stdin')
+    # No Python transport buffering: stdin/stdout and EOF go directly to SSH.
+    os.execvp('ssh', ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
+                      '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2',
+                      '--', host, command])
+
+
+if __name__ == '__main__':
+    main()

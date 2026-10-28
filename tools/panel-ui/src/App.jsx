@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import usePanelSocket from './usePanelSocket.js'
 import useMjpeg from './useMjpeg.js'
-import useTeleop from './useTeleop.js'
+import useVision from './useVision.js'
+import VisionFrame from './VisionFrame.jsx'
+import useTeleop, { LIMITS as HARD_LIMITS, DEFAULT_LINEAR_SPEED } from './useTeleop.js'
 import LidarCanvas from './LidarCanvas.jsx'
 import SlamStatus from './SlamStatus.jsx'
+import ServiceChannels from './ServiceChannels.jsx'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
-// Hard server-side drive limits; the slider only scales commands down.
-const HARD_LIMITS = { v: 0.1, w: 0.4 }
 const SEGMENTS = [
   ['left', 'Левый'], ['front', 'Передний'], ['right', 'Правый'],
 ]
@@ -37,17 +38,30 @@ export default function App() {
   const [view, setView] = useState({ radius: 3, center: null })
   const [collapsed, setCollapsed] = useState({ lidar: false, camera: false, sensors: false })
   const [expanded, setExpanded] = useState(null)
+  const [visionEnabled, setVisionEnabled] = useState(false)
 
   const onMessage = useCallback((msg) => {
     if (msg.type === 'state') setState(msg.data)
     else if (msg.type === 'scan') setScan(msg.data)
+    else if (msg.type === 'vision' && typeof msg.data?.enabled === 'boolean') setVisionEnabled(msg.data.enabled)
   }, [])
   const { connected, send } = usePanelSocket(onMessage)
-  const [speed, setSpeed] = useState(HARD_LIMITS.v)
-  const linearLimit = Number.isFinite(speed) ? Math.min(Math.max(speed, 0.01), HARD_LIMITS.v) : HARD_LIMITS.v
-  const { stop } = useTeleop(send, linearLimit)
+  const [speed, setSpeed] = useState(DEFAULT_LINEAR_SPEED)
+  const linearLimit = Number.isFinite(speed) ? Math.min(Math.max(speed, 0.01), HARD_LIMITS.v) : DEFAULT_LINEAR_SPEED
+  const [turnSpeed, setTurnSpeed] = useState(HARD_LIMITS.w)
+  const angularLimit = Number.isFinite(turnSpeed) ? Math.min(Math.max(turnSpeed, 0.01), HARD_LIMITS.w) : HARD_LIMITS.w
+  const { stop } = useTeleop(send, linearLimit, angularLimit)
   const cameraActive = !collapsed.camera && expanded !== 'lidar' && expanded !== 'sensors'
-  const { status: camStatus, src: camSrc } = useMjpeg({ url: '/camera.mjpeg', active: cameraActive })
+  const { status: rawStatus, src: camSrc } = useMjpeg({ url: '/camera.mjpeg', active: cameraActive && !visionEnabled })
+  const vision = useVision(cameraActive && visionEnabled)
+  const camStatus = visionEnabled ? vision.status : rawStatus
+  const visionStatus = {
+    off: 'Панель скрыта', connecting: 'Подключение', loading: 'Загрузка модели',
+    live: 'Прямой поток', error: 'Ошибка', stale: 'Нет свежих кадров', disconnected: 'Нет связи · переподключение',
+  }[vision.status]
+  const camStatusText = visionEnabled
+    ? `YOLO · ${visionStatus}${camStatus === 'live' && Number.isFinite(vision.frame?.inference_ms) ? ` · ${Math.round(vision.frame.inference_ms)} мс` : ''}`
+    : camStatus === 'live' ? 'Прямой поток' : camStatus === 'off' ? 'Панель свёрнута' : camStatus === 'retrying' ? 'Нет потока' : 'Подключение'
 
   // Odometry is telemetry only; the lidar view stays in the robot frame.
   const odom = state.odom || {}
@@ -148,16 +162,17 @@ export default function App() {
             <div className="heading">
               <h2 id="camera-title">Камера</h2>
               <div className="heading-end">
-                <span id="cam-status">{camStatus === 'live' ? 'Прямой поток' : camStatus === 'off' ? 'Панель свёрнута' : camStatus === 'retrying' ? 'Нет потока' : 'Подключение'}</span>
+                <span id="cam-status">{camStatusText}</span>
                 <div className="panel-actions">{panelBtn('camera', 'Камера')}</div>
               </div>
             </div>
             {!collapsed.camera && (
               <div className="camera-stage">
                 <div id="cam-off" role="status" hidden={camStatus === 'live'}>
-                  {camStatus === 'retrying' ? 'Камера недоступна. Повторное подключение…' : 'Подключение к камере…'}
+                  {visionEnabled ? (vision.error || camStatusText) : camStatus === 'retrying' ? 'Камера недоступна. Повторное подключение…' : 'Подключение к камере…'}
                 </div>
-                {camStatus !== 'off' && (
+                {visionEnabled && vision.frame && <VisionFrame frame={vision.frame} />}
+                {!visionEnabled && camStatus !== 'off' && (
                   <img id="cam" alt="Прямой поток с камеры робота" src={camSrc} />
                 )}
               </div>
@@ -174,6 +189,7 @@ export default function App() {
             {!collapsed.sensors && (
               <table className="sensor-table" aria-label="Все датчики шасси"><tbody>
                 <tr><td>Батарея</td><td id="battery" className={batteryText === null ? 'missing' : ''}>{batteryText ?? 'нет данных'}</td></tr>
+                <tr><td>Док</td><td id="dock" className={typeof sensors.dock === 'boolean' ? '' : 'missing'}>{typeof sensors.dock === 'boolean' ? (sensors.dock ? 'На доке' : 'Вне дока') : 'нет данных'}</td></tr>
                 <tr><td>Бампер</td><td id="bumper" className={sensors.bumper === 'PRESSED' ? 'alert' : sensors.bumper ? '' : 'missing'}>{sensors.bumper ? (sensors.bumper === 'PRESSED' ? 'Нажат' : 'Свободен') : 'нет данных'}</td></tr>
                 {SEGMENTS.map(([id, name], i) => {
                   const seg = Array.isArray(sensors.bumper_segments) ? sensors.bumper_segments[i] : undefined
@@ -192,11 +208,15 @@ export default function App() {
                   const v = pair(sensors.drop_ranges?.[i], sensors.drop_ir?.[i])
                   return <SensorRow key={i} id={`drop-${i}`} name={`ИК ${i + 1}`} value={reading(v, '')} />
                 })}
+                <tr><td>Компас</td><td id="compass" className={Number.isFinite(sensors.compass?.yaw) ? '' : 'missing'}>
+                  {Number.isFinite(sensors.compass?.yaw) ? `${fmt(sensors.compass.yaw, 3)} рад · ${fmt(sensors.compass.yaw * 180 / Math.PI, 1)}°` : 'нет данных'}
+                </td></tr>
                 <tr><td>Сонар</td><td id="sonar" className={Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? 'alert' : '') : 'missing'}>
                   {Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? '65.534 м · sentinel' : `${fmt(sensors.sonar, 3)} м`) : 'нет данных'}
                 </td></tr>
               </tbody></table>
             )}
+            {!collapsed.sensors && <ServiceChannels channels={sensors.service_channels} />}
             {!collapsed.sensors && <p className="sensor-note">Нули ИК — сырые показания, не признак безопасности. 65.534 м сонара — вероятный sentinel, не дистанция.</p>}
           </section>
         </aside>
@@ -205,11 +225,16 @@ export default function App() {
         <span><kbd>W A S D</kbd> / <kbd>↑ ← ↓ →</kbd> удерживать</span>
         <label className="speed" htmlFor="speed-slider" title="Ограничение линейной скорости ручного управления">
           <span>Скорость <b id="speed-value">{`${linearLimit.toFixed(2)} м/с`}</b></span>
-          <input id="speed-slider" type="range" min="0.01" max="0.1" step="0.01" value={linearLimit}
+          <input id="speed-slider" type="range" min="0.01" max={HARD_LIMITS.v} step="0.01" value={linearLimit}
             onChange={(e) => setSpeed(Number(e.target.value))} />
         </label>
+        <label className="speed" htmlFor="turn-speed-slider" title="Ограничение скорости поворота ручного управления">
+          <span>Поворот <b id="turn-speed-value">{`${angularLimit.toFixed(2)} рад/с`}</b></span>
+          <input id="turn-speed-slider" type="range" min="0.01" max={HARD_LIMITS.w} step="0.01" value={angularLimit}
+            onChange={(e) => setTurnSpeed(Number(e.target.value))} />
+        </label>
         <button id="stop" type="button" onClick={stop}>Стоп · Space</button>
-        <span className="limits">≤ 0.1 м/с &nbsp; ≤ 0.4 рад/с</span>
+        <span className="limits">≤ {HARD_LIMITS.v} м/с &nbsp; ≤ {HARD_LIMITS.w} рад/с</span>
       </footer>
     </>
   )

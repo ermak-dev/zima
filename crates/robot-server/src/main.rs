@@ -3,6 +3,7 @@ mod player;
 mod safety;
 mod slam;
 mod telemetry;
+mod vision;
 
 use axum::{
     extract::{
@@ -42,6 +43,7 @@ struct Config {
     camera_url: String,
     netrc: PathBuf,
     slam_adapter: Option<PathBuf>,
+    yolo_adapter: Option<PathBuf>,
 }
 impl Config {
     fn parse() -> Result<Option<Self>, Failure> {
@@ -54,11 +56,12 @@ impl Config {
             netrc: PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                 .join(".config/robot/camera.netrc"),
             slam_adapter: None,
+            yolo_adapter: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             if a == "--help" {
-                println!("robot-server\n\n--player-host HOST  Player host (robot)\n--player-port PORT  Player port (6665)\n--listen HOST       HTTP bind host (127.0.0.1)\n--port PORT         HTTP port (8085)\n--camera-url URL    MJPEG URL (http://cam/mjpeg)\n--netrc PATH        Camera credentials (~/.config/robot/camera.netrc)\n--slam-adapter EXE  Optional MRPT SLAM adapter (line JSON over stdio)\n--help             Show help");
+                println!("robot-server\n\n--player-host HOST  Player host (robot)\n--player-port PORT  Player port (6665)\n--listen HOST       HTTP bind host (127.0.0.1)\n--port PORT         HTTP port (8085)\n--camera-url URL    MJPEG URL (http://cam/mjpeg)\n--netrc PATH        Camera credentials (~/.config/robot/camera.netrc)\n--slam-adapter EXE  Optional MRPT SLAM adapter (line JSON over stdio)\n--yolo-adapter EXE  Optional camera object detector (line JSON over stdio)\n--help             Show help");
                 return Ok(None);
             }
             let v = args.next().ok_or("option requires a value")?;
@@ -76,6 +79,20 @@ impl Config {
                     }
                     c.slam_adapter = Some(p);
                 }
+                "--yolo-adapter" => {
+                    let p = PathBuf::from(&v);
+                    if !p.is_file() {
+                        return Err(format!("--yolo-adapter: {v} is not a file").into());
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if p.metadata()?.permissions().mode() & 0o111 == 0 {
+                            return Err("YOLO adapter must be executable".into());
+                        }
+                    }
+                    c.yolo_adapter = Some(p);
+                }
                 _ => return Err("unknown option (see --help)".into()),
             }
         }
@@ -88,6 +105,7 @@ struct App {
     state: watch::Receiver<Value>,
     scan: watch::Receiver<Option<Value>>,
     camera: camera::Camera,
+    vision: Option<watch::Receiver<Value>>,
     ids: Arc<AtomicU64>,
 }
 #[derive(Deserialize)]
@@ -103,26 +121,29 @@ async fn index() -> Response {
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "panel bundle unavailable").into_response(),
     }
 }
+fn allowed_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin") else {
+        return true;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|s| reqwest::Url::parse(s).ok())
+        .is_some_and(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && headers
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .is_some_and(|h| {
+                        reqwest::Url::parse(&format!("{}://{h}", u.scheme()))
+                            .is_ok_and(|host| host.origin() == u.origin())
+                    })
+        })
+}
 async fn upgrade(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     // Do not let a foreign web page drive a localhost session using browser WS.
-    if let Some(origin) = headers.get("origin") {
-        let same = origin
-            .to_str()
-            .ok()
-            .and_then(|s| reqwest::Url::parse(s).ok())
-            .is_some_and(|u| {
-                matches!(u.scheme(), "http" | "https")
-                    && headers
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .is_some_and(|h| {
-                            reqwest::Url::parse(&format!("{}://{h}", u.scheme()))
-                                .is_ok_and(|host| host.origin() == u.origin())
-                        })
-            });
-        if !same {
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    if !allowed_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
     }
     ws.max_message_size(4096)
         .max_frame_size(4096)
@@ -185,6 +206,12 @@ async fn session(socket: WebSocket, app: App) {
     let send = async {
         let initial = state.borrow_and_update().clone();
         send_frame(&mut output, "state", initial).await?;
+        send_frame(
+            &mut output,
+            "vision",
+            json!({"enabled": app.vision.is_some()}),
+        )
+        .await?;
         let initial = scan.borrow_and_update().clone();
         if let Some(v) = initial {
             send_frame(&mut output, "scan", v).await?;
@@ -304,11 +331,18 @@ async fn run(c: Config) -> Result<(), Failure> {
         slam_tx,
     ));
     let mut drive_task = tokio::spawn(player::drive(writer.clone(), safety.clone()));
+    let (_vision_tasks, vision) = if let Some(exe) = c.yolo_adapter {
+        let (tasks, updates) = vision::Vision::start(camera.clone(), exe);
+        (Some(tasks), Some(updates))
+    } else {
+        (None, None)
+    };
     let app = App {
         safety,
         state,
         scan,
         camera,
+        vision,
         ids: Arc::new(AtomicU64::new(1)),
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
@@ -324,6 +358,7 @@ async fn run(c: Config) -> Result<(), Failure> {
         .route("/", get(index))
         .route("/ws", get(upgrade))
         .route("/camera.mjpeg", get(camera::proxy))
+        .route("/vision/ws", get(vision::upgrade))
         .with_state(app);
     let mut http = tokio::spawn(async move { axum::serve(listener, router).await });
     let (result, completed) = tokio::select! {

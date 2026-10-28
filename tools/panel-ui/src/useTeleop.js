@@ -2,21 +2,26 @@ import { useEffect, useRef, useState } from 'react'
 
 // Teleop: a held key publishes at 150 ms; blur, hidden tab, Space or keyup
 // stop immediately. The interval exists only while keys are held, so an
-// idle panel has zero running timers. The linear limit is a UI-side scale
-// factor only; the server keeps clamping to its own hard limits.
+// idle panel has zero running timers. Speed limits are independent UI-side
+// settings; the server keeps clamping to its own hard limits.
 const KEYS = {
   ArrowUp: ['v', 1], KeyW: ['v', 1], ArrowDown: ['v', -1], KeyS: ['v', -1],
   ArrowLeft: ['w', 1], KeyA: ['w', 1], ArrowRight: ['w', -1], KeyD: ['w', -1],
 }
-const LIMITS = { v: 0.1, w: 0.4 }
+export const LIMITS = { v: 0.5, w: 0.4 }
+export const DEFAULT_LINEAR_SPEED = 0.1
 
-export default function useTeleop(send, linearLimit = LIMITS.v) {
+export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angularLimit = LIMITS.w) {
   const held = useRef(new Set())
   const [active, setActive] = useState(false)
   const sendRef = useRef(send)
   sendRef.current = send
-  const limitsRef = useRef({ v: linearLimit, w: linearLimit / LIMITS.v * LIMITS.w })
-  limitsRef.current = { v: linearLimit, w: linearLimit / LIMITS.v * LIMITS.w }
+  const speed = Number.isFinite(linearLimit) ? Math.max(0, Math.min(linearLimit, LIMITS.v)) : 0
+  const limitsRef = useRef({ v: 0, w: 0 })
+  limitsRef.current = {
+    v: speed,
+    w: Number.isFinite(angularLimit) ? Math.max(0, Math.min(angularLimit, LIMITS.w)) : 0,
+  }
 
   const publish = () => {
     const cmd = { v: 0, w: 0 }
@@ -28,8 +33,10 @@ export default function useTeleop(send, linearLimit = LIMITS.v) {
   }
 
   useEffect(() => {
-    const isTyping = (target) =>
-      ['SELECT', 'INPUT', 'BUTTON', 'TEXTAREA'].includes(target?.tagName)
+    const isTyping = (target, code) => {
+      if (target?.tagName === 'INPUT' && target.type === 'range' && code.startsWith('Key')) return false
+      return ['SELECT', 'INPUT', 'BUTTON', 'TEXTAREA'].includes(target?.tagName)
+    }
 
     const onKey = (event, add) => {
       if (event.code === 'Space') {
@@ -39,7 +46,7 @@ export default function useTeleop(send, linearLimit = LIMITS.v) {
         publish()
         return
       }
-      if (!KEYS[event.code] || (add && isTyping(event.target))) return
+      if (!KEYS[event.code] || (add && isTyping(event.target, event.code))) return
       if (!add && !held.current.has(event.code)) return
       event.preventDefault()
       if (add) held.current.add(event.code)

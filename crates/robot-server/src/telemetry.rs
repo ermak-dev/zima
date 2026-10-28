@@ -28,8 +28,10 @@ impl Telemetry {
         let mut sensors = json!({});
         for key in [
             "battery",
+            "dock",
             "bumper",
             "bumper_segments",
+            "compass",
             "wall_ir",
             "cliff_ir",
             "drop_ir",
@@ -43,6 +45,21 @@ impl Telemetry {
         for raw in ["wall_voltages", "cliff_ranges", "drop_ranges"] {
             out.as_object_mut().unwrap().remove(raw);
         }
+        let mut service = json!({});
+        for key in [
+            "ir:3",
+            "ir:4",
+            "ir:6",
+            "ir:7",
+            "ir:8",
+            "position3d:0",
+            "position3d:1",
+            "position3d:4",
+        ] {
+            service[key] = self.fields.get(key).cloned().unwrap_or(Value::Null);
+            out.as_object_mut().unwrap().remove(key);
+        }
+        sensors["service_channels"] = service;
         out["sensors"] = sensors;
         out
     }
@@ -98,6 +115,23 @@ impl Telemetry {
                         .insert(format!("{name}_ranges"), values(&s.ranges));
                 }
             }
+            (IR_CODE, 3 | 4 | 6 | 7 | 8) => {
+                let s = decode_ir(p)?;
+                self.fields.insert(format!("ir:{}", a.index), json!({
+                    "voltages": values(&s.voltages),
+                    "ranges": values(&s.ranges),
+                    "stamp": if msg.header.timestamp > 0. { rounded(msg.header.timestamp, 6) } else { Value::Null },
+                }));
+            }
+            (POSITION3D_CODE, 0 | 1 | 4) => {
+                let s = decode_position3d(p)?;
+                self.fields.insert(format!("position3d:{}", a.index), json!({
+                    "pos": s.pos.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
+                    "vel": s.vel.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
+                    "stall": s.stall,
+                    "stamp": if msg.header.timestamp > 0. { rounded(msg.header.timestamp, 6) } else { Value::Null },
+                }));
+            }
             (SONAR_CODE, 0) => {
                 let s = decode_sonar(p)?;
                 self.fields.insert(
@@ -113,6 +147,32 @@ impl Telemetry {
                 // Valid bits are authoritative for each frame: never retain an earlier
                 // reading where the new frame says unknown. No current is synthesized.
                 self.fields.insert("battery".into(),json!({"percent":if s.valid&8!=0 && s.percent.is_finite() && (0.0..=100.0).contains(&s.percent){json!((s.percent as f64).round() as i64)}else{Value::Null},"volts":if s.valid&1!=0 && s.volts>0.0{rounded(s.volts as f64,1)}else{Value::Null},"charging":if s.valid&16!=0 && matches!(s.charging,0|1){json!(s.charging==1)}else{Value::Null}}));
+                // The vendor merges dock presence into the power frame's charging
+                // field; the dock row restates that fact instead of inventing a
+                // separate sensor that does not exist on the wire.
+                self.fields.insert(
+                    "dock".into(),
+                    if s.valid & 16 != 0 && matches!(s.charging, 0 | 1) {
+                        json!(s.charging == 1)
+                    } else {
+                        Value::Null
+                    },
+                );
+            }
+            (POSITION3D_CODE, 2) => {
+                // Compass device: only the yaw carries meaning (roll/pitch/z are
+                // zero on the V1); position is not odometry.
+                let s = decode_position3d(p)?;
+                self.fields.insert(
+                    "compass".into(),
+                    json!({
+                        "x": rounded(s.pos[0], 3),
+                        "y": rounded(s.pos[1], 3),
+                        "z": rounded(s.pos[2], 3),
+                        "yaw": rounded(s.pos[5], 3),
+                        "stall": json!(s.stall),
+                    }),
+                );
             }
             _ => return Ok(false),
         }
@@ -178,6 +238,64 @@ mod tests {
             payload,
         }
     }
+    // FEATURE: service-channel inventory without inferred units or motor commands.
+    // SPEC: preserve raw arrays, null nonfinite values, and expose missing readings.
+    // IMPLEMENTATION: optional IR/position3d channels live in sensors.service_channels.
+    // RESULT: IMPLEMENTED — arrays, empty frames and unknown values verified offline.
+    // STATUS: DONE
+    #[test]
+    fn service_ir_channels_preserve_raw_arrays_and_clear_old_values() {
+        let mut t = Telemetry::new();
+        for index in [3, 4, 6, 7, 8] {
+            let key = format!("ir:{index}");
+            assert_eq!(t.json()["sensors"]["service_channels"][&key], Value::Null);
+            let mut p = Vec::new();
+            for array in [vec![0f32, 2., f32::NAN], vec![17f32]] {
+                p.extend((array.len() as u32).to_be_bytes());
+                p.extend((array.len() as u32).to_be_bytes());
+                for v in array {
+                    p.extend(v.to_be_bytes());
+                }
+            }
+            let mut m = data(IR_CODE, p);
+            m.header.addr.index = index;
+            m.header.timestamp = 42.;
+            assert!(t.update(&m).unwrap());
+            assert_eq!(
+                t.json()["sensors"]["service_channels"][&key],
+                json!({"voltages":[0.,2.,null],"ranges":[17.],"stamp":42.})
+            );
+            m.payload = vec![0; 16];
+            t.update(&m).unwrap();
+            assert_eq!(
+                t.json()["sensors"]["service_channels"][&key]["ranges"],
+                json!([])
+            );
+        }
+        let mut m = data(IR_CODE, vec![0; 16]);
+        m.header.addr.index = 5;
+        assert!(!t.update(&m).unwrap());
+    }
+
+    #[test]
+    fn service_position3d_channels_preserve_all_axes() {
+        let mut t = Telemetry::new();
+        for index in [0, 1, 4] {
+            let mut p = Vec::new();
+            for v in [1f64, 2., 3., 0.1, 0.2, 0.3, 4., 5., 6., 0.4, 0.5, f64::NAN] {
+                p.extend(v.to_be_bytes());
+            }
+            p.extend(1u32.to_be_bytes());
+            let mut m = data(POSITION3D_CODE, p);
+            m.header.addr.index = index;
+            assert!(t.update(&m).unwrap());
+            assert_eq!(
+                t.json()["sensors"]["service_channels"][format!("position3d:{index}")],
+                json!({"pos":[1.,2.,3.,0.1,0.2,0.3],"vel":[4.,5.,6.,0.4,0.5,null],"stall":true,"stamp":null})
+            );
+        }
+    }
+
     #[test]
     fn invalid_power_values_are_unknown() {
         for (volts, percent, charging) in [

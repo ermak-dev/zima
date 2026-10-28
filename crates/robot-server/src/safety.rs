@@ -1,10 +1,9 @@
 //! One lock protects ownership and the bounded latest-command slot. No I/O here.
-use player_bridge::drive::{BackOff, DriveCommand, StallDetector};
+use player_bridge::drive::{DriveCommand, StallDetector};
 use std::time::{Duration, Instant};
 pub struct Safety {
     owner: Option<u64>,
     drive: DriveCommand,
-    backoff: BackOff,
     stall: StallDetector,
     hold: Option<Instant>,
     pressed: bool,
@@ -16,7 +15,6 @@ impl Safety {
         Self {
             owner: None,
             drive: DriveCommand::new(Duration::from_secs(1)),
-            backoff: BackOff::new(),
             stall: StallDetector::new(),
             hold: None,
             pressed: false,
@@ -41,11 +39,7 @@ impl Safety {
             return;
         }
         self.owner = Some(id);
-        if self.pressed
-            || !self.slam_ok
-            || self.backoff.is_running(now)
-            || self.hold.is_some_and(|until| now < until)
-        {
+        if !self.slam_ok || self.hold.is_some_and(|until| now < until) {
             return;
         }
         self.drive.set(v, w, now);
@@ -55,19 +49,15 @@ impl Safety {
             return;
         }
         self.owner = None;
-        self.backoff = BackOff::new();
         self.drive = DriveCommand::new(Duration::from_secs(1));
         self.drive.set(0., 0., Instant::now());
         self.current = (0., 0.);
         self.stall = StallDetector::new();
     }
     pub fn bumper(&mut self, pressed: bool, now: Instant) {
-        // Safety recovery is enabled only during intentional driving, not viewing.
-        if !pressed || (self.owner.is_some() && self.current != (0., 0.)) {
-            self.backoff.observe(pressed, now);
-        }
-        if pressed && !self.pressed && self.backoff.is_running(now) {
+        if pressed && !self.pressed && self.owner.is_some() {
             self.drive = DriveCommand::new(Duration::from_secs(1));
+            self.drive.set(0., 0., now);
         }
         self.pressed = pressed;
     }
@@ -75,13 +65,12 @@ impl Safety {
         if self.stall.update(self.current, (v, w), now) {
             eprintln!("robot-server: DRIVE STALLED; holding commands for 10 s");
             self.hold = Some(now + Duration::from_secs(10));
-            self.backoff = BackOff::new();
             self.drive = DriveCommand::new(Duration::from_secs(1));
             self.drive.set(0., 0., now);
         }
     }
     pub fn next(&mut self, now: Instant) -> Option<(f64, f64)> {
-        let next = self.backoff.active(now).or_else(|| self.drive.next(now));
+        let next = self.drive.next(now);
         if let Some(v) = next {
             self.current = v;
         }
@@ -97,6 +86,41 @@ mod tests {
     // IMPLEMENTATION: shared DriveCommand handles lease/clamp; Safety gates ownership.
     // RESULT: IMPLEMENTED — latest command, expiry and ownership transitions verified.
     // STATUS: DONE
+    // BUG: a held bumper prevents an operator from driving away.
+    // HYPOTHESIS: the command gate conflates a contact edge with a held state.
+    // SPEC: contact clears pending commands once; subsequent commands remain usable.
+    // SOLUTION: remove the held-bumper command gate, keeping the contact-edge stop.
+    // RESULT: FIXED — manual reverse/turn/forward and repeated contacts verified offline.
+    // STATUS: FIXED
+    #[test]
+    fn bumper_stops_without_reverse_and_discards_pending_commands() {
+        let now = Instant::now();
+        let mut s = Safety::new();
+        s.bumper(true, now);
+        assert_eq!(s.next(now), None);
+        s.bumper(false, now);
+        s.command(1, 0.06, 0., now);
+        assert_eq!(s.next(now), Some((0.06, 0.)));
+        s.command(1, 0.08, 0.1, now);
+        s.bumper(true, now);
+        assert_eq!(s.next(now), Some((0., 0.)));
+        s.bumper(false, now);
+        assert_eq!(s.next(now), None);
+        s.bumper(true, now);
+        assert_eq!(s.next(now), Some((0., 0.)));
+        for (i, command) in [(-0.06, 0.), (0., 0.2), (0.06, 0.)].into_iter().enumerate() {
+            let t = now + Duration::from_millis(100 * (i as u64 + 1));
+            s.command(1, command.0, command.1, t);
+            s.bumper(true, t);
+            assert_eq!(s.next(t), Some(command));
+            assert_eq!(s.next(t), None);
+        }
+        s.bumper(false, now + Duration::from_millis(400));
+        assert_eq!(s.next(now + Duration::from_millis(400)), None);
+        s.bumper(true, now + Duration::from_millis(500));
+        assert_eq!(s.next(now + Duration::from_millis(500)), Some((0., 0.)));
+    }
+
     #[test]
     fn latest_only_lease_and_owner_transitions() {
         let now = Instant::now();
@@ -108,7 +132,7 @@ mod tests {
             s.command(1, i as f64 / 10000., -1., now);
         }
         s.command(2, -0.1, 0., now);
-        assert_eq!(s.next(now), Some((0.1, -0.4)));
+        assert_eq!(s.next(now), Some((0.5, -0.4)));
         assert_eq!(s.next(now), None);
         s.disconnect(2);
         assert_eq!(s.next(now), None);
@@ -123,7 +147,7 @@ mod tests {
         s.disconnect(1);
         assert_eq!(s.next(Instant::now()), Some((0., 0.)));
         s.command(2, -1., 1., now + Duration::from_secs(5));
-        assert_eq!(s.next(now + Duration::from_secs(5)), Some((-0.1, 0.4)));
+        assert_eq!(s.next(now + Duration::from_secs(5)), Some((-0.5, 0.4)));
     }
     // FEATURE: SLAM gate on manual driving.
     // SPEC: when localization is not confirmed, commands are ignored and any

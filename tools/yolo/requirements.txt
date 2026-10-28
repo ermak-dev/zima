@@ -1,0 +1,6 @@
+# Python 3.10+; install matching CUDA torch/torchvision wheels first (setup_gpu.sh).
+ultralytics==8.4.191
+torch==2.10.0
+torchvision==0.25.0
+# Provides import clip / clip.clip.tokenize without Ultralytics' git auto-install.
+clip-anytorch==2.6.0

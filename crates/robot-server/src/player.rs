@@ -72,6 +72,15 @@ pub async fn connect(c: &Config) -> Result<(Reader, Writer), Failure> {
             (IR_CODE, 2),
             (SONAR_CODE, 0),
             (POWER_CODE, 0),
+            (POSITION3D_CODE, 2),
+            (IR_CODE, 3),
+            (IR_CODE, 4),
+            (IR_CODE, 6),
+            (IR_CODE, 7),
+            (IR_CODE, 8),
+            (POSITION3D_CODE, 0),
+            (POSITION3D_CODE, 1),
+            (POSITION3D_CODE, 4),
         ] {
             let mut p = [0; 28];
             p[8..12].copy_from_slice(&(interf as u32).to_be_bytes());

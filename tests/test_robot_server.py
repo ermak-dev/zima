@@ -30,6 +30,8 @@ class ServerCliTests(unittest.TestCase):
                         ROBOT_ROS_SETUP='/nonexistent/ros-setup',
                         ROBOT_WS_SETUP='/nonexistent/workspace')
         self.executable('supervisor', '#!/bin/sh\nexit 0\n')
+        self.env['ROBOT_SLAM_ADAPTER'] = str(self.executable('default-adapter', '#!/bin/sh\nexit 0\n'))
+        self.env['ROBOT_YOLO_ADAPTER'] = str(self.executable('default-yolo-adapter', '#!/bin/sh\nexit 0\n'))
         self.executable('server', '''#!/bin/bash
 printf 'server:%s heartbeat=%s\n' "$*" "${ROBOT_SERVER_HEARTBEAT:-}" >> "$ROBOT_TEST_LOG"
 trap 'echo server-stopped >> "$ROBOT_TEST_LOG"; exit 0' TERM INT
@@ -79,6 +81,124 @@ exit 0
         return subprocess.run([str(ROOT / 'bin/robot'), *args], env=self.env | overrides,
                               capture_output=True, text=True, timeout=10)
 
+    # FEATURE: normal sessions start panel MRPT SLAM by default.
+    # SPEC: missing adapters fail before handoff; --no-slam explicitly opts out.
+    # IMPLEMENTATION: repository-relative default with environment and CLI overrides.
+    # RESULT: IMPLEMENTED — defaults, overrides and preflight verified with fakes.
+    # STATUS: DONE
+    def test_slam_enabled_by_default(self):
+        result = self.run_cli('run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        server = next(line for line in self.log.read_text().splitlines()
+                      if line.startswith('server:'))
+        self.assertIn(f'--slam-adapter {self.env["ROBOT_SLAM_ADAPTER"]}', server)
+
+    def test_default_adapter_path_is_relative_to_repository(self):
+        repo = self.directory / 'repo'
+        (repo / 'bin').mkdir(parents=True)
+        cli = repo / 'bin/robot'
+        cli.write_text((ROOT / 'bin/robot').read_text())
+        cli.chmod(0o700)
+        env = self.env.copy()
+        env.pop('ROBOT_SLAM_ADAPTER')
+        result = subprocess.run([str(cli), 'run'], env=env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(repo / 'tools/mrpt-adapter/adapter'), result.stderr)
+        self.assertEqual(self.log.read_text(), '')
+
+    def test_missing_default_adapter_fails_before_ssh(self):
+        result = self.run_cli('run', ROBOT_SLAM_ADAPTER=str(self.directory / 'missing'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('adapter', result.stderr.lower())
+        self.assertEqual(self.log.read_text(), '')
+
+    def test_no_slam_explicitly_disables_default_and_skips_adapter_check(self):
+        result = self.run_cli('run', '--no-slam',
+                              ROBOT_SLAM_ADAPTER=str(self.directory / 'missing'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        server = next(line for line in self.log.read_text().splitlines()
+                      if line.startswith('server:'))
+        self.assertNotIn('--slam-adapter', server)
+
+    # FEATURE: normal sessions enable MRPT and YOLO with explicit opt-outs.
+    # SPEC: repository-relative defaults, environment/CLI overrides and executable
+    # preflight before SSH; --no-yolo disables only object detection.
+    # IMPLEMENTATION: repository defaults with environment/CLI overrides and opt-outs.
+    # RESULT: IMPLEMENTED — fake sessions verify defaults, refusal and independent disabling.
+    # STATUS: DONE
+    def test_yolo_adapter_flag_reaches_server(self):
+        adapter = self.executable('yolo-adapter', '#!/bin/sh\nexit 0\n')
+        result = self.run_cli('run', '--yolo-adapter', str(adapter))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'--yolo-adapter {adapter}', self.log.read_text())
+        self.assertIn('--slam-adapter', self.log.read_text())
+
+    def test_yolo_adapter_missing_or_not_executable_fails_before_ssh(self):
+        not_executable = self.directory / 'not-executable'
+        not_executable.write_text('not an executable')
+        for path in (self.directory / 'missing-yolo', not_executable):
+            with self.subTest(path=path):
+                self.log.write_text('')
+                result = self.run_cli('run', '--yolo-adapter', str(path))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('YOLO', result.stderr)
+                self.assertEqual(self.log.read_text(), '')
+        result = self.run_cli('run', '--yolo-adapter')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.log.read_text(), '')
+
+    def test_yolo_enabled_by_default(self):
+        result = self.run_cli('run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'--yolo-adapter {self.env["ROBOT_YOLO_ADAPTER"]}', self.log.read_text())
+        self.assertIn(f'--slam-adapter {self.env["ROBOT_SLAM_ADAPTER"]}', self.log.read_text())
+
+    def test_yolo_default_path_is_relative_to_repository(self):
+        repo = self.directory / 'repo'
+        (repo / 'bin').mkdir(parents=True)
+        cli = repo / 'bin/robot'
+        cli.write_text((ROOT / 'bin/robot').read_text())
+        cli.chmod(0o700)
+        env = self.env.copy()
+        env.pop('ROBOT_YOLO_ADAPTER')
+        result = subprocess.run([str(cli), 'run'], env=env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(repo / 'tools/yolo/adapter'), result.stderr)
+        self.assertEqual(self.log.read_text(), '')
+
+    def test_yolo_default_preflight_rejects_missing_files_and_directories(self):
+        for path in (self.directory / 'missing-yolo', self.directory):
+            with self.subTest(path=path):
+                self.log.write_text('')
+                result = self.run_cli('run', ROBOT_YOLO_ADAPTER=str(path))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('YOLO', result.stderr)
+                self.assertEqual(self.log.read_text(), '')
+
+    def test_no_yolo_skips_preflight_and_keeps_slam(self):
+        result = self.run_cli('run', '--no-yolo',
+                              ROBOT_YOLO_ADAPTER=str(self.directory / 'missing-yolo'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('--yolo-adapter', self.log.read_text())
+        self.assertIn('--slam-adapter', self.log.read_text())
+
+    def test_both_adapters_can_be_disabled(self):
+        result = self.run_cli('run', '--no-slam', '--no-yolo',
+                              ROBOT_YOLO_ADAPTER=str(self.directory / 'missing-yolo'),
+                              ROBOT_SLAM_ADAPTER=str(self.directory / 'missing-slam'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('--yolo-adapter', self.log.read_text())
+        self.assertNotIn('--slam-adapter', self.log.read_text())
+
+    def test_yolo_cli_override_takes_precedence_over_environment(self):
+        adapter = self.executable('override-yolo-adapter', '#!/bin/sh\nexit 0\n')
+        result = self.run_cli('run', '--yolo-adapter', str(adapter),
+                              ROBOT_YOLO_ADAPTER=str(self.directory / 'missing-yolo'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'--yolo-adapter {adapter}', self.log.read_text())
+
     def test_slam_adapter_flag_reaches_server(self):
         self.executable('slam-adapter', '#!/bin/sh\nexit 0\n')
         result = self.run_cli('run', '--slam-adapter', str(self.directory / 'slam-adapter'))
@@ -98,6 +218,8 @@ exit 0
                 self.assertIn('--player-host 127.0.0.1', server)
                 self.assertIn('--port 8099', server)
                 self.assertIn('--listen 127.0.0.1', server)
+                self.assertIn(f'--slam-adapter {self.env["ROBOT_SLAM_ADAPTER"]}', server)
+                self.assertIn(f'--yolo-adapter {self.env["ROBOT_YOLO_ADAPTER"]}', server)
                 self.assertIn('heartbeat=127.0.0.1:7665', server)
                 self.assertLess(lines.index('supervisor'), lines.index('disable'))
                 self.assertLess(lines.index('disable'), lines.index(server))

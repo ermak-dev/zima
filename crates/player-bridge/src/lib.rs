@@ -22,8 +22,9 @@ pub mod sensors;
 
 pub use bumper::{decode_bumper, BumperState, BUMPER_CODE, BUMPER_DATA_STATE};
 pub use sensors::{
-    decode_ir, decode_power, decode_sonar, IrState, PowerState, SonarState, IR_CODE,
-    IR_DATA_RANGES, POWER_CODE, POWER_DATA_STATE, SONAR_CODE, SONAR_DATA_RANGES,
+    decode_ir, decode_position3d, decode_power, decode_sonar, IrState, Position3dState, PowerState,
+    SonarState, IR_CODE, IR_DATA_RANGES, POSITION3D_CODE, POSITION3D_DATA_STATE, POWER_CODE,
+    POWER_DATA_STATE, SONAR_CODE, SONAR_DATA_RANGES,
 };
 
 use std::collections::VecDeque;

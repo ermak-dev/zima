@@ -77,6 +77,14 @@ fn bumper_segments(flags: &[u8]) -> Vec<u8> {
     p.resize(p.len().div_ceil(4) * 4, 0);
     packet(BUMPER_CODE, 0, 1, 10., &p)
 }
+fn compass(pos: [f64; 6]) -> Vec<u8> {
+    let mut p = Vec::new();
+    for v in pos {
+        p.extend(v.to_bits().to_be_bytes());
+    }
+    p.resize(100, 0);
+    packet(POSITION3D_CODE, 2, 1, 10., &p)
+}
 impl Session {
     async fn start(extra: &[&str], hb: Option<String>, optional: bool) -> Self {
         Self::start_delayed(extra, hb, optional, Duration::ZERO).await
@@ -119,7 +127,9 @@ impl Session {
             let mut banner = [0; 32];
             banner[..9].copy_from_slice(b"Player v.");
             s.write_all(&banner).await.unwrap();
-            for n in 0..8 {
+            // FEATURE: optional service subscriptions; no motor subscriptions or commands.
+            // SPEC: service rejection must not prevent the panel from starting.
+            for n in 0..17 {
                 let mut h = [0; 40];
                 s.read_exact(&mut h).await.unwrap();
                 let h = decode_header(&h).unwrap();
@@ -135,6 +145,15 @@ impl Session {
                     (22, 2),
                     (5, 0),
                     (2, 0),
+                    (30, 2),
+                    (22, 3),
+                    (22, 4),
+                    (22, 6),
+                    (22, 7),
+                    (22, 8),
+                    (30, 0),
+                    (30, 1),
+                    (30, 4),
                 ][n];
                 assert_eq!(
                     (
@@ -284,9 +303,16 @@ async fn frame(w: &mut Ws, kind: &str) -> Value {
             if let Ok(s) = m.to_text() {
                 let v: Value = serde_json::from_str(s).unwrap();
                 assert!(
-                    matches!(v["type"].as_str(), Some("state" | "scan")),
+                    matches!(v["type"].as_str(), Some("state" | "scan" | "vision")),
                     "unexpected frame {v}"
                 );
+                if v["type"] == "vision" {
+                    assert!(
+                        v["data"]["enabled"].is_boolean(),
+                        "control channel carries only vision capability, not images"
+                    );
+                    assert!(v["data"].get("jpeg").is_none());
+                }
                 if v["type"] == kind {
                     return v["data"].clone();
                 }
@@ -358,7 +384,7 @@ async fn silent_player_lease_fragmentation_and_exclusive_driver() {
     s.send(p[..17].to_vec()).await;
     cmd(&mut a, r#"{"v":10,"w":-10}"#).await;
     let moving = s.command().await;
-    assert_eq!((moving.1, moving.2), (0.1, -0.4));
+    assert_eq!((moving.1, moving.2), (0.5, -0.4));
     cmd(&mut b, r#"{"v":-0.1,"w":0}"#).await;
     b.close(None).await.unwrap();
     let stop = s.command().await;
@@ -463,10 +489,11 @@ async fn scan_and_raw_sensor_schema() {
     }
     od.extend(0u32.to_be_bytes());
     s.send(packet(4, 0, 1, 43., &od)).await;
+    s.send(compass([0.1, 0.2, 0.3, 0.04, 0.05, 1.25])).await;
     let state = timeout(WAIT, async {
         loop {
             let v = frame(&mut w, "state").await;
-            if v.get("odom").is_some() {
+            if v.get("compass").is_some() {
                 break v;
             }
         }
@@ -476,6 +503,13 @@ async fn scan_and_raw_sensor_schema() {
     assert_eq!(
         state["battery"],
         json!({"percent":83,"volts":19.9,"charging":true})
+    );
+    // The dock row is the charging fact restated, not an extra sensor: the
+    // vendor merges dock status into the power frame's charging field.
+    assert_eq!(state["sensors"]["dock"], json!(true));
+    assert_eq!(
+        state["compass"],
+        json!({"x":0.1,"y":0.2,"z":0.3,"yaw":1.25,"stall":false})
     );
     assert_eq!(
         state["odom"],
@@ -508,10 +542,9 @@ async fn scan_and_raw_sensor_schema() {
     );
 }
 #[tokio::test]
-async fn bumper_is_bounded_edge_triggered_and_disconnect_cancels_reverse() {
+async fn bumper_stops_without_automatic_reverse_or_restart() {
     let mut s = Session::start(&[], None, true).await;
     let mut w = s.ws().await;
-    // A contact during read-only viewing updates telemetry but may not initiate motion.
     s.send(bumper(true)).await;
     wait_bumper(&mut w, "PRESSED").await;
     s.quiet(80).await;
@@ -520,30 +553,23 @@ async fn bumper_is_bounded_edge_triggered_and_disconnect_cancels_reverse() {
     cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
     assert_eq!(s.command().await.1, 0.06);
     s.send(bumper(true)).await;
-    let start = s.command().await;
-    assert_eq!(start.1, -0.1);
-    let end = Instant::now() + Duration::from_millis(1550);
-    let mut stop = false;
-    while Instant::now() < end {
-        s.send(bumper(true)).await;
-        cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
-        while let Ok(c) = s.cmds.try_recv() {
-            if c.1 == 0. {
-                stop = true;
-            } else {
-                assert_eq!(c.1, -0.1, "forward must not leak during/after held press");
-            }
-        }
-        sleep(Duration::from_millis(40)).await;
-    }
-    assert!(stop, "reverse must finish with a stop");
+    let stop = s.command().await;
+    assert_eq!((stop.1, stop.2), (0., 0.));
     wait_bumper(&mut w, "PRESSED").await;
+    s.quiet(50).await;
+    cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
+    assert_eq!(s.command().await.1, -0.06);
+    for _ in 0..4 {
+        s.send(bumper(true)).await;
+        s.quiet(50).await;
+    }
+    cmd(&mut w, r#"{"v":0,"w":0}"#).await;
+    assert_eq!(s.command().await.1, 0.);
     s.send(bumper(false)).await;
     wait_bumper(&mut w, "clear").await;
+    s.quiet(100).await;
     cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
-    let _ = s.command().await;
-    s.send(bumper(true)).await;
-    assert_eq!(s.command().await.1, -0.1);
+    assert_eq!(s.command().await.1, 0.06);
     w.close(None).await.unwrap();
     assert_eq!(s.command().await.1, 0.);
     s.quiet(100).await;
@@ -1267,4 +1293,183 @@ async fn real_adapter_maps_synthetic_room() {
     .await
     .expect("mapping pose must advance along the driven path");
     assert!(last["mode"] == "mapping");
+}
+
+// FEATURE: YOLO is an optional read-only camera adapter on a separate channel.
+// SPEC: matched JPEG/id/boxes, server-only auth, inert viewers and independent
+// drive lease even when inference hangs; raw camera remains the default.
+// IMPLEMENTATION: latest-only video tasks and a separately supervised child.
+// RESULT: IMPLEMENTED — pairing/auth, readonly viewers, lease expiry and cleanup pass.
+// STATUS: DONE
+#[tokio::test]
+async fn yolo_adapter_streams_matching_camera_frame_without_drive_access() {
+    use axum::{
+        body::Body,
+        http::{header, HeaderMap},
+        response::Response,
+        routing::get,
+        Router,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let camera = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cp = camera.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/mjpeg",
+        get(|headers: HeaderMap| async move {
+            assert_eq!(headers[header::AUTHORIZATION], "Basic dXNlcjpzZWNyZXQ=");
+            let stream = futures_util::stream::unfold(0u8, |n| async move {
+                sleep(Duration::from_millis(20)).await;
+                let bytes = vec![0xff, 0xd8, n, 0xff, 0xd9];
+                Some((Ok::<_, std::io::Error>(bytes), n.wrapping_add(1)))
+            });
+            Response::builder()
+                .header(
+                    header::CONTENT_TYPE,
+                    "multipart/x-mixed-replace; boundary=frame",
+                )
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let camera_task = tokio::spawn(async move { axum::serve(camera, app).await.unwrap() });
+    let dir = std::env::temp_dir().join(format!("robot-yolo-it-{}-{cp}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let credentials = dir.join("camera.netrc");
+    std::fs::write(
+        &credentials,
+        "machine 127.0.0.1 login user password secret\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let adapter = dir.join("yolo-adapter");
+    std::fs::write(
+        &adapter,
+        r##"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['op'] == 'init':
+        reply = {'ok': True, 'model': 'fake-yolo'}
+    else:
+        reply = {'ok': True, 'frame_id': request['frame_id'], 'width': 640, 'height': 480,
+                 'objects': [{'label': 'chair', 'confidence': 0.9, 'box': [0.1, 0.2, 0.5, 0.8]}],
+                 'inference_ms': 2.5}
+    print(json.dumps(reply), flush=True)
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let url = format!("http://127.0.0.1:{cp}/mjpeg");
+    let mut session = Session::start(
+        &[
+            "--camera-url",
+            &url,
+            "--netrc",
+            credentials.to_str().unwrap(),
+            "--yolo-adapter",
+            adapter.to_str().unwrap(),
+        ],
+        None,
+        false,
+    )
+    .await;
+    let (mut vision, _) = connect_async(format!("ws://127.0.0.1:{}/vision/ws", session.port))
+        .await
+        .unwrap();
+    let data = timeout(WAIT, async {
+        loop {
+            let msg = vision.next().await.unwrap().unwrap();
+            if let Ok(text) = msg.to_text() {
+                let value: Value = serde_json::from_str(text).unwrap();
+                assert_eq!(value["type"], "vision");
+                if value["data"]["status"] == "live" {
+                    break value["data"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("YOLO must publish a frame");
+    assert!(data["frame_id"].is_u64());
+    assert_eq!(data["width"], 640);
+    assert_eq!(data["height"], 480);
+    assert!(data["jpeg"].as_str().unwrap().starts_with("/9g"));
+    assert_eq!(data["objects"][0]["label"], "chair");
+    assert_eq!(data["objects"][0]["box"], json!([0.1, 0.2, 0.5, 0.8]));
+    assert!(!data.to_string().contains("secret"));
+    cmd(&mut vision, r#"{"v":0.1,"w":0}"#).await;
+    session.quiet(100).await;
+    let mut control = session.ws().await;
+    cmd(&mut control, r#"{"v":0.05,"w":0}"#).await;
+    assert_eq!(session.command().await.1, 0.05);
+    vision.close(None).await.unwrap();
+    session.quiet(100).await;
+    control.close(None).await.unwrap();
+    assert_eq!(session.command().await.1, 0.0);
+    drop(session);
+    camera_task.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn yolo_hung_initialization_does_not_block_drive_lease_or_shutdown() {
+    use std::os::unix::fs::PermissionsExt;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("robot-yolo-hang-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pidfile = dir.join("pid");
+    let adapter = dir.join("adapter");
+    std::fs::write(&adapter, format!("#!/usr/bin/env python3\nimport os,time\nfrom pathlib import Path\nPath({:?}).write_text(str(os.getpid()))\ntime.sleep(60)\n", pidfile.to_str().unwrap())).unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut s = Session::start(
+        &[
+            "--yolo-adapter",
+            adapter.to_str().unwrap(),
+            "--camera-url",
+            "http://127.0.0.1:9/mjpeg",
+        ],
+        None,
+        false,
+    )
+    .await;
+    let mut control = s.ws().await;
+    assert_eq!(frame(&mut control, "vision").await["enabled"], true);
+    cmd(&mut control, r#"{"v":0.05,"w":0}"#).await;
+    assert_eq!(s.command().await.1, 0.05);
+    let stopped = s.command().await;
+    assert_eq!(stopped.1, 0.0, "hung YOLO must not delay expiry");
+    assert!(Command::new("kill")
+        .args(["-TERM", &s.child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    timeout(WAIT, async {
+        while s.child.try_wait().unwrap().is_none() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = std::fs::read_to_string(&pidfile).unwrap();
+    timeout(WAIT, async {
+        while std::path::Path::new(&format!("/proc/{}", pid.trim())).exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("hung adapter survived server shutdown");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn yolo_disabled_by_default_has_no_camera_channel() {
+    let s = Session::start(&[], None, false).await;
+    let result = connect_async(format!("ws://127.0.0.1:{}/vision/ws", s.port)).await;
+    assert!(
+        result.is_err(),
+        "disabled detector must not expose a video socket"
+    );
 }

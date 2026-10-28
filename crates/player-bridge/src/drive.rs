@@ -4,7 +4,7 @@
 //! one replaces it; nothing on the robot expires it. So the bridge, not
 //! its callers, enforces two rules before a command reaches the wheels:
 //!
-//! - limits: the project ceiling (0.1 m/s, 0.4 rad/s) whatever the
+//! - limits: the project ceiling (0.5 m/s, 0.4 rad/s) whatever the
 //!   source (Nav2, teleop, a stray `ros2 topic pub`); non-finite values
 //!   become zero;
 //! - lease: a velocity holds only while commands keep arriving. When the
@@ -17,8 +17,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Linear speed ceiling, m/s (project limit, same as `robot move`).
-pub const MAX_LINEAR: f64 = 0.1;
+/// Linear speed ceiling, m/s (matching the configured chassis driver limit).
+pub const MAX_LINEAR: f64 = 0.5;
 /// Angular speed ceiling, rad/s.
 pub const MAX_ANGULAR: f64 = 0.4;
 
@@ -129,7 +129,7 @@ impl BackOff {
     /// Stock-tuned: ~0.1 m back at a gentle reverse speed.
     pub fn new() -> Self {
         BackOff {
-            speed: -MAX_LINEAR,
+            speed: -0.1,
             duration: Duration::from_millis(1200),
             until: None,
             was_pressed: false,
@@ -235,6 +235,29 @@ mod tests {
 
     fn ms(t0: Instant, ms: u64) -> Instant {
         t0 + Duration::from_millis(ms)
+    }
+
+    // FEATURE: driver-ceiling linear commands without raising angular or recovery speeds.
+    // SPEC: accept up to 0.5 m/s both ways; clamp excess and retain the one-second lease.
+    // IMPLEMENTATION: raise MAX_LINEAR only and keep the unused BackOff helper at 0.1 m/s.
+    // RESULT: IMPLEMENTED — ceiling, angular bound, lease and recovery speed verified.
+    // STATUS: DONE
+    #[test]
+    fn accepts_driver_linear_ceiling_and_clamps_excess() {
+        assert_eq!(MAX_LINEAR, 0.5);
+        for v in [0.1, 0.3, 0.5, -0.3, -0.5] {
+            assert_eq!(clamp_velocity(v, 0.), (v, 0.));
+        }
+        assert_eq!(clamp_velocity(9., 9.), (0.5, 0.4));
+        assert_eq!(clamp_velocity(-9., -9.), (-0.5, -0.4));
+        let t0 = Instant::now();
+        let mut d = DriveCommand::new(LEASE);
+        d.set(0.5, 0., t0);
+        assert_eq!(d.next(t0), Some((0.5, 0.)));
+        assert_eq!(d.next(ms(t0, 1000)), Some((0., 0.)));
+        let mut b = BackOff::new();
+        b.observe(true, t0);
+        assert_eq!(b.active(t0), Some((-0.1, 0.)));
     }
 
     #[test]

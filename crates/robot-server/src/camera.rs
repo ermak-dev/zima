@@ -57,7 +57,7 @@ impl Camera {
             .map_err(|_| "camera credentials unavailable")?;
         netrc(&text, self.url.host_str().unwrap())
     }
-    async fn response(&self) -> Result<Response, Failure> {
+    pub async fn stream(&self) -> Result<reqwest::Response, Failure> {
         let mut request = self.client.get(self.url.clone());
         if let Some((login, password)) = self.credentials().await? {
             request = request.basic_auth(login, Some(password));
@@ -69,7 +69,7 @@ impl Camera {
         if upstream.status() != StatusCode::OK {
             return Err("camera returned unsuccessful status".into());
         }
-        let kind = upstream
+        let _kind = upstream
             .headers()
             .get(header::CONTENT_TYPE)
             .filter(|v| {
@@ -80,6 +80,11 @@ impl Camera {
             })
             .cloned()
             .ok_or("camera returned non-MJPEG content")?;
+        Ok(upstream)
+    }
+    async fn response(&self) -> Result<Response, Failure> {
+        let upstream = self.stream().await?;
+        let kind = upstream.headers()[header::CONTENT_TYPE].clone();
         let bytes = futures_util::StreamExt::map(upstream.bytes_stream(), |chunk| {
             chunk.map_err(|_| std::io::Error::other("camera stream interrupted"))
         });

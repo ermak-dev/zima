@@ -35,7 +35,7 @@ afterEach(() => {
 describe('App lifecycle', () => {
   it('mounts sensor table with explicit missing values', () => {
     render(<App />)
-    for (const id of ['battery', 'bumper', 'wall', 'cliff-0', 'cliff-1', 'cliff-2', 'cliff-3', 'drop-0', 'drop-1', 'sonar', 'bumper-left', 'bumper-front', 'bumper-right']) {
+    for (const id of ['battery', 'dock', 'bumper', 'wall', 'cliff-0', 'cliff-1', 'cliff-2', 'cliff-3', 'drop-0', 'drop-1', 'sonar', 'bumper-left', 'bumper-front', 'bumper-right', 'compass']) {
       expect(document.getElementById(id).textContent).toBe('нет данных')
     }
   })
@@ -81,12 +81,49 @@ describe('App lifecycle', () => {
     expect(document.getElementById('bumper-left').className).toBe('')
   })
 
+  it('renders compass yaw and dock state from telemetry', () => {
+    render(<App />)
+    act(() => lastHandler({ type: 'state', data: { sensors: { dock: true, compass: { x: 0, y: 0, z: 0, yaw: 1.256, stall: false } } } }))
+    expect(document.getElementById('compass').textContent).toBe('1.256 рад · 72.0°')
+    expect(document.getElementById('dock').textContent).toBe('На доке')
+    expect(document.getElementById('dock').className).toBe('')
+    act(() => lastHandler({ type: 'state', data: { sensors: { dock: false, compass: { yaw: null } } } }))
+    expect(document.getElementById('compass').textContent).toBe('нет данных')
+    expect(document.getElementById('compass').className).toBe('missing')
+    expect(document.getElementById('dock').textContent).toBe('Вне дока')
+  })
+
+  // FEATURE: service telemetry with explicit missing and unsafe-subscription states.
+  // SPEC: show every raw channel without converting flags into physical units.
+  // IMPLEMENTATION: a collapsible read-only inventory distinguishes blocked subscriptions.
+  // RESULT: IMPLEMENTED — missing values, raw arrays and inert viewing verified.
+  // STATUS: DONE
+  it('shows service channels without sending commands', () => {
+    const { getByRole } = render(<App />)
+    for (const key of ['ir:3', 'ir:4', 'ir:6', 'ir:7', 'ir:8', 'position3d:0', 'position3d:1', 'position3d:4']) {
+      expect(document.getElementById(`service-${key}`).textContent).toBe('нет данных')
+    }
+    for (const key of ['motor:0', 'motor:1', 'motor:2']) {
+      expect(document.getElementById(`service-${key}`).textContent).toMatch(/подписка отключена/)
+    }
+    expect(document.getElementById('service-keypad:0').textContent).toMatch(/формат не подтверждён/)
+    act(() => lastHandler({ type: 'state', data: { sensors: { service_channels: {
+      'ir:7': { voltages: [0, 12, null], ranges: [17], stamp: 42 },
+      'position3d:0': { pos: [1, 2, 3, 0.1, 0.2, 0.3], vel: [0, 0, 0, 0, 0, null], stall: false },
+    } } } }))
+    expect(document.getElementById('service-ir:7').textContent).toBe('voltages [0, 12, —] · ranges [17]')
+    expect(document.getElementById('service-position3d:0').textContent).toContain('pos [1, 2, 3, 0.1, 0.2, 0.3]')
+    expect(getByRole('group', { name: 'Служебные каналы' })).toBeTruthy()
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
   it('speed slider scales teleop commands within the hard limits', () => {
     const { container } = render(<App />)
     const sent = () => sockets.flatMap((s) => s.sent)
     const slider = container.querySelector('#speed-slider')
     expect(slider).toBeTruthy()
     expect(slider.value).toBe('0.1')
+    expect(slider.max).toBe('0.5')
     expect(document.getElementById('speed-value').textContent).toBe('0.10 м/с')
     // The default limit keeps the current behavior byte-for-byte.
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
@@ -100,8 +137,50 @@ describe('App lifecycle', () => {
     expect(document.getElementById('speed-value').textContent).toBe('0.06 м/с')
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
     expect(sent().at(-1)).toEqual({ v: 0.06, w: 0 })
-    expect(sent().every((c) => Math.abs(c.v) <= 0.10001 && Math.abs(c.w) <= 0.40001)).toBe(true)
     act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
+    act(() => {
+      set.call(slider, '0.5')
+      slider.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(document.getElementById('speed-value').textContent).toBe('0.50 м/с')
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: 0.5, w: 0 })
+    expect(sent().every((c) => Math.abs(c.v) <= 0.5 && Math.abs(c.w) <= 0.4)).toBe(true)
+    act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
+  })
+
+  // FEATURE: separate, labelled turn-speed slider without motion on adjustment.
+  // SPEC: 0.01–0.4 rad/s, default 0.4; changing linear speed does not alter turn speed.
+  // IMPLEMENTATION: separate turn-speed state and accessible slider in the footer.
+  // RESULT: IMPLEMENTED — idle adjustment is inert and focused-slider WASD uses both limits.
+  // STATUS: DONE
+  it('adjusts turn speed independently without sending commands while idle', () => {
+    const { getByRole } = render(<App />)
+    const slider = getByRole('slider', { name: /Поворот/ })
+    const sent = () => sockets.flatMap((s) => s.sent)
+    expect(slider.min).toBe('0.01')
+    expect(slider.max).toBe('0.4')
+    expect(slider.step).toBe('0.01')
+    expect(slider.value).toBe('0.4')
+    expect(document.getElementById('turn-speed-value').textContent).toBe('0.40 рад/с')
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    act(() => {
+      set.call(slider, '0.15')
+      slider.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(document.getElementById('turn-speed-value').textContent).toBe('0.15 рад/с')
+    expect(sent()).toEqual([])
+    const linear = document.getElementById('speed-slider')
+    act(() => {
+      set.call(linear, '0.5')
+      linear.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(sent()).toEqual([])
+    act(() => slider.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
+    act(() => slider.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyA', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: 0.5, w: 0.15 })
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: 0, w: 0 })
   })
 
   it('state messages render odometry telemetry', () => {

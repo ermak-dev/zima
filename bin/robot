@@ -9,7 +9,8 @@
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
-#        robot run [--port N] [--listen HOST]  # supervised server + lidar web panel
+#        robot run [--port N] [--listen HOST] [--no-slam] [--no-yolo]  # MRPT + YOLO by default
+#                  [--slam-adapter EXE] [--yolo-adapter EXE]
 #        robot panel [--port N] [--listen HOST]  # alias for run (hands over controller)
 #        robot bridge [--port N] [--listen HOST] # alias for run
 #        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
@@ -339,22 +340,29 @@ case $cmd in
             *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
         esac ;;
     run|panel|bridge)
-        port=8085 listen=127.0.0.1 heartbeat_port=7665 timeout_ms=5000 slam_adapter=
+        port=8085 listen=127.0.0.1 heartbeat_port=7665 timeout_ms=5000
+        slam_adapter=${ROBOT_SLAM_ADAPTER:-$(repo_root)/tools/mrpt-adapter/adapter}
+        yolo_adapter=${ROBOT_YOLO_ADAPTER:-$(repo_root)/tools/yolo/adapter}
         while (( $# )); do
             case $1 in
-                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter)
+                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter|--yolo-adapter)
                     (( $# >= 2 )) || fail "missing value for $1"
                     case $1 in
                         --port) port=$2 ;;
                         --listen) listen=$2 ;;
                         --heartbeat-port) heartbeat_port=$2 ;;
                         --timeout-ms) timeout_ms=$2 ;;
+                        --yolo-adapter)
+                            [[ -f $2 && -x $2 ]] || fail "YOLO adapter is missing or not executable: $2"
+                            yolo_adapter=$2 ;;
                         --slam-adapter)
                             [[ -f $2 ]] || fail "--slam-adapter: $2 is not a file"
                             slam_adapter=$2 ;;
                     esac
                     shift 2 ;;
-                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE]' ;;
+                --no-slam) slam_adapter=; shift ;;
+                --no-yolo) yolo_adapter=; shift ;;
+                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE|--no-slam] [--yolo-adapter EXE|--no-yolo]' ;;
             esac
         done
         for number in "$port" "$heartbeat_port"; do
@@ -372,6 +380,12 @@ case $cmd in
             binary=$repo/crates/target/debug/robot-server
         fi
         [[ -x $binary ]] || fail 'robot-server binary is missing; build: cargo build --manifest-path crates/Cargo.toml --release'
+        if [[ -n $slam_adapter && ! -x $slam_adapter ]]; then
+            fail "SLAM adapter is missing or not executable: $slam_adapter; see tools/mrpt-adapter/README.md or use --no-slam"
+        fi
+        if [[ -n $yolo_adapter && ( ! -f $yolo_adapter || ! -x $yolo_adapter ) ]]; then
+            fail "YOLO adapter is missing or not executable: $yolo_adapter; see tools/yolo/README.md or use --no-yolo"
+        fi
         lock=${ROBOT_SESSION_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/robot-server-$UID.lock}
         exec 9>"$lock"
         flock -n 9 || fail 'a robot server session is already running on this host'
@@ -385,6 +399,7 @@ case $cmd in
         controller_disable >&2
         server_args=(--player-host "$host" --listen "$listen" --port "$port")
         [[ -n $slam_adapter ]] && server_args+=(--slam-adapter "$slam_adapter")
+        [[ -n $yolo_adapter ]] && server_args+=(--yolo-adapter "$yolo_adapter")
         ROBOT_SERVER_HEARTBEAT="$host:$heartbeat_port" \
             "$binary" "${server_args[@]}" &
         server_pid=$!

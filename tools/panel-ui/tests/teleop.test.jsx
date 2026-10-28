@@ -50,17 +50,95 @@ describe('teleop safety', () => {
     expect(send).toHaveBeenCalledTimes(count)
   })
 
-  it('scales commands by the requested linear limit', () => {
+  // FEATURE: driver-ceiling linear teleop with an unchanged angular ceiling.
+  // SPEC: allow 0.5 m/s, retain 0.4 rad/s, and reject nonfinite/oversized limits.
+  // IMPLEMENTATION: shared UI limits with bounded linear and angular scaling.
+  // RESULT: IMPLEMENTED — maximum speed, invalid limits and turn ceiling verified.
+  // STATUS: DONE
+  it.each([0.3, 0.5])('uses linear speed %s without increasing turn speed', (speed) => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send, speed))
+    key('keydown', 'KeyW')
+    expect(send).toHaveBeenLastCalledWith({ v: speed, w: 0 })
+    key('keydown', 'KeyA')
+    expect(send).toHaveBeenLastCalledWith({ v: speed, w: 0.4 })
+    key('keyup', 'KeyW')
+    key('keyup', 'KeyA')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+  })
+
+  it.each([1, Infinity, NaN, -1])('bounds the requested speed %s', (speed) => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send, speed))
+    key('keydown', 'KeyW')
+    key('keydown', 'KeyA')
+    const command = send.mock.calls.at(-1)[0]
+    expect(Number.isFinite(command.v)).toBe(true)
+    expect(command.v).toBeGreaterThanOrEqual(0)
+    expect(command.v).toBeLessThanOrEqual(0.5)
+    expect(Number.isFinite(command.w)).toBe(true)
+    expect(command.w).toBeGreaterThanOrEqual(0)
+    expect(command.w).toBeLessThanOrEqual(0.4)
+  })
+
+  // FEATURE: independently adjustable angular speed.
+  // SPEC: linear speed does not scale yaw; updated limits affect the held-key refresh.
+  // IMPLEMENTATION: bound the angular argument independently and allow WASD on range inputs.
+  // RESULT: IMPLEMENTED — independent limits, live refresh, signs and stop verified.
+  // STATUS: DONE
+  it('adjusts turn speed independently while keys are held', () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    const { rerender } = renderHook(({ v, w }) => useTeleop(send, v, w), {
+      initialProps: { v: 0.06, w: 0.15 },
+    })
+    expect(send).not.toHaveBeenCalled()
+    key('keydown', 'KeyW')
+    key('keydown', 'KeyA')
+    expect(send).toHaveBeenLastCalledWith({ v: 0.06, w: 0.15 })
+    rerender({ v: 0.5, w: 0.25 })
+    act(() => vi.advanceTimersByTime(150))
+    expect(send).toHaveBeenLastCalledWith({ v: 0.5, w: 0.25 })
+    key('keyup', 'KeyA')
+    key('keydown', 'KeyD')
+    expect(send).toHaveBeenLastCalledWith({ v: 0.5, w: -0.25 })
+    key('keyup', 'KeyW')
+    key('keyup', 'KeyD')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+  })
+
+  it.each([[1, 0.4], [-1, 0], [NaN, 0], [Infinity, 0]])('bounds angular limit %s to %s', (limit, expected) => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send, 0.1, limit))
+    key('keydown', 'KeyA')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: expected })
+  })
+
+  it('uses independent defaults for linear and angular speed', () => {
     const send = vi.fn()
     renderHook(() => useTeleop(send, 0.06))
     key('keydown', 'KeyW')
     expect(send).toHaveBeenLastCalledWith({ v: 0.06, w: 0 })
     key('keyup', 'KeyW')
     key('keydown', 'KeyA')
-    // Angular scales by the same ratio so slow crawling turns slowly too.
-    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0.24 })
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0.4 })
     key('keyup', 'KeyA')
     expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+  })
+
+  it('accepts WASD after a range adjustment but leaves arrows to the slider', () => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send, 0.1, 0.15))
+    const slider = document.createElement('input')
+    slider.type = 'range'
+    document.body.append(slider)
+    key('keydown', 'ArrowRight', slider)
+    expect(send).not.toHaveBeenCalled()
+    key('keydown', 'KeyA', slider)
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0.15 })
+    key('keyup', 'KeyA', slider)
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+    slider.remove()
   })
 
   it('releases a held key even if focus moved to a control', () => {
