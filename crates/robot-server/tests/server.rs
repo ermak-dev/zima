@@ -606,7 +606,7 @@ async fn scan_and_raw_sensor_schema() {
     assert_eq!(state["sensors"]["dock"], json!(true));
     assert_eq!(
         state["compass"],
-        json!({"x":0.1,"y":0.2,"z":0.3,"yaw":1.25,"stall":false})
+        json!({"x":0.1,"y":0.2,"z":0.3,"yaw":1.25,"stall":false,"status":"received","stamp":10.})
     );
     assert_eq!(
         state["odom"],
