@@ -188,7 +188,7 @@ fn round(v: f64) -> f64 {
 }
 
 /// Owned thread talking to the adapter process. Observations in, slam state
-/// out; the safety gate gets a localized/lost verdict on every update.
+/// out. Localization status is telemetry and does not control wheel commands.
 /// Restarting the adapter on crash keeps the session alive.
 pub struct SlamThread {
     pub observe: std::sync::mpsc::Sender<Observation>,
@@ -199,7 +199,7 @@ impl SlamThread {
         exe: PathBuf,
         mapping: bool,
         map_path: Option<String>,
-        on_state: Box<dyn Fn(Value, bool) + Send + 'static>,
+        on_state: Box<dyn Fn(Value) + Send + 'static>,
     ) -> Result<Self, String> {
         let mut adapter = Adapter::spawn(&exe)?;
         let init = if mapping {
@@ -236,12 +236,7 @@ impl SlamThread {
                 if let Some(m) = &last_map {
                     state["map"] = m.clone();
                 }
-                // The drive gate: mapping always allows driving (that is
-                // how the map gets drawn); localize requires a trusted pose.
-                let mode = state["mode"].as_str().unwrap_or("lost");
-                let localized = mode == "mapping"
-                    || (mode == "localize" && state["quality"].as_f64().is_some_and(|q| q >= 0.5));
-                on_state(state, localized);
+                on_state(state);
             }
         });
         Ok(Self { observe: tx })

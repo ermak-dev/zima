@@ -5,8 +5,6 @@ const CHANNELS = [
   ['ir:7', 'Ток основной щётки'],
   ['ir:8', 'Ток боковой щётки'],
   ['position3d:0', 'Гироскоп'],
-  ['position3d:1', 'Одометрия + гироскоп'],
-  ['position3d:4', 'Одометрия 3D'],
 ]
 const MOTORS = ['Вентилятор', 'Основная щётка', 'Боковая щётка']
 const array = (values) => `[${values.map((v) => Number.isFinite(v) ? v : '—').join(', ')}]`
@@ -25,9 +23,8 @@ function format(data) {
 
 export default function ServiceChannels({ channels = {} }) {
   return (
-    <details className="service-channels" role="group" aria-label="Служебные каналы">
-      <summary>Служебные каналы</summary>
-      <p className="sensor-note">Сырые поля Player: единицы и значения статусов не подтверждены. Последний кадр не гарантирует свежесть.</p>
+    <div className="service-channels" role="group" aria-label="Служебные каналы">
+      <h3>Служебные каналы <small>сырые поля Player</small></h3>
       <table className="sensor-table" aria-label="Служебная телеметрия"><tbody>
         {CHANNELS.map(([key, name]) => {
           const text = format(channels?.[key])
@@ -36,6 +33,6 @@ export default function ServiceChannels({ channels = {} }) {
         <tr><td>Кнопки · keypad:0</td><td id="service-keypad:0" className="missing">формат не подтверждён</td></tr>
         {MOTORS.map((name, i) => <tr key={i}><td>{name} · motor:{i}</td><td id={`service-motor:${i}`} className="missing">подписка отключена: возможны побочные эффекты</td></tr>)}
       </tbody></table>
-    </details>
+    </div>
   )
 }

@@ -33,6 +33,49 @@ afterEach(() => {
 })
 
 describe('App lifecycle', () => {
+  // FEATURE: obstacle balloon with an explicit server-confirmed reset.
+  // SPEC: state.blocked is authoritative, held keys are cancelled, and reset never resumes motion.
+  // IMPLEMENTATION: persistent alert sends typed reset and waits for server state.
+  // RESULT: IMPLEMENTED — no auto-resume, camera unchanged and disconnected reset disabled.
+  // STATUS: DONE
+  it('shows a reset balloon and waits for acknowledgement without restarting movement', () => {
+    vi.useFakeTimers()
+    const { getByRole, queryByRole } = render(<App />)
+    const sent = () => sockets.flatMap((s) => s.sent)
+    const cameraSrc = document.getElementById('cam').getAttribute('src')
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: 0.1, w: 0 })
+    act(() => lastHandler({ type: 'state', data: { blocked: true, sensors: { bumper: 'PRESSED' } } }))
+    expect(document.getElementById('cam').getAttribute('src')).toBe(cameraSrc)
+    expect(getByRole('alert').textContent).toContain('Наезд на препятствие')
+    const count = sent().length
+    act(() => vi.advanceTimersByTime(450))
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyS', bubbles: true })))
+    expect(sent()).toHaveLength(count)
+    act(() => getByRole('button', { name: 'Сброс' }).click())
+    expect(sent().at(-1)).toEqual({ type: 'reset_blocked' })
+    expect(getByRole('alert')).toBeTruthy()
+    const afterReset = sent().length
+    act(() => lastHandler({ type: 'state', data: { blocked: false, sensors: { bumper: 'PRESSED' } } }))
+    expect(queryByRole('alert')).toBeNull()
+    act(() => vi.advanceTimersByTime(450))
+    expect(sent()).toHaveLength(afterReset)
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyS', repeat: true, bubbles: true })))
+    expect(sent()).toHaveLength(afterReset)
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyS', bubbles: true })))
+    expect(sent().at(-1)).toEqual({ v: -0.1, w: 0 })
+    act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyS', bubbles: true })))
+  })
+
+  it('disables reset while disconnected and preserves blocked notification', () => {
+    connected = false
+    const { getByRole } = render(<App />)
+    act(() => lastHandler({ type: 'state', data: { blocked: true } }))
+    expect(getByRole('button', { name: 'Сброс' }).disabled).toBe(true)
+    act(() => getByRole('button', { name: 'Сброс' }).click())
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
   it('mounts sensor table with explicit missing values', () => {
     render(<App />)
     for (const id of ['battery', 'dock', 'bumper', 'wall', 'cliff-0', 'cliff-1', 'cliff-2', 'cliff-3', 'drop-0', 'drop-1', 'sonar', 'bumper-left', 'bumper-front', 'bumper-right', 'compass']) {
@@ -95,12 +138,12 @@ describe('App lifecycle', () => {
 
   // FEATURE: service telemetry with explicit missing and unsafe-subscription states.
   // SPEC: show every raw channel without converting flags into physical units.
-  // IMPLEMENTATION: a collapsible read-only inventory distinguishes blocked subscriptions.
+  // IMPLEMENTATION: an always-visible read-only inventory distinguishes blocked subscriptions.
   // RESULT: IMPLEMENTED — missing values, raw arrays and inert viewing verified.
   // STATUS: DONE
   it('shows service channels without sending commands', () => {
     const { getByRole } = render(<App />)
-    for (const key of ['ir:3', 'ir:4', 'ir:6', 'ir:7', 'ir:8', 'position3d:0', 'position3d:1', 'position3d:4']) {
+    for (const key of ['ir:3', 'ir:4', 'ir:6', 'ir:7', 'ir:8', 'position3d:0']) {
       expect(document.getElementById(`service-${key}`).textContent).toBe('нет данных')
     }
     for (const key of ['motor:0', 'motor:1', 'motor:2']) {
@@ -150,7 +193,7 @@ describe('App lifecycle', () => {
   })
 
   // FEATURE: separate, labelled turn-speed slider without motion on adjustment.
-  // SPEC: 0.01–0.4 rad/s, default 0.4; changing linear speed does not alter turn speed.
+  // SPEC: 0.01–3.14 rad/s, default 0.4; changing linear speed does not alter turn speed.
   // IMPLEMENTATION: separate turn-speed state and accessible slider in the footer.
   // RESULT: IMPLEMENTED — idle adjustment is inert and focused-slider WASD uses both limits.
   // STATUS: DONE
@@ -159,7 +202,7 @@ describe('App lifecycle', () => {
     const slider = getByRole('slider', { name: /Поворот/ })
     const sent = () => sockets.flatMap((s) => s.sent)
     expect(slider.min).toBe('0.01')
-    expect(slider.max).toBe('0.4')
+    expect(slider.max).toBe('3.14')
     expect(slider.step).toBe('0.01')
     expect(slider.value).toBe('0.4')
     expect(document.getElementById('turn-speed-value').textContent).toBe('0.40 рад/с')
@@ -181,6 +224,83 @@ describe('App lifecycle', () => {
     expect(sent().at(-1)).toEqual({ v: 0.5, w: 0.15 })
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', bubbles: true })))
     expect(sent().at(-1)).toEqual({ v: 0, w: 0 })
+  })
+
+  // FEATURE: always-visible orientation instruments and dense telemetry.
+  // SPEC: missing stays unknown; sensor angles drive the graphics; service channels need no expansion.
+  // IMPLEMENTATION: two labelled SVG instruments, root viewport grid and open service inventory.
+  // RESULT: IMPLEMENTED — angles, unknown states and inert rendering verified offline.
+  // STATUS: DONE
+  it('shows compass and gyro instruments with real angles and explicit unknowns', () => {
+    const { getByRole, container } = render(<App />)
+    expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
+    expect(getByRole('img', { name: 'Гироскоп' }).dataset.known).toBe('false')
+    expect(container.querySelector('[data-compass-needle]')).toBeNull()
+    act(() => lastHandler({ type: 'state', data: { sensors: {
+      compass: { yaw: Math.PI / 2 },
+      service_channels: { 'position3d:0': { pos: [0, 0, 0, Math.PI / 6, Math.PI / 12, -Math.PI / 4], vel: [0, 0, 0, 0, 0, 0] } },
+    } } }))
+    expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
+    expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(-90 60 60)')
+    const gyro = getByRole('img', { name: 'Гироскоп' })
+    expect(gyro.dataset.roll).toBe('30')
+    expect(gyro.dataset.pitch).toBe('15')
+    expect(document.getElementById('gyro-yaw').textContent).toBe('-45.0°')
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
+  it('keeps every service value exposed without a collapsed disclosure', () => {
+    const { getByRole, container } = render(<App />)
+    const service = getByRole('group', { name: 'Служебные каналы' })
+    expect(service.closest('details:not([open])')).toBeNull()
+    expect(container.querySelector('.sensor-readings')).toBeTruthy()
+    expect(container.querySelector('.orientation-instruments')).toBeTruthy()
+    expect(service.querySelectorAll('[id^="service-"]').length).toBe(10)
+  })
+
+  it('allows the chassis turn ceiling without changing the initial speed', () => {
+    const { getByRole } = render(<App />)
+    const slider = getByRole('slider', { name: /Поворот/ })
+    expect(slider.max).toBe('3.14')
+    expect(slider.value).toBe('0.4')
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    act(() => {
+      set.call(slider, '3.14')
+      slider.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(document.getElementById('turn-speed-value').textContent).toBe('3.14 рад/с')
+    act(() => slider.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyA', bubbles: true })))
+    expect(sockets.flatMap((s) => s.sent).at(-1)).toEqual({ v: 0, w: 3.14 })
+    act(() => slider.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyA', bubbles: true })))
+  })
+
+  // FEATURE: dedicated position and measured-velocity odometry instruments.
+  // SPEC: preserve unknowns and signed values; remove duplicate service rows and lidar strip.
+  // IMPLEMENTATION: position/course graphic and two measured-velocity meters next to orientation.
+  // RESULT: IMPLEMENTED — missing data, signed meters, numeric values and deduplication verified.
+  // STATUS: DONE
+  it('shows odometry as instruments instead of system information', () => {
+    const { getByRole, container } = render(<App />)
+    const pose = getByRole('img', { name: 'Положение одометрии' })
+    const velocity = getByRole('img', { name: 'Скорости одометрии' })
+    expect(pose.dataset.known).toBe('false')
+    expect(velocity.dataset.known).toBe('false')
+    expect(container.querySelector('[data-odometry-position]')).toBeNull()
+    expect(document.getElementById('pose-v').textContent).toBe('—')
+    const services = getByRole('group', { name: 'Служебные каналы' })
+    expect(services.textContent).not.toMatch(/Одометрия|position3d:1|position3d:4/)
+    expect(container.querySelector('#panel-lidar #odom')).toBeNull()
+    act(() => lastHandler({ type: 'state', data: { odom: { x: 3, y: 4, yaw: Math.PI / 2, vx: -0.25, yaw_rate: 1.57 } } }))
+    expect(pose.dataset.known).toBe('true')
+    expect(velocity.dataset.known).toBe('true')
+    expect(container.querySelector('[data-odometry-position]').dataset.x).toBe('3')
+    expect(container.querySelector('[data-odometry-position]').dataset.y).toBe('4')
+    expect(document.getElementById('pose-x').textContent).toBe('3.00 м')
+    expect(document.getElementById('pose-v').textContent).toBe('-0.25 м/с')
+    expect(document.getElementById('pose-w').textContent).toBe('1.57 рад/с')
+    expect(container.querySelector('[data-odometry-linear]').dataset.ratio).toBe('-0.5')
+    expect(container.querySelector('[data-odometry-angular]').dataset.ratio).toBe('0.5')
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
 
   it('state messages render odometry telemetry', () => {

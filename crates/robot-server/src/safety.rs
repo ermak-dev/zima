@@ -1,173 +1,185 @@
-//! One lock protects ownership and the bounded latest-command slot. No I/O here.
-use player_bridge::drive::{DriveCommand, StallDetector};
+//! Exclusive wheel-command ownership, lease and explicit bumper blocking. No I/O here.
+use player_bridge::drive::DriveCommand;
 use std::time::{Duration, Instant};
+
 pub struct Safety {
     owner: Option<u64>,
     drive: DriveCommand,
-    stall: StallDetector,
-    hold: Option<Instant>,
     pressed: bool,
-    current: (f64, f64),
-    slam_ok: bool,
+    blocked: bool,
+    stop_pending: bool,
 }
+
 impl Safety {
     pub fn new() -> Self {
         Self {
             owner: None,
             drive: DriveCommand::new(Duration::from_secs(1)),
-            stall: StallDetector::new(),
-            hold: None,
             pressed: false,
-            current: (0., 0.),
-            slam_ok: true,
+            blocked: false,
+            stop_pending: false,
         }
     }
-    /// SLAM verdict for the drive gate. Without a SLAM subsystem the verdict
-    /// stays true (open gate); a lost localization stops and holds driving.
-    pub fn slam(&mut self, ok: bool, now: Instant) {
-        if self.slam_ok == ok {
-            return;
-        }
-        self.slam_ok = ok;
-        if !ok {
-            self.drive = DriveCommand::new(Duration::from_secs(1));
-            self.drive.set(0., 0., now);
-        }
+
+    pub fn is_blocked(&self) -> bool {
+        self.blocked
     }
+
+    pub fn reset_blocked(&mut self) -> bool {
+        if !self.blocked {
+            return false;
+        }
+        self.blocked = false;
+        self.drive = DriveCommand::new(Duration::from_secs(1));
+        true
+    }
+
     pub fn command(&mut self, id: u64, v: f64, w: f64, now: Instant) {
-        if self.owner.is_some_and(|owner| owner != id) {
+        if self.blocked || self.owner.is_some_and(|owner| owner != id) {
             return;
         }
         self.owner = Some(id);
-        if !self.slam_ok || self.hold.is_some_and(|until| now < until) {
-            return;
-        }
         self.drive.set(v, w, now);
     }
+
     pub fn disconnect(&mut self, id: u64) {
         if self.owner != Some(id) {
             return;
         }
         self.owner = None;
         self.drive = DriveCommand::new(Duration::from_secs(1));
-        self.drive.set(0., 0., Instant::now());
-        self.current = (0., 0.);
-        self.stall = StallDetector::new();
+        self.stop_pending = true;
     }
-    pub fn bumper(&mut self, pressed: bool, now: Instant) {
-        if pressed && !self.pressed && self.owner.is_some() {
+
+    pub fn bumper(&mut self, pressed: bool, _now: Instant) {
+        if pressed && !self.pressed {
+            self.blocked = true;
             self.drive = DriveCommand::new(Duration::from_secs(1));
-            self.drive.set(0., 0., now);
-            self.current = (0., 0.);
-            self.stall = StallDetector::new();
-            self.hold = None;
+            self.stop_pending = true;
         }
         self.pressed = pressed;
     }
-    pub fn odom(&mut self, v: f64, w: f64, now: Instant) {
-        if self.stall.update(self.current, (v, w), now) {
-            eprintln!("robot-server: DRIVE STALLED; holding commands for 10 s");
-            self.hold = Some(now + Duration::from_secs(10));
-            self.drive = DriveCommand::new(Duration::from_secs(1));
-            self.drive.set(0., 0., now);
-        }
-    }
+
     pub fn next(&mut self, now: Instant) -> Option<(f64, f64)> {
-        let next = self.drive.next(now);
-        if let Some(v) = next {
-            self.current = v;
+        // A reset/new command must not overwrite an unsent collision stop.
+        if self.stop_pending {
+            self.stop_pending = false;
+            return Some((0., 0.));
         }
-        next
+        if self.blocked {
+            return None;
+        }
+        self.drive.next(now)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    // FEATURE: bounded latest-only commands and exclusive ownership.
-    // SPEC: no startup/viewer zero; overwrite rather than queue; stale pending
-    // commands never start late; only the controlling socket's disconnect stops.
-    // IMPLEMENTATION: shared DriveCommand handles lease/clamp; Safety gates ownership.
-    // RESULT: IMPLEMENTED — latest command, expiry and ownership transitions verified.
+    // FEATURE: explicit bumper blocker with a priority stop and manual reset.
+    // SPEC: reset preserves held contact; old commands never resume and stop cannot be overwritten.
+    // IMPLEMENTATION: latched block and separate stop slot; no odometry or SLAM gate.
+    // RESULT: IMPLEMENTED — reset, rearm, priority, ownership and lease verified offline.
     // STATUS: DONE
-    // BUG: a held bumper prevents an operator from driving away.
-    // HYPOTHESIS: the command gate conflates a contact edge with a held state.
-    // SPEC: contact clears pending commands once; subsequent commands remain usable.
-    // SOLUTION: remove the held-bumper command gate, keeping the contact-edge stop.
-    // RESULT: FIXED — manual reverse/turn/forward and repeated contacts verified offline.
-    // STATUS: FIXED
     #[test]
-    fn bumper_stops_without_reverse_and_discards_pending_commands() {
+    fn collision_stop_survives_reset_and_new_command_before_drive_tick() {
         let now = Instant::now();
         let mut s = Safety::new();
+        s.command(1, 0.1, 0., now);
         s.bumper(true, now);
-        assert_eq!(s.next(now), None);
+        assert!(s.is_blocked());
+        s.command(1, -0.1, 0., now);
+        s.reset_blocked();
+        assert!(!s.is_blocked());
+        s.command(1, -0.06, 0., now);
+        assert_eq!(s.next(now), Some((0., 0.)));
+        assert_eq!(s.next(now), Some((-0.06, 0.)));
+        s.bumper(true, now);
+        assert!(!s.is_blocked());
         s.bumper(false, now);
-        s.command(1, 0.06, 0., now);
-        assert_eq!(s.next(now), Some((0.06, 0.)));
-        s.command(1, 0.08, 0.1, now);
+        s.bumper(true, now);
+        assert!(s.is_blocked());
+    }
+
+    #[test]
+    fn contact_blocks_without_owner_until_explicit_reset() {
+        let now = Instant::now();
+        let mut s = Safety::new();
+        assert!(!s.is_blocked());
+        assert_eq!(s.next(now), None);
+        s.bumper(true, now);
+        assert!(s.is_blocked());
+        assert_eq!(s.next(now), Some((0., 0.)));
+        s.command(1, 0.1, 0., now);
+        s.bumper(false, now);
+        assert!(s.is_blocked());
+        assert_eq!(s.next(now + Duration::from_secs(30)), None);
+        assert!(s.reset_blocked());
+        assert_eq!(s.next(now), None);
+        s.command(2, -0.06, 0., now);
+        assert_eq!(s.next(now), Some((-0.06, 0.)));
+    }
+
+    #[test]
+    fn reset_preserves_contact_level_and_never_resumes_old_commands() {
+        let now = Instant::now();
+        let mut s = Safety::new();
+        s.command(1, 0.1, 0., now);
+        s.next(now);
         s.bumper(true, now);
         assert_eq!(s.next(now), Some((0., 0.)));
+        assert!(s.reset_blocked());
+        assert!(!s.reset_blocked());
+        s.bumper(true, now);
+        assert!(!s.is_blocked());
+        assert_eq!(s.next(now), None);
+        s.command(1, -0.06, 0., now);
+        assert_eq!(s.next(now), Some((-0.06, 0.)));
         s.bumper(false, now);
         assert_eq!(s.next(now), None);
         s.bumper(true, now);
+        assert!(s.is_blocked());
         assert_eq!(s.next(now), Some((0., 0.)));
-        for (i, command) in [(-0.06, 0.), (0., 0.2), (0.06, 0.)].into_iter().enumerate() {
-            let t = now + Duration::from_millis(100 * (i as u64 + 1));
-            s.command(1, command.0, command.1, t);
-            s.bumper(true, t);
-            assert_eq!(s.next(t), Some(command));
-            assert_eq!(s.next(t), None);
+    }
+
+    #[test]
+    fn disconnect_does_not_clear_block_and_idle_reset_does_not_stop() {
+        let now = Instant::now();
+        let mut s = Safety::new();
+        s.command(1, 0.1, 0., now);
+        assert!(!s.reset_blocked());
+        assert_eq!(s.next(now), Some((0.1, 0.)));
+        s.bumper(true, now);
+        s.next(now);
+        s.disconnect(2);
+        assert!(s.is_blocked());
+        assert_eq!(s.next(now), None);
+        s.disconnect(1);
+        assert!(s.is_blocked());
+        assert_eq!(s.next(now), Some((0., 0.)));
+        s.reset_blocked();
+        assert_eq!(s.next(now), None);
+        s.command(2, -0.1, 0., now);
+        assert_eq!(s.next(now), Some((-0.1, 0.)));
+    }
+
+    #[test]
+    fn angular_ceiling_preserves_lower_speeds() {
+        let now = Instant::now();
+        let mut s = Safety::new();
+        for (requested, expected) in [
+            (0.4, 0.4),
+            (-0.4, -0.4),
+            (1., 1.),
+            (-2., -2.),
+            (3.14, 3.14),
+            (-3.14, -3.14),
+            (9., 3.14),
+            (-9., -3.14),
+        ] {
+            s.command(1, 0.1, requested, now);
+            assert_eq!(s.next(now), Some((0.1, expected)));
         }
-        s.bumper(false, now + Duration::from_millis(400));
-        assert_eq!(s.next(now + Duration::from_millis(400)), None);
-        s.bumper(true, now + Duration::from_millis(500));
-        assert_eq!(s.next(now + Duration::from_millis(500)), Some((0., 0.)));
-    }
-
-    // BUG: bumper stop can leave the stall hold latched and block manual recovery.
-    // HYPOTHESIS: the contact edge resets only the command slot, not stall state/current.
-    // SOLUTION: contact clears the prior stall episode and its hold before queuing zero.
-    // RESULT: FIXED — stale hold/race reproduced; manual retreat and new-stall protection pass.
-    // STATUS: FIXED
-    #[test]
-    fn bumper_contact_clears_stall_hold_for_manual_recovery() {
-        let t0 = Instant::now();
-        let mut s = Safety::new();
-        s.command(1, 0.1, 0., t0);
-        assert_eq!(s.next(t0), Some((0.1, 0.)));
-        s.odom(0., 0., t0);
-        let contact = t0 + Duration::from_secs(3);
-        s.odom(0., 0., contact);
-        assert_eq!(s.next(contact), Some((0., 0.)));
-        s.bumper(true, contact);
-        assert_eq!(s.next(contact), Some((0., 0.)));
-        s.command(1, -0.06, 0., contact);
-        assert_eq!(s.next(contact), Some((-0.06, 0.)));
-        s.command(2, 0.1, 0., contact);
-        assert_eq!(s.next(contact), None);
-        s.odom(-0.06, 0., contact);
-        s.bumper(false, contact);
-        s.odom(0., 0., contact);
-        let later = contact + Duration::from_secs(3);
-        s.odom(0., 0., later);
-        assert_eq!(s.next(later), Some((0., 0.)));
-        s.command(1, 0.06, 0., later);
-        assert_eq!(s.next(later), None, "new stalls must still hold commands");
-    }
-
-    #[test]
-    fn odometry_between_bumper_and_zero_send_cannot_relatch_old_stall() {
-        let t0 = Instant::now();
-        let mut s = Safety::new();
-        s.command(1, 0.1, 0., t0);
-        s.next(t0);
-        s.odom(0., 0., t0);
-        let contact = t0 + Duration::from_secs(3);
-        s.bumper(true, contact);
-        s.odom(0., 0., contact);
-        assert_eq!(s.next(contact), Some((0., 0.)));
-        s.command(1, -0.06, 0., contact);
-        assert_eq!(s.next(contact), Some((-0.06, 0.)));
     }
 
     #[test]
@@ -178,53 +190,20 @@ mod tests {
         s.disconnect(5);
         assert_eq!(s.next(now), None);
         for i in 0..10000 {
-            s.command(1, i as f64 / 10000., -1., now);
+            s.command(1, i as f64 / 10000., -9., now);
         }
         s.command(2, -0.1, 0., now);
-        assert_eq!(s.next(now), Some((0.5, -0.4)));
+        assert_eq!(s.next(now), Some((0.5, -3.14)));
         assert_eq!(s.next(now), None);
         s.disconnect(2);
         assert_eq!(s.next(now), None);
         assert_eq!(s.next(now + Duration::from_secs(1)), Some((0., 0.)));
         assert_eq!(s.next(now + Duration::from_secs(2)), None);
         s.command(1, 0.08, 0., now + Duration::from_secs(2));
-        assert_eq!(
-            s.next(now + Duration::from_secs(4)),
-            None,
-            "stale pending may not start"
-        );
+        assert_eq!(s.next(now + Duration::from_secs(4)), None);
         s.disconnect(1);
         assert_eq!(s.next(Instant::now()), Some((0., 0.)));
-        s.command(2, -1., 1., now + Duration::from_secs(5));
-        assert_eq!(s.next(now + Duration::from_secs(5)), Some((-0.5, 0.4)));
-    }
-    // FEATURE: SLAM gate on manual driving.
-    // SPEC: when localization is not confirmed, commands are ignored and any
-    // active drive is stopped; re-confirmation re-enables; without SLAM the
-    // gate is open and behavior is unchanged.
-    // IMPLEMENTATION: a slam_ok flag in Safety, cleared drive on losing it.
-    // RESULT: IMPLEMENTED — block, stop, resume and default-open verified.
-    // STATUS: DONE
-    #[test]
-    fn slam_loss_blocks_and_stops_manual_commands() {
-        let now = Instant::now();
-        let mut s = Safety::new();
-        s.command(1, 0.1, 0., now);
-        assert_eq!(s.next(now), Some((0.1, 0.0)));
-        s.slam(false, now);
-        assert_eq!(
-            s.next(now + Duration::from_millis(10)),
-            Some((0., 0.)),
-            "losing localization must stop the active drive"
-        );
-        s.command(1, 0.1, 0., now + Duration::from_millis(20));
-        assert_eq!(
-            s.next(now + Duration::from_millis(20)),
-            None,
-            "commands must be ignored while localization is lost"
-        );
-        s.slam(true, now + Duration::from_millis(30));
-        s.command(1, 0.1, 0., now + Duration::from_millis(40));
-        assert_eq!(s.next(now + Duration::from_millis(40)), Some((0.1, 0.0)));
+        s.command(2, -1., 9., now + Duration::from_secs(5));
+        assert_eq!(s.next(now + Duration::from_secs(5)), Some((-0.5, 3.14)));
     }
 }

@@ -3,10 +3,13 @@ import usePanelSocket from './usePanelSocket.js'
 import useMjpeg from './useMjpeg.js'
 import useVision from './useVision.js'
 import VisionFrame from './VisionFrame.jsx'
-import useTeleop, { LIMITS as HARD_LIMITS, DEFAULT_LINEAR_SPEED } from './useTeleop.js'
+import useTeleop, { LIMITS as HARD_LIMITS, DEFAULT_LINEAR_SPEED, DEFAULT_ANGULAR_SPEED } from './useTeleop.js'
 import LidarCanvas from './LidarCanvas.jsx'
 import SlamStatus from './SlamStatus.jsx'
 import ServiceChannels from './ServiceChannels.jsx'
+import OrientationInstruments from './OrientationInstruments.jsx'
+import OdometryInstruments from './OdometryInstruments.jsx'
+import SpeechPanel from './SpeechPanel.jsx'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
 const SEGMENTS = [
@@ -39,6 +42,22 @@ export default function App() {
   const [collapsed, setCollapsed] = useState({ lidar: false, camera: false, sensors: false })
   const [expanded, setExpanded] = useState(null)
   const [visionEnabled, setVisionEnabled] = useState(false)
+  const [audioSettings, setAudioSettings] = useState(null)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch('/api/audio/config', { signal: controller.signal })
+      .then((res) => res.ok ? res.json() : null)
+      .then((settings) => {
+        if (!controller.signal.aborted && settings && typeof settings.enabled === 'boolean' &&
+          Number.isFinite(settings.volume) && Number.isFinite(settings.max_volume) &&
+          settings.volume >= 0 && settings.volume <= settings.max_volume && settings.max_volume <= 1) {
+          setAudioSettings(settings)
+        }
+      })
+      .catch(() => {})
+    return () => controller.abort()
+  }, [])
 
   const onMessage = useCallback((msg) => {
     if (msg.type === 'state') setState(msg.data)
@@ -48,9 +67,10 @@ export default function App() {
   const { connected, send } = usePanelSocket(onMessage)
   const [speed, setSpeed] = useState(DEFAULT_LINEAR_SPEED)
   const linearLimit = Number.isFinite(speed) ? Math.min(Math.max(speed, 0.01), HARD_LIMITS.v) : DEFAULT_LINEAR_SPEED
-  const [turnSpeed, setTurnSpeed] = useState(HARD_LIMITS.w)
-  const angularLimit = Number.isFinite(turnSpeed) ? Math.min(Math.max(turnSpeed, 0.01), HARD_LIMITS.w) : HARD_LIMITS.w
-  const { stop } = useTeleop(send, linearLimit, angularLimit)
+  const [turnSpeed, setTurnSpeed] = useState(DEFAULT_ANGULAR_SPEED)
+  const angularLimit = Number.isFinite(turnSpeed) ? Math.min(Math.max(turnSpeed, 0.01), HARD_LIMITS.w) : DEFAULT_ANGULAR_SPEED
+  const blocked = state.blocked === true
+  const { stop } = useTeleop(send, linearLimit, angularLimit, blocked)
   const cameraActive = !collapsed.camera && expanded !== 'lidar' && expanded !== 'sensors'
   const { status: rawStatus, src: camSrc } = useMjpeg({ url: '/camera.mjpeg', active: cameraActive && !visionEnabled })
   const vision = useVision(cameraActive && visionEnabled)
@@ -123,6 +143,14 @@ export default function App() {
         </div>
         <span id="connection" role="status">{connected ? 'Связь с роботом' : 'Нет связи с панелью'}</span>
       </header>
+      {blocked && <div className="blocked-balloon" role="alert" aria-label="Наезд на препятствие">
+        <div>
+          <strong>Наезд на препятствие</strong>
+          <p>Колёса остановлены. Нажмите «Сброс», чтобы снова разрешить управление.</p>
+          {!connected && <p>Нет связи с сервером. Сброс недоступен.</p>}
+        </div>
+        <button type="button" disabled={!connected} onClick={() => send({ type: 'reset_blocked' })}>Сброс</button>
+      </div>}
       <main id="workspace" data-expanded={expanded || ''}
         data-lidar-collapsed={collapsed.lidar} data-camera-collapsed={collapsed.camera} data-sensors-collapsed={collapsed.sensors}>
         <section id="panel-lidar" className={`lidar${collapsed.lidar ? ' is-collapsed' : ''}${expanded === 'lidar' ? ' is-expanded' : ''}`} aria-labelledby="lidar-title">
@@ -149,13 +177,6 @@ export default function App() {
             </div>
           )}
           <SlamStatus slam={state.slam} />
-          <div className="pose" id="odom" aria-label="Одометрия">
-            <span>x <b id="pose-x">{Number.isFinite(odom.x) ? `${fmt(odom.x)} м` : '—'}</b></span>
-            <span>y <b id="pose-y">{Number.isFinite(odom.y) ? `${fmt(odom.y)} м` : '—'}</b></span>
-            <span>θ <b id="pose-yaw">{Number.isFinite(odom.yaw) ? `${fmt(odom.yaw * 180 / Math.PI)} °` : '—'}</b></span>
-            <span>v <b id="pose-v">{Number.isFinite(odom.vx) ? `${fmt(odom.vx)} м/с` : '—'}</b></span>
-            <span>ω <b id="pose-w">{Number.isFinite(odom.yaw_rate) ? `${fmt(odom.yaw_rate)} рад/с` : '—'}</b></span>
-          </div>
         </section>
         <aside>
           <section id="panel-camera" className={`camera${collapsed.camera ? ' is-collapsed' : ''}${expanded === 'camera' ? ' is-expanded' : ''}`} aria-labelledby="camera-title">
@@ -187,6 +208,12 @@ export default function App() {
               </div>
             </div>
             {!collapsed.sensors && (
+              <div className="sensor-content">
+              <div className="navigation-instruments">
+                <OrientationInstruments compass={sensors.compass} gyro={sensors.service_channels?.['position3d:0']} />
+                <OdometryInstruments odom={odom} />
+              </div>
+              <div className="sensor-readings">
               <table className="sensor-table" aria-label="Все датчики шасси"><tbody>
                 <tr><td>Батарея</td><td id="battery" className={batteryText === null ? 'missing' : ''}>{batteryText ?? 'нет данных'}</td></tr>
                 <tr><td>Док</td><td id="dock" className={typeof sensors.dock === 'boolean' ? '' : 'missing'}>{typeof sensors.dock === 'boolean' ? (sensors.dock ? 'На доке' : 'Вне дока') : 'нет данных'}</td></tr>
@@ -215,9 +242,11 @@ export default function App() {
                   {Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? '65.534 м · sentinel' : `${fmt(sensors.sonar, 3)} м`) : 'нет данных'}
                 </td></tr>
               </tbody></table>
+              </div>
+              <ServiceChannels channels={sensors.service_channels} />
+              </div>
             )}
-            {!collapsed.sensors && <ServiceChannels channels={sensors.service_channels} />}
-            {!collapsed.sensors && <p className="sensor-note">Нули ИК — сырые показания, не признак безопасности. 65.534 м сонара — вероятный sentinel, не дистанция.</p>}
+            {!collapsed.sensors && <p className="sensor-note">Сырые показания, калибровка не подтверждена. Нули ИК не означают безопасность; 65.534 м сонара — sentinel. Последний кадр не гарантирует свежесть.</p>}
           </section>
         </aside>
       </main>
@@ -235,6 +264,7 @@ export default function App() {
         </label>
         <button id="stop" type="button" onClick={stop}>Стоп · Space</button>
         <span className="limits">≤ {HARD_LIMITS.v} м/с &nbsp; ≤ {HARD_LIMITS.w} рад/с</span>
+        <SpeechPanel settings={audioSettings} />
       </footer>
     </>
   )

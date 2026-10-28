@@ -333,6 +333,75 @@ async fn wait_bumper(w: &mut Ws, expected: &str) {
     .await
     .unwrap();
 }
+// FEATURE: persistent explicit collision block and strict observer reset.
+// SPEC: any contact blocks until reset; reset broadcasts without Player data,
+// preserves bumper/ownership, never moves, and survives reconnect/telemetry.
+// IMPLEMENTATION: typed reset with immediate state publication and persistent contact level.
+// RESULT: IMPLEMENTED — strict parsing, reset, observer semantics and rearm verified offline.
+// STATUS: DONE
+#[tokio::test]
+async fn blocked_reset_is_strict_persistent_and_observer_safe() {
+    let mut s = Session::start(&[], None, true).await;
+    let mut owner = s.ws().await;
+    let mut observer = s.ws().await;
+    assert_eq!(frame(&mut owner, "state").await["blocked"], false);
+    frame(&mut observer, "state").await;
+    cmd(&mut owner, r#"{"v":0.1,"w":0}"#).await;
+    assert_eq!(s.command().await.1, 0.1);
+    s.send(bumper(true)).await;
+    assert_eq!(s.command().await.1, 0.);
+    wait_bumper(&mut owner, "PRESSED").await;
+    assert_eq!(frame(&mut observer, "state").await["blocked"], true);
+    for bad in [
+        r#"{"type":"reset_blocked","v":0,"w":0}"#,
+        r#"{"type":"reset_blocked","extra":true}"#,
+        r#"{"type":"reset_blocked","data":{}}"#,
+        r#"{"type":["reset_blocked"]}"#,
+        r#"{"reset_blocked":true}"#,
+        r#"{"type":"reset_blocked","type":"reset_blocked"}"#,
+        r#"{"v":0,"w":0}"#,
+    ] {
+        cmd(&mut observer, bad).await;
+    }
+    cmd(&mut owner, r#"{"v":0.2,"w":0}"#).await;
+    s.quiet(100).await;
+    observer.close(None).await.unwrap();
+    let mut observer = s.ws().await;
+    assert_eq!(frame(&mut observer, "state").await["blocked"], true);
+    cmd(&mut observer, r#"{"type":"reset_blocked"}"#).await;
+    let reset = frame(&mut observer, "state").await;
+    assert_eq!(reset["blocked"], false);
+    assert_eq!(reset["bumper"], "PRESSED");
+    cmd(&mut observer, r#"{"type":"reset_blocked"}"#).await;
+    cmd(&mut observer, r#"{"v":0.3,"w":0}"#).await;
+    s.quiet(80).await;
+    // Repeated pressed data and unrelated telemetry cannot resurrect the block.
+    s.send(bumper(true)).await;
+    s.send(packet(4, 0, 1, 21., &[0; 52])).await;
+    let state = timeout(WAIT, async {
+        loop {
+            let state = frame(&mut observer, "state").await;
+            if state["odom"].is_object() {
+                break state;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state["blocked"], false);
+    cmd(&mut owner, r#"{"v":-0.1,"w":0}"#).await;
+    assert_eq!(s.command().await.1, -0.1);
+    s.send(bumper(false)).await;
+    wait_bumper(&mut observer, "clear").await;
+    s.send(bumper(true)).await;
+    assert_eq!(s.command().await.1, 0.);
+    assert_eq!(frame(&mut observer, "state").await["blocked"], true);
+    owner.close(None).await.unwrap();
+    assert_eq!(s.command().await.1, 0.);
+    let mut reconnect = s.ws().await;
+    assert_eq!(frame(&mut reconnect, "state").await["blocked"], true);
+}
+
 #[test]
 fn help_and_bad_args() {
     let out = Command::new(env!("CARGO_BIN_EXE_robot-server"))
@@ -357,6 +426,32 @@ fn help_and_bad_args() {
         .unwrap()
         .success());
 }
+// FEATURE: backend angular ceiling of 3.14 rad/s.
+// SPEC: WebSocket commands reach fake Player unchanged below the ceiling;
+// excess is clamped symmetrically without changing explicit low-speed commands.
+// IMPLEMENTATION: the shared drive ceiling applies through the existing WS path.
+// RESULT: IMPLEMENTED — lower speeds and symmetric ceiling reach fake Player.
+// STATUS: DONE
+#[tokio::test]
+async fn angular_ceiling_preserves_lower_speeds() {
+    let mut s = Session::start(&[], None, false).await;
+    let mut w = s.ws().await;
+    for (requested, expected) in [
+        (0.4, 0.4),
+        (-0.4, -0.4),
+        (1., 1.),
+        (-2., -2.),
+        (3.14, 3.14),
+        (-3.14, -3.14),
+        (9., 3.14),
+        (-9., -3.14),
+    ] {
+        cmd(&mut w, &json!({"v": 0.1, "w": requested}).to_string()).await;
+        let moving = s.command().await;
+        assert_eq!((moving.1, moving.2), (0.1, expected));
+    }
+}
+
 #[tokio::test]
 async fn silent_player_lease_fragmentation_and_exclusive_driver() {
     let mut s = Session::start(&[], None, false).await;
@@ -384,7 +479,7 @@ async fn silent_player_lease_fragmentation_and_exclusive_driver() {
     s.send(p[..17].to_vec()).await;
     cmd(&mut a, r#"{"v":10,"w":-10}"#).await;
     let moving = s.command().await;
-    assert_eq!((moving.1, moving.2), (0.5, -0.4));
+    assert_eq!((moving.1, moving.2), (0.5, -3.14));
     cmd(&mut b, r#"{"v":-0.1,"w":0}"#).await;
     b.close(None).await.unwrap();
     let stop = s.command().await;
@@ -435,6 +530,8 @@ async fn scan_and_raw_sensor_schema() {
     .await
     .unwrap();
     assert_eq!(v["sensors"]["bumper_segments"], json!([true, false, true]));
+    let contact_stop = s.command().await;
+    assert_eq!((contact_stop.1, contact_stop.2), (0., 0.));
     s.send(bumper_segments(&[0, 0, 0])).await;
     let v = timeout(WAIT, async {
         loop {
@@ -542,12 +639,18 @@ async fn scan_and_raw_sensor_schema() {
     );
 }
 #[tokio::test]
-async fn bumper_stops_without_automatic_reverse_or_restart() {
+async fn bumper_latches_until_reset_without_automatic_motion() {
     let mut s = Session::start(&[], None, true).await;
     let mut w = s.ws().await;
     s.send(bumper(true)).await;
     wait_bumper(&mut w, "PRESSED").await;
-    s.quiet(80).await;
+    assert_eq!(
+        s.command().await.1,
+        0.,
+        "contact stops even without an owner"
+    );
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
+    assert_eq!(frame(&mut w, "state").await["blocked"], false);
     s.send(bumper(false)).await;
     wait_bumper(&mut w, "clear").await;
     cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
@@ -556,6 +659,13 @@ async fn bumper_stops_without_automatic_reverse_or_restart() {
     let stop = s.command().await;
     assert_eq!((stop.1, stop.2), (0., 0.));
     wait_bumper(&mut w, "PRESSED").await;
+    s.quiet(50).await;
+    cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
+    s.quiet(50).await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
+    let reset = frame(&mut w, "state").await;
+    assert_eq!(reset["blocked"], false);
+    assert_eq!(reset["bumper"], "PRESSED");
     s.quiet(50).await;
     cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
     assert_eq!(s.command().await.1, -0.06);
@@ -575,7 +685,7 @@ async fn bumper_stops_without_automatic_reverse_or_restart() {
     s.quiet(100).await;
 }
 #[tokio::test]
-async fn stalled_drive_stops_and_holds_commands() {
+async fn stationary_odometry_never_blocks_manual_commands() {
     let mut s = Session::start(&[], None, false).await;
     let mut w = s.ws().await;
     let start = Instant::now();
@@ -595,18 +705,31 @@ async fn stalled_drive_stops_and_holds_commands() {
     }
     assert!(last_motion > Duration::from_secs(2));
     assert!(
-        last_motion < Duration::from_millis(3600),
-        "commands continued after stall: {last_motion:?}"
+        last_motion > Duration::from_millis(4000),
+        "odometry must not gate teleop: {last_motion:?}"
     );
-    assert!(stopped);
-    s.quiet(80).await;
-    // A confirmed bumper contact ends the old stall episode so the operator
-    // can issue a fresh retreat command without a ten-second lockout.
+    assert!(!stopped, "stall detection must not stop manual driving");
+    // Contact alone blocks, irrespective of odometry.
     s.send(bumper(true)).await;
     wait_bumper(&mut w, "PRESSED").await;
-    let stop = s.command().await;
-    assert_eq!((stop.1, stop.2), (0., 0.));
+    timeout(WAIT, async {
+        loop {
+            let stop = s.command().await;
+            if (stop.1, stop.2) == (0., 0.) {
+                break;
+            }
+            assert_eq!(
+                (stop.1, stop.2),
+                (0.06, 0.),
+                "only pre-contact commands may precede stop"
+            );
+        }
+    })
+    .await
+    .unwrap();
     s.quiet(80).await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
+    assert_eq!(frame(&mut w, "state").await["blocked"], false);
     let sent = Instant::now();
     cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
     let reverse = s.command().await;
@@ -765,6 +888,45 @@ async fn bad_player_banner_is_not_retried() {
             .is_err(),
         "a protocol failure must never reconnect"
     );
+}
+
+// FEATURE: shared robot-server authenticates control sessions without exposing the token.
+// SPEC: AUTH must succeed before ACTIVATE; authentication cannot starve supervision.
+#[tokio::test]
+async fn supervisor_control_session_authenticates_before_activation() {
+    let supervisor = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = supervisor.local_addr().unwrap().to_string();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let fake = tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let (stream, _) = supervisor.accept().await.unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "AUTH control-test-token\n");
+        stream
+            .get_mut()
+            .write_all(b"AUTHENTICATED\n")
+            .await
+            .unwrap();
+        line.clear();
+        stream.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "ACTIVATE\n");
+        stream.get_mut().write_all(b"ACTIVATED\n").await.unwrap();
+        let _ = seen_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    let session = Session::start_env(
+        &[],
+        Some(address),
+        false,
+        Duration::ZERO,
+        &[("ROBOT_SUPERVISOR_TOKEN", "control-test-token")],
+    )
+    .await;
+    timeout(WAIT, seen_rx).await.unwrap().unwrap();
+    drop(session);
+    fake.abort();
 }
 
 // BUG: the real supervisor replies ACTIVATED before monitoring heartbeat.
@@ -942,14 +1104,31 @@ async fn camera_proxy_streams_with_server_only_auth_and_no_redirects() {
     std::fs::write(&path, "machine 127.0.0.1 login user password secret\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    for route in ["mjpeg", "redirect"] {
-        let url = format!("http://127.0.0.1:{cp}/{route}");
-        let s = Session::start(
-            &["--camera-url", &url, "--netrc", path.to_str().unwrap()],
-            None,
-            false,
-        )
-        .await;
+    // FEATURE: the shared TOML environment handoff configures camera consumers.
+    // SPEC: configured URL/netrc work without repeating CLI parameters.
+    for route in ["mjpeg", "redirect", "env"] {
+        let camera_route = if route == "env" { "mjpeg" } else { route };
+        let url = format!("http://127.0.0.1:{cp}/{camera_route}");
+        let s = if route == "env" {
+            Session::start_env(
+                &[],
+                None,
+                false,
+                Duration::ZERO,
+                &[
+                    ("ROBOT_CAMERA_URL", &url),
+                    ("ROBOT_CAMERA_NETRC", path.to_str().unwrap()),
+                ],
+            )
+            .await
+        } else {
+            Session::start(
+                &["--camera-url", &url, "--netrc", path.to_str().unwrap()],
+                None,
+                false,
+            )
+            .await
+        };
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -958,7 +1137,7 @@ async fn camera_proxy_streams_with_server_only_auth_and_no_redirects() {
             .send()
             .await
             .unwrap();
-        if route == "mjpeg" {
+        if route != "redirect" {
             assert_eq!(response.status(), 200);
             assert_eq!(
                 response.headers()[header::CONTENT_TYPE],
@@ -1064,8 +1243,7 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
     s.fake.abort();
     drop(s);
 
-    // Session 2 (localize on a "saved" map): the fake replies low quality
-    // first (lost: teleop blocked), then localizes with a pose (teleop on).
+    // Session 2 reports lost then localized; neither status gates manual commands.
     let mut s2 = Session::start_env(
         &["--slam-adapter", fake2.to_str().unwrap()],
         None,
@@ -1094,11 +1272,11 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
     .expect("slam must be lost on sustained low quality");
     assert_eq!(st["mode"], "lost");
     cmd(&mut w2, r#"{"v":0.1,"w":0.0}"#).await;
-    // The gate itself may emit a final stop zero; drain it, then no more.
-    sleep(Duration::from_millis(100)).await;
-    while let Ok(c) = s2.cmds.try_recv() {
-        assert_eq!(c.1, 0.0, "only a stop zero may slip through the gate");
-    }
+    assert_eq!(
+        s2.command().await.1,
+        0.1,
+        "lost SLAM is display data, not a drive gate"
+    );
     s2.quiet(120).await;
     // The fake localizes from its 10th update on; send enough scans.
     for i in 0..8 {

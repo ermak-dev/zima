@@ -8,14 +8,17 @@ const KEYS = {
   ArrowUp: ['v', 1], KeyW: ['v', 1], ArrowDown: ['v', -1], KeyS: ['v', -1],
   ArrowLeft: ['w', 1], KeyA: ['w', 1], ArrowRight: ['w', -1], KeyD: ['w', -1],
 }
-export const LIMITS = { v: 0.5, w: 0.4 }
+export const LIMITS = { v: 0.5, w: 3.14 }
 export const DEFAULT_LINEAR_SPEED = 0.1
+export const DEFAULT_ANGULAR_SPEED = 0.4
 
-export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angularLimit = LIMITS.w) {
+export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angularLimit = DEFAULT_ANGULAR_SPEED, blocked = false) {
   const held = useRef(new Set())
   const [active, setActive] = useState(false)
   const sendRef = useRef(send)
   sendRef.current = send
+  const blockedRef = useRef(blocked)
+  blockedRef.current = blocked
   const speed = Number.isFinite(linearLimit) ? Math.max(0, Math.min(linearLimit, LIMITS.v)) : 0
   const limitsRef = useRef({ v: 0, w: 0 })
   limitsRef.current = {
@@ -24,6 +27,7 @@ export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angu
   }
 
   const publish = () => {
+    if (blockedRef.current) return
     const cmd = { v: 0, w: 0 }
     for (const code of held.current) {
       const [axis, dir] = KEYS[code]
@@ -39,7 +43,9 @@ export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angu
     }
 
     const onKey = (event, add) => {
+      if (blockedRef.current) return
       if (event.code === 'Space') {
+        if (isTyping(event.target, event.code) || event.target?.closest?.('[contenteditable]:not([contenteditable="false"])')) return
         event.preventDefault()
         held.current.clear()
         setActive(false)
@@ -48,6 +54,7 @@ export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angu
       }
       if (!KEYS[event.code] || (add && isTyping(event.target, event.code))) return
       if (!add && !held.current.has(event.code)) return
+      if (add && event.repeat && !held.current.has(event.code)) return
       event.preventDefault()
       if (add) held.current.add(event.code)
       else held.current.delete(event.code)
@@ -76,6 +83,12 @@ export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angu
       document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [])
+
+  useEffect(() => {
+    if (!blocked) return
+    held.current.clear()
+    setActive(false)
+  }, [blocked])
 
   // Refresh loop only while a key is held; cleanup clears it.
   useEffect(() => {

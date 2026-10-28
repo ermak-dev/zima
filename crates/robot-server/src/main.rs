@@ -1,3 +1,4 @@
+mod audio;
 mod camera;
 mod player;
 mod safety;
@@ -44,6 +45,7 @@ struct Config {
     netrc: PathBuf,
     slam_adapter: Option<PathBuf>,
     yolo_adapter: Option<PathBuf>,
+    audio_only: bool,
 }
 impl Config {
     fn parse() -> Result<Option<Self>, Failure> {
@@ -52,16 +54,26 @@ impl Config {
             player_port: 6665,
             listen: "127.0.0.1".into(),
             port: 8085,
-            camera_url: "http://cam/mjpeg".into(),
-            netrc: PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".config/robot/camera.netrc"),
+            camera_url: std::env::var("ROBOT_CAMERA_URL")
+                .unwrap_or_else(|_| "http://cam/mjpeg".into()),
+            netrc: std::env::var_os("ROBOT_CAMERA_NETRC")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                        .join(".config/robot/camera.netrc")
+                }),
             slam_adapter: None,
             yolo_adapter: None,
+            audio_only: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
+            if a == "--audio-only" {
+                c.audio_only = true;
+                continue;
+            }
             if a == "--help" {
-                println!("robot-server\n\n--player-host HOST  Player host (robot)\n--player-port PORT  Player port (6665)\n--listen HOST       HTTP bind host (127.0.0.1)\n--port PORT         HTTP port (8085)\n--camera-url URL    MJPEG URL (http://cam/mjpeg)\n--netrc PATH        Camera credentials (~/.config/robot/camera.netrc)\n--slam-adapter EXE  Optional MRPT SLAM adapter (line JSON over stdio)\n--yolo-adapter EXE  Optional camera object detector (line JSON over stdio)\n--help             Show help");
+                println!("robot-server\n\n--player-host HOST  Player host (robot)\n--player-port PORT  Player port (6665)\n--listen HOST       HTTP bind host (127.0.0.1)\n--port PORT         HTTP port (8085)\n--camera-url URL    MJPEG URL (http://cam/mjpeg)\n--netrc PATH        Camera credentials (~/.config/robot/camera.netrc)\n--slam-adapter EXE  Optional MRPT SLAM adapter (line JSON over stdio)\n--yolo-adapter EXE  Optional camera object detector (line JSON over stdio)\n--audio-only       Serve HTTP/TTS without Player or controller handoff\n--help             Show help");
                 return Ok(None);
             }
             let v = args.next().ok_or("option requires a value")?;
@@ -103,6 +115,7 @@ impl Config {
 struct App {
     safety: Arc<Mutex<Safety>>,
     state: watch::Receiver<Value>,
+    states: watch::Sender<Value>,
     scan: watch::Receiver<Option<Value>>,
     camera: camera::Camera,
     vision: Option<watch::Receiver<Value>>,
@@ -113,6 +126,17 @@ struct App {
 struct Command {
     v: f64,
     w: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetCommand {
+    #[serde(rename = "type")]
+    _kind: ResetKind,
+}
+#[derive(Deserialize)]
+enum ResetKind {
+    #[serde(rename = "reset_blocked")]
+    ResetBlocked,
 }
 async fn index() -> Response {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/panel.html");
@@ -196,6 +220,12 @@ async fn session(socket: WebSocket, app: App) {
                                 std::time::Instant::now(),
                             );
                         }
+                    } else if serde_json::from_str::<ResetCommand>(&text).is_ok() {
+                        let mut safety = app.safety.lock().unwrap();
+                        if safety.reset_blocked() {
+                            app.states
+                                .send_modify(|state| state["blocked"] = json!(false));
+                        }
                     }
                 }
                 Message::Close(_) => break,
@@ -253,38 +283,50 @@ async fn heartbeat(mut stream: TcpStream) -> Result<(), Failure> {
     }
 }
 async fn run(c: Config) -> Result<(), Failure> {
+    let audio = audio::Audio::new()?;
+    if c.audio_only {
+        let listener = TcpListener::bind((c.listen.as_str(), c.port)).await?;
+        let router = Router::new()
+            .route("/", get(index))
+            .merge(audio::router(audio));
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        return Ok(());
+    }
     let camera = camera::Camera::new(&c)?;
     let mut supervisor = if let Ok(addr) = std::env::var("ROBOT_SERVER_HEARTBEAT") {
         let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
             .await
             .map_err(|_| "supervisor connection timed out")?
             .map_err(|_| "supervisor connection failed")?;
+        audio::authenticate(
+            &mut stream,
+            &std::env::var("ROBOT_SUPERVISOR_TOKEN").unwrap_or_default(),
+        )
+        .await?;
         tokio::time::timeout(Duration::from_secs(1), stream.write_all(b"ACTIVATE\n")).await??;
         Some(stream)
     } else {
         None
     };
     let safety = Arc::new(Mutex::new(Safety::new()));
-    let (states, state) = watch::channel(telemetry::Telemetry::new().json());
+    let mut initial = telemetry::Telemetry::new().json();
+    initial["blocked"] = json!(false);
+    let (states, state) = watch::channel(initial);
     let (scans, scan) = watch::channel(None);
-    // Optional SLAM: adapter subprocess on its own thread; observations are
-    // forwarded from the Player reader, verdicts gate driving via Safety.
+    // SLAM observations come from Player; results are display data, not drive gates.
     let slam_tx = if let Some(exe) = c.slam_adapter.clone() {
         // Without a saved map the only meaningful mode is mapping; with one,
         // localize unless mapping is explicitly requested.
         let map_path = std::env::var("ROBOT_SLAM_MAP").ok();
         let mapping = map_path.is_none() || std::env::var_os("ROBOT_SLAM_MAPPING").is_some();
-        let safety = safety.clone();
         let states_tx = states.clone();
         match slam::SlamThread::start(
             exe,
             mapping,
             map_path,
-            Box::new(move |slam_state, localized| {
-                safety
-                    .lock()
-                    .unwrap()
-                    .slam(localized, std::time::Instant::now());
+            Box::new(move |slam_state| {
                 states_tx.send_if_modified(|old| {
                     let mut next = old.clone();
                     next["slam"] = slam_state.clone();
@@ -340,6 +382,7 @@ async fn run(c: Config) -> Result<(), Failure> {
     let app = App {
         safety,
         state,
+        states,
         scan,
         camera,
         vision,
@@ -359,7 +402,8 @@ async fn run(c: Config) -> Result<(), Failure> {
         .route("/ws", get(upgrade))
         .route("/camera.mjpeg", get(camera::proxy))
         .route("/vision/ws", get(vision::upgrade))
-        .with_state(app);
+        .with_state(app)
+        .merge(audio::router(audio));
     let mut http = tokio::spawn(async move { axum::serve(listener, router).await });
     let (result, completed) = tokio::select! {
      _=shutdown_signal()=>(Ok(()),0),

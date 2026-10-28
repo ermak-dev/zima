@@ -86,6 +86,46 @@ describe('teleop safety', () => {
   // IMPLEMENTATION: bound the angular argument independently and allow WASD on range inputs.
   // RESULT: IMPLEMENTED — independent limits, live refresh, signs and stop verified.
   // STATUS: DONE
+  it.each([3.14, 9])('bounds chassis turn speed %s to 3.14', (speed) => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send, 0.1, speed))
+    key('keydown', 'KeyA')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 3.14 })
+    key('keyup', 'KeyA')
+    key('keydown', 'KeyD')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: -3.14 })
+    key('keyup', 'KeyD')
+  })
+
+  // FEATURE: latched bumper block cancels local held keys without resuming on reset.
+  // SPEC: blocked panels send no movement; reset needs a fresh non-repeat keydown.
+  // IMPLEMENTATION: blocked ref stops sends synchronously and clears held keys/timer.
+  // RESULT: IMPLEMENTED — no periodic commands while blocked or automatic restart after reset.
+  // STATUS: DONE
+  it('clears held keys while blocked and requires a fresh press after reset', () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    const { rerender } = renderHook(({ blocked }) => useTeleop(send, 0.1, 0.4, blocked), {
+      initialProps: { blocked: false },
+    })
+    key('keydown', 'KeyW')
+    expect(send).toHaveBeenLastCalledWith({ v: 0.1, w: 0 })
+    rerender({ blocked: true })
+    const count = send.mock.calls.length
+    key('keydown', 'KeyS')
+    act(() => vi.advanceTimersByTime(450))
+    expect(send).toHaveBeenCalledTimes(count)
+    rerender({ blocked: false })
+    act(() => vi.advanceTimersByTime(450))
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', repeat: true, bubbles: true })))
+    expect(send).toHaveBeenCalledTimes(count)
+    key('keyup', 'KeyW')
+    key('keydown', 'KeyS')
+    expect(send).toHaveBeenLastCalledWith({ v: -0.1, w: 0 })
+    key('keyup', 'KeyS')
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+  })
+
   it('adjusts turn speed independently while keys are held', () => {
     vi.useFakeTimers()
     const send = vi.fn()
@@ -107,7 +147,7 @@ describe('teleop safety', () => {
     expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
   })
 
-  it.each([[1, 0.4], [-1, 0], [NaN, 0], [Infinity, 0]])('bounds angular limit %s to %s', (limit, expected) => {
+  it.each([[1, 1], [-1, 0], [NaN, 0], [Infinity, 0]])('bounds angular limit %s to %s', (limit, expected) => {
     const send = vi.fn()
     renderHook(() => useTeleop(send, 0.1, limit))
     key('keydown', 'KeyA')
@@ -150,6 +190,28 @@ describe('teleop safety', () => {
     key('keyup', 'KeyW', button)
     button.remove()
     expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
+  })
+
+  // FEATURE: Space remains text input inside editable speech controls.
+  // SPEC: Neither keydown nor keyup prevents typing or sends a stop command.
+  // IMPLEMENTATION: Apply the typing guard to Space, including contenteditable descendants.
+  // RESULT: IMPLEMENTED — editable Space stays native; global stop behavior retained.
+  // STATUS: DONE
+  it.each(['input', 'textarea', 'contenteditable'])('leaves Space untouched in %s', (kind) => {
+    const send = vi.fn()
+    renderHook(() => useTeleop(send))
+    const editor = document.createElement(kind === 'contenteditable' ? 'div' : kind)
+    if (kind === 'contenteditable') editor.setAttribute('contenteditable', 'true')
+    const target = kind === 'contenteditable' ? editor.appendChild(document.createElement('span')) : editor
+    document.body.append(editor)
+    try {
+      for (const type of ['keydown', 'keyup']) {
+        const event = new KeyboardEvent(type, { code: 'Space', bubbles: true, cancelable: true })
+        act(() => target.dispatchEvent(event))
+        expect(event.defaultPrevented).toBe(false)
+      }
+      expect(send).not.toHaveBeenCalled()
+    } finally { editor.remove() }
   })
 
   it('ignores typing and stops with Space or the explicit stop action', () => {

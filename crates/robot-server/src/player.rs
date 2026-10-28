@@ -250,13 +250,15 @@ pub async fn read(
             }
             (POSITION2D_CODE, 0, POSITION2D_DATA_STATE) => {
                 let v = decode_position2d(&m.payload)?;
-                safety.lock().unwrap().odom(v.vx, v.vyaw, Instant::now());
                 odom_pose = Some((v.x as f64, v.y as f64, v.yaw as f64));
             }
             _ => {}
         }
         if telemetry.update(&m)? {
-            let v = telemetry.json();
+            let mut v = telemetry.json();
+            // Match reset's lock order so telemetry cannot publish an old block verdict.
+            let safety = safety.lock().unwrap();
+            v["blocked"] = serde_json::json!(safety.is_blocked());
             states.send_if_modified(|old| {
                 // Merge, not replace: the slam thread writes its own fields
                 // into this shared state and must survive telemetry publishes.
