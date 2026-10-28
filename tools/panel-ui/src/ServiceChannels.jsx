@@ -4,7 +4,6 @@ const CHANNELS = [
   ['ir:6', 'Статус вентилятора'],
   ['ir:7', 'Ток основной щётки'],
   ['ir:8', 'Ток боковой щётки'],
-  ['position3d:0', 'Гироскоп'],
 ]
 const MOTORS = ['Вентилятор', 'Основная щётка', 'Боковая щётка']
 const array = (values) => `[${values.map((v) => Number.isFinite(v) ? v : '—').join(', ')}]`

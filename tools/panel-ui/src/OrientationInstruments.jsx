@@ -1,22 +1,27 @@
-import { useId } from 'react'
-
-const degrees = (v) => Number.isFinite(v) ? Number((v * 180 / Math.PI).toFixed(3)) : null
+const degrees = (v) => {
+  const result = typeof v === 'number' ? v * 180 / Math.PI : NaN
+  return Number.isFinite(result) ? Number(result.toFixed(3)) : null
+}
 const angleText = (v) => v === null ? '—' : `${v.toFixed(1)}°`
 
+export function compassYaw(compass) {
+  if (!compass || compass.status === 'empty' || compass.status === 'invalid') return null
+  // Older server bundles did not distinguish the observed zero initialization frame.
+  if (compass.status == null && [compass.x, compass.y, compass.z, compass.yaw].every((v) => v === 0)) return null
+  return Number.isFinite(compass.yaw) ? compass.yaw : null
+}
+
 export default function OrientationInstruments({ compass, gyro }) {
-  const clip = useId()
-  const yaw = degrees(compass?.yaw)
-  const roll = degrees(gyro?.pos?.[3])
-  const pitch = degrees(gyro?.pos?.[4])
+  const yaw = degrees(compassYaw(compass))
   const gyroYaw = degrees(gyro?.pos?.[5])
   const heading = yaw === null ? null : (yaw % 360 + 360) % 360
-  const attitudeKnown = roll !== null && pitch !== null
+  const emptyCompass = compass && heading === null && (compass.status === 'empty' || [compass.x, compass.y, compass.z, compass.yaw].every((v) => v === 0))
   return (
     <div className="orientation-instruments">
       <figure className="instrument">
         <h3>Компас</h3>
         <svg viewBox="0 0 120 120" role="img" aria-label="Компас" data-known={heading !== null}>
-          <title>{heading === null ? 'Нет данных компаса' : `Курс датчика ${heading.toFixed(1)}°, не калиброванный север`}</title>
+          <title>{heading === null ? (emptyCompass ? 'Канал компаса возвращает нулевой кадр без измерения' : 'Нет данных компаса') : `Курс датчика ${heading.toFixed(1)}°, не калиброванный север`}</title>
           <circle className="instrument-ring" cx="60" cy="60" r="44" />
           {Array.from({ length: 24 }, (_, i) => <path key={i} className="instrument-tick" d={i % 6 ? 'M60 18v3' : 'M60 16v7'} transform={`rotate(${i * 15} 60 60)`} />)}
           <text x="60" y="12" textAnchor="middle">0°</text>
@@ -32,32 +37,30 @@ export default function OrientationInstruments({ compass, gyro }) {
         </svg>
         <figcaption>
           <b>{heading === null ? 'нет данных' : angleText(heading)}</b>
-          <small>Угол датчика, не север</small>
+          <small>{emptyCompass ? 'Канал передаёт нули' : 'Угол датчика, не север'}</small>
         </figcaption>
       </figure>
       <figure className="instrument">
         <h3>Гироскоп</h3>
-        <svg viewBox="0 0 120 120" role="img" aria-label="Гироскоп" data-known={attitudeKnown} data-roll={roll ?? ''} data-pitch={pitch ?? ''}>
-          <title>{attitudeKnown ? `Крен ${angleText(roll)}, тангаж ${angleText(pitch)}; калибровка не подтверждена` : 'Нет данных гироскопа'}</title>
-          <defs><clipPath id={clip}><circle cx="60" cy="60" r="43" /></clipPath></defs>
+        <svg viewBox="0 0 120 120" role="img" aria-label="Гироскоп" data-known={gyroYaw !== null} data-yaw={gyroYaw ?? ''}>
+          <title>{gyroYaw === null ? 'Нет данных курса гироскопа' : `Поворот в плоскости пола ${angleText(gyroYaw)}. Вид сверху; относительный курс, не магнитный север.`}</title>
           <circle className="instrument-ring" cx="60" cy="60" r="44" />
-          {attitudeKnown && <g clipPath={`url(#${clip})`}>
-            <g transform={`rotate(${-roll} 60 60)`}>
-              <g transform={`translate(0 ${Math.max(-45, Math.min(45, pitch)) * 0.6})`}>
-                <path className="attitude-upper" d="M-60-60h240V60H-60z" />
-                <path className="attitude-lower" d="M-60 60h240v180H-60z" />
-                <path className="attitude-horizon" d="M-60 60h240" />
-                <path className="instrument-tick" d="M45 48h30M50 36h20M45 72h30M50 84h20" />
-              </g>
-            </g>
+          <path className="instrument-axis" d="M16 60h88M60 16v88" />
+          <text x="110" y="63" textAnchor="middle">0°</text>
+          <text x="60" y="12" textAnchor="middle">90</text>
+          <text x="9" y="63" textAnchor="middle">180</text>
+          <text x="60" y="116" textAnchor="middle">270</text>
+          {gyroYaw !== null && <g data-gyro-heading transform={`rotate(${-gyroYaw} 60 60)`}>
+            <circle className="planar-robot" cx="60" cy="60" r="23" />
+            <circle className="instrument-center" cx="49" cy="60" r="5" />
+            <path className="planar-reference" d="M61 60h21" />
+            <path className="instrument-pointer" d="M92 60l-11-6v12z" />
           </g>}
-          <path className="attitude-reference" d="M30 60h20l10 5 10-5h20" />
-          <path className="instrument-pointer" d="M60 18l-4 7h8z" />
         </svg>
-        <figcaption className="gyro-readings">
-          <span title="Roll · position3d:0 pos[3]">Крен <b id="gyro-roll">{angleText(roll)}</b></span>
-          <span title="Pitch · position3d:0 pos[4]">Тангаж <b id="gyro-pitch">{angleText(pitch)}</b></span>
-          <span title="Yaw · position3d:0 pos[5]">Курс <b id="gyro-yaw">{angleText(gyroYaw)}</b></span>
+        <figcaption>
+          <b id="gyro-yaw">{angleText(gyroYaw)}</b>
+          <small>Относительный курс · вид сверху</small>
+          <small>ω {Number.isFinite(gyro?.vel?.[5]) ? `${gyro.vel[5].toFixed(2)} рад/с` : '—'}</small>
         </figcaption>
       </figure>
     </div>

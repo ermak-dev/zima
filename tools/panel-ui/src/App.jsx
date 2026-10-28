@@ -7,9 +7,10 @@ import useTeleop, { LIMITS as HARD_LIMITS, DEFAULT_LINEAR_SPEED, DEFAULT_ANGULAR
 import LidarCanvas from './LidarCanvas.jsx'
 import SlamStatus from './SlamStatus.jsx'
 import ServiceChannels from './ServiceChannels.jsx'
-import OrientationInstruments from './OrientationInstruments.jsx'
+import OrientationInstruments, { compassYaw } from './OrientationInstruments.jsx'
 import OdometryInstruments from './OdometryInstruments.jsx'
 import SpeechPanel from './SpeechPanel.jsx'
+import zimaLogo from './assets/zima-logo.png?inline'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
 const SEGMENTS = [
@@ -86,6 +87,7 @@ export default function App() {
   // Odometry is telemetry only; the lidar view stays in the robot frame.
   const odom = state.odom || {}
   const sensors = state.sensors || {}
+  const compassAngle = compassYaw(sensors.compass)
   const battery = sensors.battery
   const batteryKnown = battery && (Number.isFinite(battery.percent) || Number.isFinite(battery.volts) || typeof battery.charging === 'boolean')
   const batteryText = batteryKnown ? `${Number.isFinite(battery.percent) ? battery.percent : '—'}% / ${Number.isFinite(battery.volts) ? battery.volts : '—'} V${battery.charging === true ? ' · заряд' : ''}` : null
@@ -138,8 +140,8 @@ export default function App() {
     <>
       <header>
         <div className="brand">
-          <svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="13" stroke="currentColor" strokeWidth="1.5" /><circle cx="12" cy="16" r="4" stroke="currentColor" strokeWidth="1.5" /><path d="M22 10v12M25 13v6" stroke="currentColor" strokeWidth="1.5" /></svg>
-          Roborock<span className="meta">V1</span><small>Рабочая панель</small>
+          <img className="brand-logo" src={zimaLogo} alt="Логотип Zima" width="28" height="28" />
+          Zima<span className="meta">V1</span><small>Рабочая панель</small>
         </div>
         <span id="connection" role="status">{connected ? 'Связь с роботом' : 'Нет связи с панелью'}</span>
       </header>
@@ -235,8 +237,8 @@ export default function App() {
                   const v = pair(sensors.drop_ranges?.[i], sensors.drop_ir?.[i])
                   return <SensorRow key={i} id={`drop-${i}`} name={`ИК ${i + 1}`} value={reading(v, '')} />
                 })}
-                <tr><td>Компас</td><td id="compass" className={Number.isFinite(sensors.compass?.yaw) ? '' : 'missing'}>
-                  {Number.isFinite(sensors.compass?.yaw) ? `${fmt(sensors.compass.yaw, 3)} рад · ${fmt(sensors.compass.yaw * 180 / Math.PI, 1)}°` : 'нет данных'}
+                <tr><td>Компас</td><td id="compass" className={Number.isFinite(compassAngle) ? '' : 'missing'}>
+                  {Number.isFinite(compassAngle) ? `${fmt(compassAngle, 3)} рад · ${fmt(compassAngle * 180 / Math.PI, 1)}°` : 'нет данных'}
                 </td></tr>
                 <tr><td>Сонар</td><td id="sonar" className={Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? 'alert' : '') : 'missing'}>
                   {Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? '65.534 м · sentinel' : `${fmt(sensors.sonar, 3)} м`) : 'нет данных'}

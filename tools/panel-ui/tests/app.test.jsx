@@ -33,6 +33,22 @@ afterEach(() => {
 })
 
 describe('App lifecycle', () => {
+  // FEATURE: Zima header with the supplied logo embedded in the single-file panel.
+  // SPEC: replace Roborock text and the generic SVG without an extra image request.
+  // IMPLEMENTATION: inline PNG asset with responsive header dimensions.
+  // RESULT: IMPLEMENTED — Zima header and embedded PNG verified; original bytes preserved.
+  // STATUS: DONE
+  it('brands the header as Zima with its embedded PNG logo', () => {
+    const { container, getByRole } = render(<App />)
+    const brand = container.querySelector('header .brand')
+    expect(brand.textContent).toContain('Zima')
+    expect(brand.textContent).not.toContain('Roborock')
+    const logo = getByRole('img', { name: 'Логотип Zima' })
+    expect(brand.contains(logo)).toBe(true)
+    expect(logo.getAttribute('src')).toMatch(/^data:image\/png;base64,/)
+    expect(brand.querySelector('svg')).toBeNull()
+  })
+
   // FEATURE: obstacle balloon with an explicit server-confirmed reset.
   // SPEC: state.blocked is authoritative, held keys are cancelled, and reset never resumes motion.
   // IMPLEMENTATION: persistent alert sends typed reset and waits for server state.
@@ -143,7 +159,7 @@ describe('App lifecycle', () => {
   // STATUS: DONE
   it('shows service channels without sending commands', () => {
     const { getByRole } = render(<App />)
-    for (const key of ['ir:3', 'ir:4', 'ir:6', 'ir:7', 'ir:8', 'position3d:0']) {
+    for (const key of ['ir:3', 'ir:4', 'ir:6', 'ir:7', 'ir:8']) {
       expect(document.getElementById(`service-${key}`).textContent).toBe('нет данных')
     }
     for (const key of ['motor:0', 'motor:1', 'motor:2']) {
@@ -155,7 +171,7 @@ describe('App lifecycle', () => {
       'position3d:0': { pos: [1, 2, 3, 0.1, 0.2, 0.3], vel: [0, 0, 0, 0, 0, null], stall: false },
     } } } }))
     expect(document.getElementById('service-ir:7').textContent).toBe('voltages [0, 12, —] · ranges [17]')
-    expect(document.getElementById('service-position3d:0').textContent).toContain('pos [1, 2, 3, 0.1, 0.2, 0.3]')
+    expect(document.getElementById('service-position3d:0')).toBeNull()
     expect(getByRole('group', { name: 'Служебные каналы' })).toBeTruthy()
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
@@ -243,9 +259,33 @@ describe('App lifecycle', () => {
     expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
     expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(-90 60 60)')
     const gyro = getByRole('img', { name: 'Гироскоп' })
-    expect(gyro.dataset.roll).toBe('30')
-    expect(gyro.dataset.pitch).toBe('15')
+    expect(gyro.dataset.yaw).toBe('-45')
+    expect(container.querySelector('[data-gyro-heading]').getAttribute('transform')).toBe('rotate(45 60 60)')
     expect(document.getElementById('gyro-yaw').textContent).toBe('-45.0°')
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
+  // FEATURE: planar gyro yaw and an honest compass-unavailable state.
+  // SPEC: gyro depends on yaw, not roll/pitch; zero placeholders are not measured north.
+  // IMPLEMENTATION: top-down yaw glyph, explicit empty compass and no duplicate gyro row.
+  // RESULT: IMPLEMENTED — planar rotation, unknown compass and valid zero heading verified.
+  // STATUS: DONE
+  it('uses planar yaw and rejects empty compass frames without rejecting real zero heading', () => {
+    const { getByRole, container } = render(<App />)
+    act(() => lastHandler({ type: 'state', data: { sensors: {
+      compass: { x: 0, y: 0, z: 0, yaw: 0 },
+      service_channels: { 'position3d:0': { pos: [0, 0, 0, null, null, Math.PI / 2], vel: [0, 0, 0, 0, 0, 0.25] } },
+    } } }))
+    expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
+    expect(container.querySelector('[data-compass-needle]')).toBeNull()
+    expect(document.getElementById('compass').textContent).toBe('нет данных')
+    expect(getByRole('img', { name: 'Гироскоп' }).dataset.known).toBe('true')
+    expect(container.querySelector('[data-gyro-heading]').getAttribute('transform')).toBe('rotate(-90 60 60)')
+    expect(container.querySelector('.attitude-horizon')).toBeNull()
+    expect(getByRole('group', { name: 'Служебные каналы' }).textContent).not.toContain('Гироскоп')
+    act(() => lastHandler({ type: 'state', data: { sensors: { compass: { x: 1, y: 0, z: 0, yaw: 0, status: 'received' } } } }))
+    expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
+    expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(0 60 60)')
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
 
@@ -255,7 +295,7 @@ describe('App lifecycle', () => {
     expect(service.closest('details:not([open])')).toBeNull()
     expect(container.querySelector('.sensor-readings')).toBeTruthy()
     expect(container.querySelector('.orientation-instruments')).toBeTruthy()
-    expect(service.querySelectorAll('[id^="service-"]').length).toBe(10)
+    expect(service.querySelectorAll('[id^="service-"]').length).toBe(9)
   })
 
   it('allows the chassis turn ceiling without changing the initial speed', () => {
