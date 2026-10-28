@@ -58,6 +58,9 @@ impl Safety {
         if pressed && !self.pressed && self.owner.is_some() {
             self.drive = DriveCommand::new(Duration::from_secs(1));
             self.drive.set(0., 0., now);
+            self.current = (0., 0.);
+            self.stall = StallDetector::new();
+            self.hold = None;
         }
         self.pressed = pressed;
     }
@@ -119,6 +122,52 @@ mod tests {
         assert_eq!(s.next(now + Duration::from_millis(400)), None);
         s.bumper(true, now + Duration::from_millis(500));
         assert_eq!(s.next(now + Duration::from_millis(500)), Some((0., 0.)));
+    }
+
+    // BUG: bumper stop can leave the stall hold latched and block manual recovery.
+    // HYPOTHESIS: the contact edge resets only the command slot, not stall state/current.
+    // SOLUTION: contact clears the prior stall episode and its hold before queuing zero.
+    // RESULT: FIXED — stale hold/race reproduced; manual retreat and new-stall protection pass.
+    // STATUS: FIXED
+    #[test]
+    fn bumper_contact_clears_stall_hold_for_manual_recovery() {
+        let t0 = Instant::now();
+        let mut s = Safety::new();
+        s.command(1, 0.1, 0., t0);
+        assert_eq!(s.next(t0), Some((0.1, 0.)));
+        s.odom(0., 0., t0);
+        let contact = t0 + Duration::from_secs(3);
+        s.odom(0., 0., contact);
+        assert_eq!(s.next(contact), Some((0., 0.)));
+        s.bumper(true, contact);
+        assert_eq!(s.next(contact), Some((0., 0.)));
+        s.command(1, -0.06, 0., contact);
+        assert_eq!(s.next(contact), Some((-0.06, 0.)));
+        s.command(2, 0.1, 0., contact);
+        assert_eq!(s.next(contact), None);
+        s.odom(-0.06, 0., contact);
+        s.bumper(false, contact);
+        s.odom(0., 0., contact);
+        let later = contact + Duration::from_secs(3);
+        s.odom(0., 0., later);
+        assert_eq!(s.next(later), Some((0., 0.)));
+        s.command(1, 0.06, 0., later);
+        assert_eq!(s.next(later), None, "new stalls must still hold commands");
+    }
+
+    #[test]
+    fn odometry_between_bumper_and_zero_send_cannot_relatch_old_stall() {
+        let t0 = Instant::now();
+        let mut s = Safety::new();
+        s.command(1, 0.1, 0., t0);
+        s.next(t0);
+        s.odom(0., 0., t0);
+        let contact = t0 + Duration::from_secs(3);
+        s.bumper(true, contact);
+        s.odom(0., 0., contact);
+        assert_eq!(s.next(contact), Some((0., 0.)));
+        s.command(1, -0.06, 0., contact);
+        assert_eq!(s.next(contact), Some((-0.06, 0.)));
     }
 
     #[test]

@@ -600,6 +600,18 @@ async fn stalled_drive_stops_and_holds_commands() {
     );
     assert!(stopped);
     s.quiet(80).await;
+    // A confirmed bumper contact ends the old stall episode so the operator
+    // can issue a fresh retreat command without a ten-second lockout.
+    s.send(bumper(true)).await;
+    wait_bumper(&mut w, "PRESSED").await;
+    let stop = s.command().await;
+    assert_eq!((stop.1, stop.2), (0., 0.));
+    s.quiet(80).await;
+    let sent = Instant::now();
+    cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
+    let reverse = s.command().await;
+    assert_eq!((reverse.1, reverse.2), (-0.06, 0.));
+    eprintln!("manual retreat reached Player after {:?}", sent.elapsed());
 }
 #[tokio::test]
 async fn player_loss_and_corrupt_frame_fail_session() {
