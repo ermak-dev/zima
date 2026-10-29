@@ -3,7 +3,7 @@
 //! from this same ELF and never enter the control ownership path.
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,8 @@ use mask_owner::ipc::{full_rollback, Rollback};
 use mask_owner::{MASK_NO_BRUSHES, MASK_STANDBY};
 #[path = "../supervisor_audio.rs"]
 mod audio;
+#[path = "../compass.rs"]
+mod compass;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -32,6 +34,7 @@ struct Config {
     // Held through the entire rollback, not merely until owner disconnect.
     owner: Mutex<()>,
     clients: AtomicUsize,
+    stopping: AtomicBool,
 }
 
 fn main() {
@@ -108,6 +111,7 @@ fn main() {
         },
         owner: Mutex::new(()),
         clients: AtomicUsize::new(0),
+        stopping: AtomicBool::new(false),
     });
     let listener = TcpListener::bind((listen.as_str(), heartbeat_port)).unwrap_or_else(|e| {
         eprintln!("robot-supervisor: cannot listen on {heartbeat_port}: {e}");
@@ -184,13 +188,43 @@ fn serve(conn: &mut TcpStream, c: &Config) {
         };
         request = next;
     }
-    if request == "PING" {
+    // Accept counts each handler before it can observe this gate. A handler
+    // that saw false is therefore included in SHUTDOWN's final client count;
+    // handlers accepted after that count see true and cannot start any work.
+    if c.stopping.load(Ordering::SeqCst) {
+        let _ = conn.write_all(b"BUSY\n");
+        return;
+    }
+    if request == "SHUTDOWN" {
+        // Unlike legacy commands, shutdown is never available without AUTH.
+        if c.token.is_none() {
+            let _ = conn.write_all(b"UNAUTHORIZED\n");
+            return;
+        }
+        // Only the thread that closes the gate may reopen it on refusal.
+        if c.stopping.swap(true, Ordering::SeqCst) {
+            let _ = conn.write_all(b"BUSY\n");
+            return;
+        }
+        if c.clients.load(Ordering::SeqCst) == 1 {
+            if let Ok(_owner) = c.owner.try_lock() {
+                // Keep the gate and owner lock through process exit. No control
+                // restoration is needed (or permitted) for an idle shutdown.
+                let _ = conn.write_all(b"STOPPING\n");
+                std::process::exit(0);
+            }
+        }
+        c.stopping.store(false, Ordering::SeqCst);
+        let _ = conn.write_all(b"BUSY\n");
+    } else if request == "PING" {
         let reply: &[u8] = if c.owner.try_lock().is_ok() {
             b"PONG IDLE\n"
         } else {
             b"PONG ACTIVE\n"
         };
         let _ = conn.write_all(reply);
+    } else if request == "COMPASS" {
+        compass::observe(conn);
     } else if request == "ACTIVATE" {
         let Ok(_owner) = c.owner.try_lock() else {
             let _ = conn.write_all(b"BUSY\n");

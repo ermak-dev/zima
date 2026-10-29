@@ -396,6 +396,52 @@ fn persistent_ping_reports_ownership_without_touching_hardware() {
     ping("PONG IDLE\n");
 }
 
+// FEATURE: automatic updates must not interrupt either an owner or its rollback.
+// SPEC: SHUTDOWN is BUSY until the control handler finishes restoring the controller.
+// IMPLEMENTATION: the stopping gate checks lifetime client count and exclusive ownership.
+// RESULT: IMPLEMENTED — active control and an in-progress restore remain uninterrupted.
+// STATUS: DONE
+#[test]
+fn shutdown_preserves_active_owner_and_in_progress_rollback() {
+    let mut service = ServiceRig::new("shutdown-owner-rollback", Some("update-secret"));
+    std::fs::write(
+        service.rig().dir.join("restore.sh"),
+        "#!/bin/sh\necho begin >> \"$1.begin\"\nsleep 1\necho restore >> \"$1\"\n",
+    )
+    .unwrap();
+    let mut owner = service.connect();
+    owner.write_all(b"AUTH update-secret\nACTIVATE\n").unwrap();
+    assert_eq!(response(&mut owner), "AUTHENTICATED\n");
+    assert_eq!(response(&mut owner), "ACTIVATED\n");
+    for restoring in [false, true] {
+        if restoring {
+            owner.write_all(b"GOODBYE\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !service.rig().dir.join("restore.calls.begin").exists() {
+                assert!(Instant::now() < deadline, "restore never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let mut update = service.connect();
+        update.write_all(b"AUTH update-secret\nSHUTDOWN\n").unwrap();
+        assert_eq!(response(&mut update), "AUTHENTICATED\n");
+        assert_eq!(response(&mut update), "BUSY\n");
+        assert!(service.child.try_wait().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(service.rig().dir.join("restore.calls")).unwrap(),
+            ""
+        );
+        if !restoring {
+            owner.write_all(b"hb").unwrap();
+            assert_eq!(
+                *service.rig().applied.lock().unwrap(),
+                vec![mask_owner::MASK_NO_BRUSHES]
+            );
+        }
+    }
+    service.wait_restored(1);
+}
+
 #[test]
 fn persistent_contract_restores_then_accepts_a_new_owner() {
     let mut service = ServiceRig::new("persistent-reuse", None);
