@@ -12,3 +12,4 @@
 #   cmake --build build -j && cmake --install build
 /third_party/
 /adapter
+/adapter-tests
