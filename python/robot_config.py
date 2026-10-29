@@ -189,6 +189,10 @@ def load_config(path=None, *, root=ROOT, environ=None):
 def export_env(config, *, environ=None):
     env = dict(os.environ if environ is None else environ)
     for name, (section, key) in ENV.items():
+        # Documented precedence CLI > environment > TOML: never overwrite a
+        # value the caller already exported (e.g. verified deskew flags).
+        if name in env:
+            continue
         value = config[section][key]
         env[name] = str(value).lower() if isinstance(value, bool) else str(value)
     supervisor = config['supervisor']

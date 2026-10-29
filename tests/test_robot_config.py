@@ -141,6 +141,20 @@ class ConfigLoaderTests(unittest.TestCase):
         env = self.module().export_env(config, environ={})
         self.assertEqual(env['ROBOT_SUPERVISOR_ADDR'], '127.0.0.3:9988')
 
+    def test_export_env_preserves_explicit_environment_over_toml(self):
+        # BUG: export_env overwrote explicit ROBOT_SLAM_* flags with TOML defaults,
+        # silently disabling verified deskew at runtime.
+        # HYPOTHESIS: export must keep caller-provided environment values.
+        env = self.module().export_env(self.load(), environ={
+            'ROBOT_SLAM_SOURCE_TIME_VERIFIED': 'true',
+            'ROBOT_SLAM_DESKEW_ENABLED': 'true',
+            'ROBOT_SLAM_BEAM_TIME_VERIFIED': 'true',
+        })
+        self.assertEqual(env['ROBOT_SLAM_SOURCE_TIME_VERIFIED'], 'true')
+        self.assertEqual(env['ROBOT_SLAM_DESKEW_ENABLED'], 'true')
+        self.assertEqual(env['ROBOT_SLAM_BEAM_TIME_VERIFIED'], 'true')
+        self.assertEqual(env['ROBOT_SLAM_ICP_MIN_GOODNESS'], '0.3')
+
     def test_export_contract_for_rust_audio_and_camera_children(self):
         module = self.module()
         env = module.export_env(self.load(), environ={})
