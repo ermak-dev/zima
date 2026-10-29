@@ -19,7 +19,7 @@ use std::{
 const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
 const FOOTER_RESERVE: u64 = 1024;
-const QUEUE: usize = 128;
+const QUEUE: usize = 1024;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Stats {
@@ -64,7 +64,15 @@ impl Recorder {
     /// Atomically creates a new owner-private file, refusing existing files and
     /// symlinks (including dangling ones). No thread or hardware is activated on failure.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let start = Instant::now();
+        Self::open_with_clock(path, Instant::now(), false)
+    }
+
+    /// Session bundles supply one clock origin for all receipt timestamps.
+    pub fn open_at(path: impl AsRef<Path>, start: Instant) -> io::Result<Self> {
+        Self::open_with_clock(path, start, true)
+    }
+
+    fn open_with_clock(path: impl AsRef<Path>, start: Instant, session: bool) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -75,7 +83,7 @@ impl Recorder {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let header = serde_json::json!({
             "type": "header", "format": "robot-player-raw-v1",
-            "receive_clock": "monotonic offset from recorder open in nanoseconds",
+            "receive_clock": if session { "monotonic offset from session start in nanoseconds" } else { "monotonic offset from recorder open in nanoseconds" },
             "source_clock_verified": false,
             "max_file_bytes": MAX_FILE, "max_payload_bytes": MAX_PAYLOAD,
             "queue_capacity": QUEUE

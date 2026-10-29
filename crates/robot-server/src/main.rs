@@ -18,7 +18,10 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use robot_server::player_recording::Recorder;
+use robot_server::{
+    player_recording::Recorder,
+    session_recording::{start_sources, Session as SessionRecording},
+};
 use safety::Safety;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -122,6 +125,7 @@ struct App {
     camera: camera::Camera,
     vision: Option<watch::Receiver<Value>>,
     ids: Arc<AtomicU64>,
+    recording: Option<Arc<SessionRecording>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -215,6 +219,9 @@ async fn session(socket: WebSocket, app: App) {
                 Message::Text(text) => {
                     if let Ok(c) = serde_json::from_str::<Command>(&text) {
                         if c.v.is_finite() && c.w.is_finite() {
+                            if let Some(r) = &app.recording {
+                                r.command(id, Some((c.v, c.w)), std::time::Instant::now());
+                            }
                             app.safety.lock().unwrap().command(
                                 id,
                                 c.v,
@@ -223,6 +230,9 @@ async fn session(socket: WebSocket, app: App) {
                             );
                         }
                     } else if serde_json::from_str::<ResetCommand>(&text).is_ok() {
+                        if let Some(r) = &app.recording {
+                            r.command(id, None, std::time::Instant::now());
+                        }
                         let mut safety = app.safety.lock().unwrap();
                         if safety.reset_blocked() {
                             app.states
@@ -286,12 +296,24 @@ async fn heartbeat(mut stream: TcpStream) -> Result<(), Failure> {
 }
 async fn run(c: Config) -> Result<(), Failure> {
     // File preflight must precede ACTIVATE (the CLI's earlier handoff is separate).
+    let recording = if c.audio_only {
+        None
+    } else {
+        SessionRecording::from_env()?
+    };
     let recorder = if c.audio_only {
         None
+    } else if let Some(r) = &recording {
+        Some(r.raw.clone())
     } else {
         Recorder::from_env()?
     };
-    let result = run_session(c, recorder.clone()).await;
+    let result = run_session(c, recorder.clone(), recording.clone()).await;
+    if let Some(recording) = recording {
+        let report = recording.finish(Duration::from_secs(2), result.is_ok());
+        eprintln!("robot-server: session recording: {report}");
+        return result;
+    }
     // run_session has stopped command producers, attempted zero where connected,
     // and dropped heartbeat before any bounded wait on the detached disk writer.
     if let Some(recorder) = recorder {
@@ -304,7 +326,11 @@ async fn run(c: Config) -> Result<(), Failure> {
     }
     result
 }
-async fn run_session(c: Config, recorder: Option<Arc<Recorder>>) -> Result<(), Failure> {
+async fn run_session(
+    c: Config,
+    recorder: Option<Arc<Recorder>>,
+    recording: Option<Arc<SessionRecording>>,
+) -> Result<(), Failure> {
     let audio = audio::Audio::new()?;
     if c.audio_only {
         let listener = TcpListener::bind((c.listen.as_str(), c.port)).await?;
@@ -337,6 +363,21 @@ async fn run_session(c: Config, recorder: Option<Arc<Recorder>>) -> Result<(), F
     initial["blocked"] = json!(false);
     let (states, state) = watch::channel(initial);
     let (scans, scan) = watch::channel(None);
+    let _recording_tasks = recording.as_ref().map(|r| {
+        let source = camera.clone();
+        start_sources(
+            r.clone(),
+            // The camera shares LDS power and needs about a minute to boot;
+            // retry the stream within a bounded budget instead of marking it
+            // unavailable from the first failed attempt.
+            move || {
+                let source = source.clone();
+                async move { source.stream().await }
+            },
+            state.clone(),
+            scan.clone(),
+        )
+    });
     // SLAM observations come from Player; results are display data, not drive gates.
     let slam_tx = if let Some(exe) = c.slam_adapter.clone() {
         // Without a saved map the only meaningful mode is mapping; with one,
@@ -406,6 +447,7 @@ async fn run_session(c: Config, recorder: Option<Arc<Recorder>>) -> Result<(), F
         camera,
         vision,
         ids: Arc::new(AtomicU64::new(1)),
+        recording,
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
         Ok(l) => l,
