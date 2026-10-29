@@ -591,7 +591,7 @@ pub struct LaserScanAngle {
     /// Per-beam bearing [rad] — the authoritative geometry, since the
     /// driver does not publish a single start/resolution pair.
     pub angles: Vec<f32>,
-    pub intensities: Vec<u8>,
+    pub intensities: Vec<u16>,
     pub id: u32,
 }
 
@@ -645,19 +645,12 @@ pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
         return Err(Error::CorruptChannel);
     }
     off += 4;
-    let mut intensities = Vec::with_capacity(intensity_count);
-    for i in 0..intensity_count {
-        match payload.get(off + i) {
-            Some(&b) => intensities.push(b),
-            None => {
-                return Err(Error::ShortPayload {
-                    need: off + i + 1,
-                    got: payload.len(),
-                })
-            }
-        }
+    let mut intensities = Vec::new();
+    for _ in 0..intensity_count {
+        let value = u16::try_from(rd_u32(off)?).map_err(|_| Error::CorruptChannel)?;
+        intensities.push(value);
+        off += 4;
     }
-    off += intensity_count + ((4 - intensity_count % 4) % 4);
     let id = rd_u32(off)?;
     Ok(LaserScanAngle {
         max_range,
