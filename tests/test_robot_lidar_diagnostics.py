@@ -59,6 +59,16 @@ sys.stdout.buffer.write(Path(os.environ['TEST_ARCHIVE']).read_bytes())
         self.assertNotIn('kill',script)
         self.assertNotIn('ACTIVATE',script)
 
+    def test_captures_clock_and_uart_provider_libraries_as_data(self):
+        names=['libuart_api.so.3.0.0','librrlog.so','libroboipc.so']
+        self.tar([(f'opt/rockrobo/cleaner/lib/{name}', b'data-only', None) for name in names])
+        output=self.root/'timing'
+        result=self.run_cli(output)
+        self.assertEqual(result.returncode,0,result.stderr)
+        for name in names:
+            self.assertEqual((output/'files/opt/rockrobo/cleaner/lib'/name).read_bytes(),b'data-only')
+            self.assertIn(name.split('.so')[0],self.log.read_text())
+
     def test_existing_output_is_not_modified_and_does_not_contact_robot(self):
         output=self.root/'existing';output.mkdir();(output/'keep').write_text('preserved')
         result=self.run_cli(output)

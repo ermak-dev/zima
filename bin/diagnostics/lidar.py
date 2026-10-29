@@ -19,6 +19,9 @@ for file in \
  /opt/rockrobo/cleaner/lib/libruby*laser*.so* \
  /opt/rockrobo/cleaner/lib/libchassis*.so* \
  /opt/rockrobo/cleaner/lib/libplayer*.so* \
+ /opt/rockrobo/cleaner/lib/libuart_api.so* \
+ /opt/rockrobo/cleaner/lib/librrlog.so* \
+ /opt/rockrobo/cleaner/lib/libroboipc.so* \
  /opt/rockrobo/cleaner/bin/player \
  /opt/rockrobo/cleaner/bin/Player \
  /opt/rockrobo/cleaner/conf/*laser*.cfg \
@@ -50,7 +53,7 @@ def allowed(name):
     parent=str(path.parent);base=path.name
     if parent=='opt/rockrobo/cleaner/bin':return base in ('player','Player')
     if parent=='opt/rockrobo/cleaner/lib':
-        return bool(re.fullmatch(r'lib(?:ruby.*laser.*|chassis.*|player.*)\.so(?:\.[A-Za-z0-9._-]+)?',base))
+        return bool(re.fullmatch(r'lib(?:ruby.*laser.*|chassis.*|player.*|uart_api|rrlog|roboipc)\.so(?:\.[A-Za-z0-9._-]+)?',base))
     if parent in ('opt/rockrobo/cleaner/conf','opt/rockrobo/cleaner/config','opt/rockrobo/cleaner/etc'):
         return base.endswith('.cfg') and any(part in base for part in ('laser','chassis','player'))
     return False
