@@ -3,7 +3,9 @@
 // IMPLEMENTATION: explicit-time SE(2) kernel shared with verified odometry interpolation.
 // RESULT: IMPLEMENTED — all six checks pass; physical Player beam timing remains unverified.
 // STATUS: DONE (offline kernel only; tracker #41 remains open)
-use robot_server::motion_compensation::{deskew, Pose2, TimedPose, TimedRay};
+use robot_server::motion_compensation::{
+    deskew, deskew_rays_from_slots, Pose2, TimedPose, TimedRay,
+};
 
 fn pose(time: f64, x: f64, y: f64, yaw: f64) -> TimedPose {
     TimedPose {
@@ -166,4 +168,96 @@ fn rejects_missing_nonmonotonic_or_nonfinite_timing_instead_of_guessing() {
     }
     assert!(deskew(&[], &valid, 0., 0.).unwrap().is_empty());
     assert!(deskew(&vec![ray(0., 0., 2.); 4097], &valid, 0., 0.).is_err());
+}
+
+// FEATURE: physical LDS deskew from the measured slot/revolution timing model.
+// SPEC: beam times come from the measured revolution period and slot indices,
+// never from sorted angles; rotation uses the SE(2) kernel and LDS lever arm.
+fn traj(t0: f64, w: f64) -> Vec<TimedPose> {
+    (0..=10)
+        .map(|i| {
+            let t = t0 + i as f64 * 0.02;
+            pose(t, 0., 0., w * (t - t0))
+        })
+        .collect()
+}
+
+#[test]
+fn rotating_scan_becomes_upright_with_measured_revolution_timing() {
+    let period = 0.2;
+    let n = 360;
+    let w = 1.0f64;
+    let stamp = 100.2; // publication right after the last beam
+    let t0 = stamp - period;
+    // A fixed world point straight ahead of the starting pose.
+    let (wx, wy) = (2.0f64, 0.5);
+    let rays: Vec<TimedRay> = (0..n)
+        .map(|slot| {
+            let time = stamp - (n - 1 - slot) as f64 * period / n as f64;
+            let yaw = w * (time - t0);
+            // Hit point in base_link at beam time, then the ray from the LDS.
+            let bx = yaw.cos() * wx + yaw.sin() * wy;
+            let by = -yaw.sin() * wx + yaw.cos() * wy;
+            let rx = bx + 0.1;
+            let ry = by;
+            TimedRay {
+                time,
+                angle: ry.atan2(rx),
+                range: rx.hypot(ry),
+            }
+        })
+        .collect();
+    let out = deskew_rays_from_slots(&rays, &traj(t0, w), stamp, period, -0.1).unwrap();
+    for ray in &out {
+        // Deskewed rays point at the same fixed world point from the LDS at the reference pose.
+        let x = -0.1 + ray.range * ray.angle.cos();
+        let y = ray.range * ray.angle.sin();
+        let yaw = w * period;
+        let rx = yaw.cos() * x - yaw.sin() * y;
+        let ry = yaw.sin() * x + yaw.cos() * y;
+        assert!((rx - wx).abs() < 1e-3, "x {} vs {wx}", rx);
+        assert!((ry - wy).abs() < 1e-3, "y {} vs {wy}", ry);
+        assert_eq!(ray.time, stamp);
+    }
+}
+
+#[test]
+fn slot_times_pair_with_array_position_not_angle_value() {
+    // Same angle at the same slot must get the same compensated result,
+    // independent of which angles occupy the other slots.
+    let trajectory = &traj(0., 0.8);
+    // Angle 0.1 sits at slot 0 in both arrays; only the neighbour differs.
+    let a = deskew_rays_from_slots(
+        &[ray(0., 0.1, 1.), ray(0., 1.7, 1.)],
+        trajectory,
+        0.2,
+        0.2,
+        -0.1,
+    )
+    .unwrap();
+    let b = deskew_rays_from_slots(
+        &[ray(0., 0.1, 1.), ray(0., -2.9, 1.)],
+        trajectory,
+        0.2,
+        0.2,
+        -0.1,
+    )
+    .unwrap();
+    assert!((a[0].angle - b[0].angle).abs() < 1e-12);
+    assert!((a[0].range - b[0].range).abs() < 1e-12);
+    assert_eq!(a[0].time, b[0].time);
+    // The kernel returns the common reference time for every corrected ray.
+    assert_eq!(a[0].time, 0.2);
+    // Rotation plus lever arm must actually change slot-0 vs slot-1 geometry.
+    assert!((a[0].angle - a[1].angle - (0.1 - 1.7)).abs() > 1e-6);
+}
+
+#[test]
+fn slot_model_rejects_uncovered_trajectory_or_bad_period() {
+    let rays = vec![ray(0.05, 0., 1.), ray(0.1, 1., 1.)];
+    assert!(deskew_rays_from_slots(&rays, &traj(0.15, 0.), 0.2, 0.2, -0.1).is_err());
+    for bad in [0., -0.2, f64::NAN] {
+        assert!(deskew_rays_from_slots(&rays, &traj(0.05, 0.), 0.2, bad, -0.1).is_err());
+    }
+    assert!(deskew_rays_from_slots(&rays, &traj(0.05, 0.), 0.2, 0.2, -0.1).is_ok());
 }

@@ -124,3 +124,35 @@ pub fn deskew(
         })
         .collect()
 }
+
+// Physical LDS timing model verified on the robot (PLAYER_TIMING.md): the
+// driver fills slots 0..359 in acquisition order, one revolution spans
+// `period` seconds, and the scan is published right after the last beam.
+// Beam time therefore comes from the slot index — never from sorted angles.
+// Slot k of N is assigned k*period/N seconds before the publication stamp;
+// array order is irrelevant because times pair with slots, not neighbours.
+pub fn deskew_rays_from_slots(
+    rays: &[TimedRay],
+    trajectory: &[TimedPose],
+    reference_time: f64,
+    period: f64,
+    sensor_x: f64,
+) -> Result<Vec<TimedRay>, &'static str> {
+    if !period.is_finite() || period <= 0. {
+        return Err("invalid_revolution_period");
+    }
+    let n = rays.len();
+    if n == 0 || n > 4096 {
+        return Err("invalid_deskew_input_size");
+    }
+    let timed: Vec<TimedRay> = rays
+        .iter()
+        .enumerate()
+        .map(|(slot, ray)| TimedRay {
+            time: reference_time - (n - 1 - slot) as f64 * period / n as f64,
+            angle: ray.angle,
+            range: ray.range,
+        })
+        .collect();
+    deskew(&timed, trajectory, reference_time, sensor_x)
+}
