@@ -94,7 +94,15 @@ describe('SLAM overlay rendering', () => {
     expect(arc[0]).toBeCloseTo(127 + 2 * 100 / 3)
     expect(arc[1]).toBeCloseTo(127)
     expect(ctx.translate).toHaveBeenCalledWith(127 + 2 * 100 / 3, 127 + 100 / 3)
-    expect(ctx.rotate).toHaveBeenCalledWith(-Math.PI)
+    // The marker must agree with its own scan: base_link +x (forward) is
+    // screen right at yaw 0, so only -yaw rotates the marker, no extra -90°.
+    expect(ctx.rotate).toHaveBeenCalledWith(-Math.PI / 2)
+  })
+
+  it('points the robot marker along the scan forward axis in robot frame', () => {
+    mount(slam, 'robot'); draw()
+    expect(ctx.translate).toHaveBeenCalledWith(127, 127)
+    expect(ctx.rotate).toHaveBeenCalledWith(0)
   })
 
   it.each([{ scan_id: 7 }, { stale: true }, { error: 'timeout' }, { mode: 'lost' }])(

@@ -173,7 +173,9 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
         const radius = 0.1725 * k
         ctx.save()
         ctx.translate(x, y)
-        ctx.rotate(-Math.PI / 2 - (world ? pose.yaw : 0))
+        // The marker must match its own scan geometry: base_link +x (forward)
+        // is screen right at yaw 0, so only -yaw is applied — no extra -90°.
+        ctx.rotate(world ? -pose.yaw : 0)
         ctx.fillStyle = '#fff'
         ctx.strokeStyle = '#223446'
         ctx.lineWidth = 2
