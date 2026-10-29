@@ -376,8 +376,9 @@ async fn run_session(c: Config, recorder: Option<Arc<Recorder>>) -> Result<(), F
             std::future::pending().await
         }
     });
+    let processor = player::DataProcessor::new(states.clone(), scans, safety.clone(), slam_tx);
     let connected = tokio::select! {
-     r=player::connect(&c, recorder)=>r,
+     r=player::connect(&c, recorder, processor)=>r,
      r=&mut hb=>return r.map_err(|e|->Failure{e.into()}).and_then(|r|r),
     };
     let (reader, mut writer) = match connected {
@@ -388,13 +389,7 @@ async fn run_session(c: Config, recorder: Option<Arc<Recorder>>) -> Result<(), F
             return Err(e);
         }
     };
-    let mut read_task = tokio::spawn(player::read(
-        reader,
-        states.clone(),
-        scans,
-        safety.clone(),
-        slam_tx,
-    ));
+    let mut read_task = tokio::spawn(player::read(reader));
     let mut drive_task = tokio::spawn(player::drive(writer.clone(), safety.clone()));
     let _compass_task = compass::start(states.clone());
     let (_vision_tasks, vision) = if let Some(exe) = c.yolo_adapter {

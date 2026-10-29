@@ -122,6 +122,11 @@ impl Session {
         let (input, mut incoming) = mpsc::channel::<Vec<u8>>(32);
         let (log, cmds) = mpsc::channel(1024);
         let (listening, listening_at) = tokio::sync::oneshot::channel();
+        let startup_data: usize = env
+            .iter()
+            .find(|(name, _)| *name == "ROBOT_TEST_STARTUP_DATA")
+            .map(|(_, value)| value.parse().unwrap())
+            .unwrap_or(0);
         let fake = tokio::spawn(async move {
             if !delay.is_zero() {
                 sleep(delay).await;
@@ -172,6 +177,32 @@ impl Session {
                 // Initial one-shot DATA must survive later subscription round trips.
                 if n == 3 && optional {
                     s.write_all(&bumper(false)).await.unwrap();
+                    if startup_data > 0 {
+                        let mut wall = arr(&[2.2]);
+                        wall.extend(arr(&[0.055]));
+                        s.write_all(&packet(IR_CODE, 0, 1, 20., &wall))
+                            .await
+                            .unwrap();
+                    }
+                }
+                if n == 16 && startup_data > 0 {
+                    s.write_all(&bumper(true)).await.unwrap();
+                    s.write_all(&bumper(false)).await.unwrap();
+                    for i in 0..startup_data {
+                        let mut odom = Vec::new();
+                        for value in [i as f64 / 1000., 2., 0.3, 0., 0., 0.] {
+                            odom.extend(value.to_be_bytes());
+                        }
+                        odom.extend(0u32.to_be_bytes());
+                        if s.write_all(&packet(POSITION2D_CODE, 0, 1, 20. + i as f64 * 0.02, &odom))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    s.write_all(&scan_packet(80.)).await.unwrap();
+                    sleep(Duration::from_millis(150)).await;
                 }
                 let reply = MsgHeader {
                     msg_type: if n < 2 || optional { 4 } else { 6 },
@@ -247,10 +278,12 @@ impl Session {
             if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 break;
             }
-            assert!(
-                this.child.try_wait().unwrap().is_none(),
-                "standalone server exited instead of serving HTTP"
-            );
+            if let Some(status) = this.child.try_wait().unwrap() {
+                let mut error = String::new();
+                std::io::Read::read_to_string(this.child.stderr.as_mut().unwrap(), &mut error)
+                    .unwrap();
+                panic!("standalone server exited instead of serving HTTP ({status}): {error}");
+            }
             assert!(Instant::now() < end, "standalone server did not serve HTTP");
             sleep(Duration::from_millis(10)).await;
         }
@@ -300,6 +333,70 @@ impl Session {
         );
     }
 }
+// BUG: normal startup telemetry exceeded the total 128-message subscription buffer.
+// HYPOTHESIS: process DATA while awaiting ACKs instead of buffering or discarding events.
+// SOLUTION: one persistent processor handles subscription-time and normal DATA at receipt.
+// RESULT: FIXED — 3000 startup packets preserve bumper edges, sensor state and scan sequence.
+// STATUS: FIXED
+#[tokio::test]
+async fn startup_data_flood_preserves_initial_sensors_and_bumper_edges() {
+    const FRAMES: usize = 3000;
+    let mut s = Session::start_env(
+        &[],
+        None,
+        true,
+        Duration::ZERO,
+        &[("ROBOT_TEST_STARTUP_DATA", "3000")],
+    )
+    .await;
+    let mut w = s.ws().await;
+    let state = frame(&mut w, "state").await;
+    assert_eq!(
+        state["blocked"], true,
+        "a press followed by release during startup must still latch"
+    );
+    assert_eq!(state["sensors"]["bumper"], "clear");
+    assert_eq!(state["sensors"]["wall_voltages"], json!([2.2]));
+    assert!((state["sensors"]["wall_ir"].as_f64().unwrap() - 0.055).abs() < 1e-6);
+    assert_eq!(state["odom"]["x"], (FRAMES - 1) as f64 / 1000.);
+    assert_eq!(frame(&mut w, "scan").await["sequence"], 1);
+    s.send(scan_packet(80.2)).await;
+    assert_eq!(frame(&mut w, "scan").await["sequence"], 2);
+    assert_eq!(
+        (s.command().await.1, s.child.try_wait().unwrap()),
+        (0., None)
+    );
+    cmd(&mut w, r#"{"v":0.1,"w":0.0}"#).await;
+    s.quiet(100).await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
+    timeout(WAIT, async {
+        loop {
+            if frame(&mut w, "state").await["blocked"] == false {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    cmd(&mut w, r#"{"v":-0.1,"w":0.0}"#).await;
+    assert_eq!(s.command().await.1, -0.1);
+    let mut service = arr(&[17.]);
+    service.extend(arr(&[]));
+    s.send(packet(IR_CODE, 7, 1, 81., &service)).await;
+    let live = timeout(WAIT, async {
+        loop {
+            let state = frame(&mut w, "state").await;
+            if state["sensors"]["service_channels"]["ir:7"]["voltages"] == json!([17.]) {
+                break state;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(live["sensors"]["wall_voltages"], json!([2.2]));
+    assert_eq!(live["odom"]["x"], (FRAMES - 1) as f64 / 1000.);
+}
+
 // BUG: vendor position3d:2 publishes thresholded XYZ, never a compass yaw.
 // HYPOTHESIS: a separate authenticated raw stream must own compass state, including freshness.
 // SOLUTION: independent authenticated evdev observer with bounded framing and freshness.
@@ -2019,7 +2116,7 @@ async fn raw_recording_captures_subscription_and_unfiltered_frames() {
             .filter(|r| r["interface"] == BUMPER_CODE)
             .count(),
         1,
-        "subscription-buffered DATA must not be lost or recorded twice"
+        "subscription-time DATA must not be lost or recorded twice"
     );
     let raw = rows.iter().find(|r| r["interface"] == 999).unwrap();
     assert_eq!(raw["payload_base64"], "AP+A");
