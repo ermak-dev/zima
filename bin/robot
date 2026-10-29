@@ -6,6 +6,7 @@
 # Usage: robot enable|disable|status        # stock controller handoff
 #        robot position|fan|battery|stop   # battery: read-only power:0 JSON
 #        robot snapshot [output.jpg]
+#        robot diagnose lidar OUTPUT_DIR  # read-only vendor files for offline timing audit
 #        robot record <output.wav> [--seconds N] [--gain 0..90]  # test WAV, no ROS
 #        robot say "text" [--volume V]  # shared web TTS API; settings from TOML
 #        robot audio <command>   # capture, playback, speech (see audio --help)
@@ -438,6 +439,8 @@ case $cmd in
         robotctl "$cmd" ;;
     snapshot)
         exec "${ROBOT_CAMERA_BIN:-$(dirname "$(realpath "$0")")/camera/snapshot}" "$@" ;;
+    diagnose)
+        exec python3 -I "$(repo_root)/bin/diagnostics/lidar.py" "$@" ;;
     record)
         # Standalone test capture: no ROS, no controller, no robot modes. Use
         # `robot audio record` instead while an audio service owns the stream.

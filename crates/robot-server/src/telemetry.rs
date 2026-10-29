@@ -54,6 +54,7 @@ impl Telemetry {
             "ir:8",
             "position3d:0",
             "position3d:1",
+            "position3d:2",
             "position3d:4",
         ] {
             service[key] = self.fields.get(key).cloned().unwrap_or(Value::Null);
@@ -123,7 +124,7 @@ impl Telemetry {
                     "stamp": if msg.header.timestamp > 0. { rounded(msg.header.timestamp, 6) } else { Value::Null },
                 }));
             }
-            (POSITION3D_CODE, 0 | 1 | 4) => {
+            (POSITION3D_CODE, 0 | 1 | 2 | 4) => {
                 let s = decode_position3d(p)?;
                 self.fields.insert(format!("position3d:{}", a.index), json!({
                     "pos": s.pos.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
@@ -159,28 +160,6 @@ impl Telemetry {
                     },
                 );
             }
-            (POSITION3D_CODE, 2) => {
-                let s = decode_position3d(p)?;
-                // The observed zero-filled initialization frame is not a measured heading.
-                let has_measurement = s
-                    .pos
-                    .iter()
-                    .chain(&s.vel)
-                    .any(|v| v.is_finite() && *v != 0.);
-                let heading_valid = has_measurement && s.pos[5].is_finite();
-                self.fields.insert(
-                    "compass".into(),
-                    json!({
-                        "x": rounded(s.pos[0], 3),
-                        "y": rounded(s.pos[1], 3),
-                        "z": rounded(s.pos[2], 3),
-                        "yaw": if heading_valid { rounded(s.pos[5], 3) } else { Value::Null },
-                        "stall": json!(s.stall),
-                        "status": if !has_measurement { "empty" } else if heading_valid { "received" } else { "invalid" },
-                        "stamp": if msg.header.timestamp > 0. { rounded(msg.header.timestamp, 6) } else { Value::Null },
-                    }),
-                );
-            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -213,7 +192,7 @@ pub fn scan(msg: &Message) -> Result<Option<Value>, Failure> {
             ])
         })
         .collect();
-    let mut out = json!({"points":points,"range_max":s.max_range,"frame":"base_link"});
+    let mut out = json!({"id":s.id,"points":points,"range_max":s.max_range,"frame":"base_link"});
     if msg.header.timestamp.is_finite() && msg.header.timestamp > 0. {
         out["stamp"] = json!(msg.header.timestamp);
     }
@@ -303,33 +282,36 @@ mod tests {
         }
     }
 
-    // BUG: the observed all-zero compass placeholder was displayed as a measured zero heading.
-    // SPEC: preserve raw zeros but mark the empty frame unknown; a real zero heading is valid.
-    // IMPLEMENTATION: distinguish empty/received/invalid compass frames and retain source stamp.
-    // RESULT: FIXED — placeholder, measured zero and nonfinite heading verified offline.
+    // BUG: vendor position3d:2 never computes yaw, even when XYZ is nonzero.
+    // HYPOTHESIS: retain the entire vendor packet only as service inventory, not a heading.
+    // SOLUTION: position3d:2 is raw inventory; only ST480 evdev supplies compass samples.
+    // RESULT: FIXED — zero, nonzero and invalid vendor yaw never become a heading.
     // STATUS: FIXED
     #[test]
-    fn compass_placeholder_is_unknown_and_measured_zero_heading_is_valid() {
+    fn vendor_compass_never_supplies_a_heading() {
         let mut t = Telemetry::new();
         let mut m = data(POSITION3D_CODE, vec![0; 100]);
         m.header.addr.index = 2;
-        m.header.timestamp = 50.;
-        t.update(&m).unwrap();
-        let compass = &t.json()["sensors"]["compass"];
-        assert!(compass["yaw"].is_null());
-        assert_eq!(compass["status"], "empty");
-        assert_eq!(compass["x"], 0.);
-        assert_eq!(compass["stamp"], 50.);
-        m.payload[..8].copy_from_slice(&1f64.to_be_bytes());
-        m.header.timestamp = 51.;
-        t.update(&m).unwrap();
-        let compass = &t.json()["sensors"]["compass"];
-        assert_eq!(compass["yaw"], 0.);
-        assert_eq!(compass["status"], "received");
-        m.payload[40..48].copy_from_slice(&f64::NAN.to_be_bytes());
-        t.update(&m).unwrap();
-        assert!(t.json()["sensors"]["compass"]["yaw"].is_null());
-        assert_eq!(t.json()["sensors"]["compass"]["status"], "invalid");
+        for (x, yaw) in [(0., 0.), (600., 0.), (600., 1.25), (600., f64::NAN)] {
+            m.payload[..8].copy_from_slice(&f64::to_be_bytes(x));
+            m.payload[40..48].copy_from_slice(&yaw.to_be_bytes());
+            m.header.timestamp = 50.;
+            t.update(&m).unwrap();
+            let state = t.json();
+            assert!(state["sensors"]["compass"].is_null());
+            assert!(state.get("compass").is_none());
+            let raw = &state["sensors"]["service_channels"]["position3d:2"];
+            assert_eq!(raw["pos"][0], x);
+            assert_eq!(
+                raw["pos"][5],
+                if yaw.is_finite() {
+                    json!(yaw)
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(raw["stamp"], 50.);
+        }
     }
 
     #[test]
@@ -378,6 +360,7 @@ mod tests {
             m.payload.extend(6f32.to_be_bytes());
             m.payload.extend([0; 28]);
             let v = scan(&m).unwrap().unwrap();
+            assert_eq!(v["id"], 0, "decoded scan identity must be preserved");
             assert_eq!(v["points"], json!([]));
             assert!(v.get("stamp").is_none());
         }

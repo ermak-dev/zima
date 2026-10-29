@@ -31,6 +31,14 @@ def defaults(root):
                   'max_volume': 0.9},
         'yandex': {'api_key': '', 'url': 'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize',
                    'voice': 'filipp', 'folder_id': '', 'enabled': False},
+        'slam': {'record_path': '', 'icp_min_goodness': 0.30, 'icp_max_iterations': 40,
+                 'icp_threshold_dist': 0.75, 'icp_decimation': 1,
+                 'insertion_linear': 0.10, 'insertion_angular_deg': 10.0,
+                 'grid_resolution': 0.05, 'max_insert_range': 5.0,
+                 'adapter_timeout_ms': 1500, 'max_pose_age_ms': 500,
+                 'odom_max_skew_ms': 100, 'source_time_verified': False,
+                 'deskew_enabled': False, 'beam_time_verified': False,
+                 'max_uncompensated_translation': 0.08, 'max_uncompensated_rotation_deg': 8.0},
         'providers': {},
     }
 
@@ -52,9 +60,16 @@ ENV = {
     'ROBOT_AUDIO_VOLUME': ('audio', 'volume'), 'ROBOT_AUDIO_MAX_VOLUME': ('audio', 'max_volume'),
     **{'ROBOT_YANDEX_' + key.upper(): ('yandex', key)
        for key in ('api_key', 'url', 'voice', 'folder_id', 'enabled')},
+    **{'ROBOT_SLAM_' + key.upper(): ('slam', key)
+       for key in ('icp_min_goodness', 'icp_max_iterations', 'icp_threshold_dist',
+                   'icp_decimation', 'insertion_linear', 'insertion_angular_deg',
+                   'grid_resolution', 'max_insert_range', 'adapter_timeout_ms',
+                   'max_pose_age_ms', 'odom_max_skew_ms', 'source_time_verified',
+                   'deskew_enabled', 'beam_time_verified', 'max_uncompensated_translation',
+                   'max_uncompensated_rotation_deg', 'record_path')},
 }
 PATHS = {('supervisor', 'binary'), ('run', 'slam_adapter'), ('run', 'yolo_adapter'),
-         ('camera', 'netrc'), ('audio', 'profile')}
+         ('camera', 'netrc'), ('audio', 'profile'), ('slam', 'record_path')}
 
 
 def validate(config, schema):
@@ -82,6 +97,21 @@ def validate(config, schema):
         raise ConfigError('config: timeout outside 100..300000')
     if not 0 <= config['audio']['volume'] <= config['audio']['max_volume'] <= 1:
         raise ConfigError('config: invalid audio volume limits')
+    limits = {
+        'icp_min_goodness': (0, 1), 'icp_max_iterations': (1, 200),
+        'icp_threshold_dist': (0.01, 5), 'icp_decimation': (1, 16),
+        'insertion_linear': (0, 1), 'insertion_angular_deg': (0, 180),
+        'grid_resolution': (0.01, 0.25), 'max_insert_range': (0.15, 10),
+        'adapter_timeout_ms': (50, 10000), 'max_pose_age_ms': (50, 10000),
+        'odom_max_skew_ms': (1, 1000), 'max_uncompensated_translation': (0, 1),
+        'max_uncompensated_rotation_deg': (0, 180),
+    }
+    for key, (lower, upper) in limits.items():
+        if not lower <= config['slam'][key] <= upper:
+            raise ConfigError('config: SLAM setting outside permitted range')
+    if config['slam']['deskew_enabled'] and not (
+            config['slam']['source_time_verified'] and config['slam']['beam_time_verified']):
+        raise ConfigError('config: deskew requires verified source and beam timing')
     for section, key in (('robot', 'ssh_host'), ('robot', 'player_host'),
                          ('supervisor', 'host'), ('supervisor', 'listen'), ('server', 'listen')):
         if config[section][key] and not re.fullmatch(r'[a-zA-Z0-9_.:\[\]-]+', config[section][key]):

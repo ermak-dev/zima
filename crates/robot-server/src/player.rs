@@ -2,9 +2,10 @@
 //! cancelled by a timer tick (which would lose partial headers/payloads).
 use crate::{safety::Safety, telemetry, Config, Failure};
 use player_bridge::*;
+use robot_server::player_recording::Recorder;
 use serde_json::Value;
 use std::{
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -18,7 +19,8 @@ use tokio::{
 type Writer = Arc<AsyncMutex<OwnedWriteHalf>>;
 pub struct Reader {
     stream: OwnedReadHalf,
-    pending: Vec<Message>,
+    pending: Vec<(Message, Instant)>,
+    recorder: Option<Arc<Recorder>>,
 }
 const LIMIT: usize = 1024 * 1024;
 async fn message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Message, Failure> {
@@ -37,7 +39,10 @@ async fn write(stream: &mut TcpStream, h: MsgHeader, p: &[u8]) -> Result<(), Fai
     stream.write_all(p).await?;
     Ok(())
 }
-pub async fn connect(c: &Config) -> Result<(Reader, Writer), Failure> {
+pub async fn connect(
+    c: &Config,
+    recorder: Option<Arc<Recorder>>,
+) -> Result<(Reader, Writer), Failure> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut waiting = false;
         let mut stream = loop {
@@ -102,11 +107,15 @@ pub async fn connect(c: &Config) -> Result<(Reader, Writer), Failure> {
             write(&mut stream, h, &p).await?;
             loop {
                 let m = message(&mut stream).await?;
+                let received = Instant::now();
+                if let Some(recorder) = &recorder {
+                    recorder.record(&m, received);
+                }
                 if m.header.msg_type == MSGTYPE_DATA {
                     if pending.len() >= 128 {
                         return Err("too much DATA during Player subscriptions".into());
                     }
-                    pending.push(m);
+                    pending.push((m, received));
                     continue;
                 }
                 if m.header.msg_type == MSGTYPE_RESP_NACK
@@ -125,7 +134,14 @@ pub async fn connect(c: &Config) -> Result<(Reader, Writer), Failure> {
             }
         }
         let (stream, wr) = stream.into_split();
-        Ok((Reader { stream, pending }, Arc::new(AsyncMutex::new(wr))))
+        Ok((
+            Reader {
+                stream,
+                pending,
+                recorder,
+            },
+            Arc::new(AsyncMutex::new(wr)),
+        ))
     })
     .await
     .map_err(|_| -> Failure { "Player startup timed out after 10 s".into() })?
@@ -214,18 +230,24 @@ pub async fn read(
     states: watch::Sender<Value>,
     scans: watch::Sender<Option<Value>>,
     safety: Arc<Mutex<Safety>>,
-    slam: Option<mpsc::Sender<crate::slam::Observation>>,
+    slam: Option<crate::slam::ObservationSender>,
 ) -> Result<(), Failure> {
     let mut telemetry = telemetry::Telemetry::new();
-    let mut odom_pose: Option<(f64, f64, f64)> = None;
+    let mut odom_history = crate::slam::OdomHistory::new();
+    let mut scan_sequence = 0u64;
     let mut pending = std::mem::take(&mut reader.pending).into_iter();
     loop {
-        let m = if let Some(m) = pending.next() {
+        let (m, received) = if let Some(m) = pending.next() {
             m
         } else {
-            tokio::time::timeout(Duration::from_secs(5), message(&mut reader.stream))
+            let m = tokio::time::timeout(Duration::from_secs(5), message(&mut reader.stream))
                 .await
-                .map_err(|_| "Player data timed out")??
+                .map_err(|_| "Player data timed out")??;
+            let received = Instant::now();
+            if let Some(recorder) = &reader.recorder {
+                recorder.record(&m, received);
+            }
+            (m, received)
         };
         validate(&m)?;
         if m.header.msg_type != MSGTYPE_DATA {
@@ -233,12 +255,30 @@ pub async fn read(
         }
         match (m.header.addr.interf, m.header.addr.index, m.header.subtype) {
             (LASER_CODE, 0, LASER_DATA_SCANANGLE) => {
-                if let Some(v) = telemetry::scan(&m)? {
+                scan_sequence += 1;
+                if let Some(mut v) = telemetry::scan(&m)? {
+                    v["sequence"] = serde_json::json!(scan_sequence);
                     scans.send_replace(Some(v));
                 }
                 if let Some(tx) = &slam {
                     let scan = decode_laser_scanangle(&m.payload)?;
-                    let _ = tx.send(crate::slam::Observation::from_scan(&scan, odom_pose));
+                    let verified = crate::slam::source_time_verified();
+                    let stamp = (m.header.timestamp.is_finite() && m.header.timestamp > 0.)
+                        .then_some(m.header.timestamp);
+                    let association = odom_history.associate(
+                        stamp,
+                        received,
+                        verified,
+                        crate::slam::odom_max_skew_ms(),
+                    );
+                    let mut obs = crate::slam::Observation::from_scan(&scan, association.pose);
+                    obs.scan_stamp = stamp;
+                    obs.sequence = scan_sequence;
+                    obs.received = received;
+                    obs.association = association.kind;
+                    obs.odom_skew_ms = association.skew;
+                    obs.source_time_verified = verified;
+                    let _ = tx.send(obs);
                 }
             }
             (BUMPER_CODE, 0, BUMPER_DATA_STATE) => {
@@ -250,7 +290,11 @@ pub async fn read(
             }
             (POSITION2D_CODE, 0, POSITION2D_DATA_STATE) => {
                 let v = decode_position2d(&m.payload)?;
-                odom_pose = Some((v.x as f64, v.y as f64, v.yaw as f64));
+                odom_history.push(
+                    m.header.timestamp,
+                    received,
+                    (v.x as f64, v.y as f64, v.yaw as f64),
+                );
             }
             _ => {}
         }
@@ -270,6 +314,10 @@ pub async fn read(
                         }
                     }
                 }
+                if let Some(compass) = old.get("compass") {
+                    next["compass"] = compass.clone();
+                    next["sensors"]["compass"] = compass.clone();
+                }
                 if *old == next {
                     false
                 } else {
@@ -278,5 +326,59 @@ pub async fn read(
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // FEATURE: retain monotonic receive clocks for subscription-time DATA.
+    // SPEC: buffering a DATA frame while subscribing must not refresh its age.
+    // IMPLEMENTATION: retain Instant alongside each pending decoded frame.
+    // RESULT: IMPLEMENTED — delayed subscription fake retains original age.
+    // STATUS: DONE
+    #[tokio::test]
+    async fn pending_data_retains_actual_receive_instant() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fake = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut banner = [0; 32];
+            banner[..9].copy_from_slice(b"Player v.");
+            stream.write_all(&banner).await.unwrap();
+            for n in 0..17 {
+                let m = message(&mut stream).await.unwrap();
+                if n == 0 {
+                    let data = MsgHeader {
+                        msg_type: MSGTYPE_DATA,
+                        size: 0,
+                        ..m.header
+                    };
+                    stream.write_all(&encode_header(&data)).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+                let ack = MsgHeader {
+                    msg_type: MSGTYPE_RESP_ACK,
+                    ..m.header
+                };
+                stream.write_all(&encode_header(&ack)).await.unwrap();
+                stream.write_all(&m.payload).await.unwrap();
+            }
+            stream
+        });
+        let config = Config {
+            player_host: "127.0.0.1".into(),
+            player_port: port,
+            listen: "127.0.0.1".into(),
+            port: 0,
+            camera_url: String::new(),
+            netrc: std::path::PathBuf::new(),
+            slam_adapter: None,
+            yolo_adapter: None,
+            audio_only: false,
+        };
+        let (reader, _) = connect(&config, None).await.unwrap();
+        assert!(reader.pending[0].1.elapsed() >= Duration::from_millis(100));
+        drop(fake.await.unwrap());
     }
 }

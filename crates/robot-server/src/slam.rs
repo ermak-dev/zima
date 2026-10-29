@@ -3,9 +3,12 @@
 //! enter the Rust build or the session's failure domain.
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Write},
+    collections::VecDeque,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 /// One request line. Scan bearings are radians in the base_link frame, ranges
@@ -35,6 +38,9 @@ pub struct SlamStatus {
     pub mode: Option<String>,
     pub pose: Option<Pose>,
     pub quality: Option<f64>,
+    pub localization_quality: Option<f64>,
+    pub tracking: Option<String>,
+    pub diagnostics: Value,
 }
 
 pub fn parse_status(line: &str) -> Result<SlamStatus, String> {
@@ -55,6 +61,9 @@ pub fn parse_status(line: &str) -> Result<SlamStatus, String> {
             mode: None,
             pose: None,
             quality: None,
+            localization_quality: None,
+            tracking: Some("error".into()),
+            diagnostics: obj.get("diagnostics").cloned().unwrap_or(Value::Null),
         });
     }
     let mode = obj.get("mode").and_then(Value::as_str).map(str::to_string);
@@ -72,48 +81,153 @@ pub fn parse_status(line: &str) -> Result<SlamStatus, String> {
         mode,
         pose,
         quality,
+        localization_quality: obj.get("localization_quality").and_then(Value::as_f64),
+        tracking: obj
+            .get("tracking")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        diagnostics: obj.get("diagnostics").cloned().unwrap_or(Value::Null),
     })
 }
 
-/// Thin owner of the adapter child process. One request line in, one reply
-/// line out; a dead or wedged child is an Err for the caller to restart.
+/// Bounded nonblocking pipe transport. A transport error poisons this process:
+/// an update may have been applied, so it must never be retried implicitly.
 pub struct Adapter {
     child: Child,
-    reader: BufReader<std::process::ChildStdout>,
+    reader: std::process::ChildStdout,
+    timeout: Duration,
+    limit: usize,
+    poisoned: bool,
 }
-
+fn env_number(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= min && *v <= max)
+        .unwrap_or(default)
+}
+pub fn source_time_verified() -> bool {
+    std::env::var("ROBOT_SLAM_SOURCE_TIME_VERIFIED").is_ok_and(|v| v == "true")
+}
+fn max_age_ms() -> f64 {
+    env_number("ROBOT_SLAM_MAX_POSE_AGE_MS", 500., 1., 60000.)
+}
+pub fn odom_max_skew_ms() -> f64 {
+    env_number("ROBOT_SLAM_ODOM_MAX_SKEW_MS", 100., 1., 10000.)
+}
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(240).collect()
+}
+#[cfg(unix)]
+fn nonblocking(fd: std::os::fd::RawFd) -> Result<(), String> {
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    // Linux F_GETFL/F_SETFL/O_NONBLOCK; server is Linux-only.
+    let flags = unsafe { fcntl(fd, 3) };
+    if flags < 0 || unsafe { fcntl(fd, 4, flags | 0o4000) } < 0 {
+        return Err("cannot configure adapter pipe".into());
+    }
+    Ok(())
+}
 impl Adapter {
     pub fn spawn(exe: &Path) -> Result<Self, String> {
+        Self::spawn_limits(
+            exe,
+            Duration::from_millis(
+                env_number("ROBOT_SLAM_ADAPTER_TIMEOUT_MS", 1500., 1., 60000.) as u64,
+            ),
+            4 * 1024 * 1024,
+        )
+    }
+    pub fn spawn_limits(exe: &Path, timeout: Duration, limit: usize) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
         let mut child = Command::new(exe)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("cannot spawn SLAM adapter {exe:?}: {e}"))?;
-        let reader = BufReader::new(child.stdout.take().expect("adapter stdout"));
-        Ok(Self { child, reader })
+            .map_err(|e| format!("cannot spawn SLAM adapter: {e}"))?;
+        let reader = child.stdout.take().expect("adapter stdout");
+        let mut adapter = Self {
+            child,
+            reader,
+            timeout,
+            limit,
+            poisoned: false,
+        };
+        nonblocking(adapter.reader.as_raw_fd())?;
+        nonblocking(adapter.child.stdin.as_mut().unwrap().as_raw_fd())?;
+        Ok(adapter)
     }
     pub fn call(&mut self, req: &str) -> Result<SlamStatus, String> {
         let line = self.call_raw(req)?;
-        parse_status(&line)
-    }
-    /// Raw reply line; extended replies (e.g. the occupancy grid) carry
-    /// fields beyond SlamStatus and need the full JSON.
-    pub fn call_raw(&mut self, req: &str) -> Result<String, String> {
-        let stdin = self.child.stdin.as_mut().expect("adapter stdin");
-        stdin
-            .write_all(req.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.flush())
-            .map_err(|e| format!("adapter pipe broke: {e}"))?;
-        let mut line = String::new();
-        self.reader
-            .read_line(&mut line)
-            .map_err(|e| format!("adapter reply failed: {e}"))?;
-        if line.trim().is_empty() {
-            return Err("adapter closed".into());
+        match parse_status(&line) {
+            Ok(status) => Ok(status),
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
         }
-        Ok(line)
+    }
+    pub fn call_raw(&mut self, req: &str) -> Result<String, String> {
+        if self.poisoned {
+            return Err("adapter transport failed; explicit restart required".into());
+        }
+        let result = self.exchange(req);
+        if result.is_err() {
+            self.poisoned = true;
+            let _ = self.child.kill();
+        }
+        result
+    }
+    fn exchange(&mut self, req: &str) -> Result<String, String> {
+        let deadline = Instant::now() + self.timeout;
+        let mut bytes = req.as_bytes().to_vec();
+        bytes.push(b'\n');
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if Instant::now() >= deadline {
+                return Err("adapter write deadline exceeded".into());
+            }
+            match self.child.stdin.as_mut().unwrap().write(&bytes[offset..]) {
+                Ok(0) => return Err("adapter stdin closed".into()),
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err("adapter write failed".into()),
+            }
+        }
+        let mut reply = Vec::new();
+        let mut buf = [0; 4096];
+        loop {
+            if Instant::now() >= deadline {
+                return Err("adapter read deadline exceeded".into());
+            }
+            match self.reader.read(&mut buf) {
+                Ok(0) => return Err("adapter closed before complete reply".into()),
+                Ok(n) => {
+                    if reply.len() + n > self.limit {
+                        return Err("adapter reply exceeds size limit".into());
+                    }
+                    reply.extend_from_slice(&buf[..n]);
+                    if let Some(end) = reply.iter().position(|b| *b == b'\n') {
+                        if end + 1 != reply.len() {
+                            return Err("adapter unsolicited reply".into());
+                        }
+                        return String::from_utf8(reply)
+                            .map_err(|_| "adapter reply is not UTF-8".into());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err("adapter read failed".into()),
+            }
+        }
     }
 }
 
@@ -132,6 +246,13 @@ pub struct Observation {
     pub ranges: Vec<f32>,
     pub max_range: f32,
     pub odom: Option<(f64, f64, f64)>,
+    pub scan_id: u32,
+    pub sequence: u64,
+    pub scan_stamp: Option<f64>,
+    pub received: Instant,
+    pub association: &'static str,
+    pub odom_skew_ms: Option<f64>,
+    pub source_time_verified: bool,
 }
 
 impl Observation {
@@ -142,20 +263,26 @@ impl Observation {
         // Normalize to [-pi, pi): the adapter bins beams into fixed angular
         // slots starting at -pi.
         let norm = |a: f32| {
-            let mut a = a + offset;
-            while a < -std::f32::consts::PI {
-                a += 2. * std::f32::consts::PI;
-            }
-            while a >= std::f32::consts::PI {
-                a -= 2. * std::f32::consts::PI;
-            }
-            a
+            // Remainder is bounded even for very large finite angles; never loop.
+            ((a as f64 + offset as f64 + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+                - std::f64::consts::PI) as f32
         };
         Self {
             angles: s.angles.iter().map(|a| norm(*a)).collect(),
             ranges: s.ranges.clone(),
             max_range: s.max_range,
             odom,
+            scan_id: s.id,
+            sequence: 0,
+            scan_stamp: None,
+            received: Instant::now(),
+            association: if odom.is_some() {
+                "unverified"
+            } else {
+                "missing"
+            },
+            odom_skew_ms: None,
+            source_time_verified: false,
         }
     }
     /// Request line for the adapter: valid beams only, each with its own
@@ -166,20 +293,28 @@ impl Observation {
         let mut angles = Vec::with_capacity(self.angles.len());
         let mut ranges = Vec::with_capacity(self.ranges.len());
         for (a, r) in self.angles.iter().zip(&self.ranges) {
-            if r.is_finite() && *r >= player_bridge::scan::LDS_RANGE_MIN && *r <= self.max_range {
+            if a.is_finite()
+                && r.is_finite()
+                && *r >= player_bridge::scan::LDS_RANGE_MIN
+                && *r <= self.max_range
+            {
                 angles.push(round(*a as f64));
                 ranges.push(round(*r as f64));
             }
         }
-        request(
-            "update",
-            json!({
-                "scan": {"angles": angles, "ranges": ranges},
-                "range_max": round(self.max_range as f64),
-                "sensor_x": player_bridge::scan::LDS_X,
-                "odom": {"dx": round(delta.0), "dy": round(delta.1), "dyaw": round(delta.2)}
-            }),
-        )
+        let mut fields = json!({
+            "scan_id": self.scan_id,
+            "scan": {"angles": angles, "ranges": ranges},
+            "range_max": round(self.max_range as f64),
+            "sensor_x": player_bridge::scan::LDS_X,
+            "odom": {"dx": round(delta.0), "dy": round(delta.1), "dyaw": round(delta.2)}
+        });
+        if self.source_time_verified {
+            if let Some(stamp) = self.scan_stamp.filter(|s| s.is_finite()) {
+                fields["stamp"] = json!(stamp);
+            }
+        }
+        request("update", fields)
     }
 }
 
@@ -187,13 +322,188 @@ fn round(v: f64) -> f64 {
     (v * 10000.).round() / 10000.
 }
 
-/// Owned thread talking to the adapter process. Observations in, slam state
-/// out. Localization status is telemetry and does not control wheel commands.
-/// Restarting the adapter on crash keeps the session alive.
-pub struct SlamThread {
-    pub observe: std::sync::mpsc::Sender<Observation>,
+fn wrap(yaw: f64) -> f64 {
+    (yaw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+}
+fn valid_pose(p: (f64, f64, f64)) -> bool {
+    p.0.is_finite() && p.1.is_finite() && p.2.is_finite()
+}
+struct OdomSample {
+    source: f64,
+    received: Instant,
+    pose: (f64, f64, f64),
+}
+pub struct Association {
+    pub pose: Option<(f64, f64, f64)>,
+    pub kind: &'static str,
+    pub skew: Option<f64>,
+}
+pub struct OdomHistory {
+    samples: VecDeque<OdomSample>,
+}
+impl OdomHistory {
+    pub fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+        }
+    }
+    pub fn push(&mut self, source: f64, received: Instant, pose: (f64, f64, f64)) -> bool {
+        if !valid_pose(pose) {
+            return false;
+        }
+        if let Some(last) = self.samples.back() {
+            if received < last.received
+                || (source.is_finite() && source > 0. && last.source.is_finite() && last.source > 0. && source <= last.source)
+                // Conservative per-sample discontinuities, not accumulated
+                // displacement since the last backend acknowledgement.
+                || (pose.0 - last.pose.0).hypot(pose.1 - last.pose.1) > 2.
+                || wrap(wrap(pose.2) - wrap(last.pose.2)).abs() > 2.
+            {
+                return false;
+            }
+        }
+        self.samples.push_back(OdomSample {
+            source,
+            received,
+            pose,
+        });
+        while self.samples.len() > 256
+            || self.samples.front().is_some_and(|s| {
+                received.saturating_duration_since(s.received) > Duration::from_secs(5)
+            })
+        {
+            self.samples.pop_front();
+        }
+        true
+    }
+    pub fn associate(
+        &self,
+        source: Option<f64>,
+        received: Instant,
+        verified: bool,
+        max_skew: f64,
+    ) -> Association {
+        let missing = || Association {
+            pose: None,
+            kind: "missing",
+            skew: None,
+        };
+        if !verified {
+            let Some(last) = self.samples.iter().rev().find(|s| s.received <= received) else {
+                return missing();
+            };
+            let skew = received
+                .saturating_duration_since(last.received)
+                .as_secs_f64()
+                * 1000.;
+            return if skew <= max_skew {
+                Association {
+                    pose: Some(last.pose),
+                    kind: "unverified",
+                    skew: Some(skew),
+                }
+            } else {
+                missing()
+            };
+        }
+        let Some(t) = source.filter(|s| s.is_finite() && *s > 0.) else {
+            return missing();
+        };
+        let samples: Vec<_> = self
+            .samples
+            .iter()
+            .filter(|s| {
+                s.source.is_finite()
+                    && s.source > 0.
+                    && received.saturating_duration_since(s.received).as_secs_f64() * 1000.
+                        <= max_age_ms()
+            })
+            .collect();
+        for pair in samples.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a.source <= t
+                && t <= b.source
+                && (t - a.source) * 1000. <= max_skew
+                && (b.source - t) * 1000. <= max_skew
+            {
+                use robot_server::motion_compensation::{interpolate_pose, Pose2, TimedPose};
+                let samples = [
+                    TimedPose {
+                        time: a.source,
+                        pose: Pose2 {
+                            x: a.pose.0,
+                            y: a.pose.1,
+                            yaw: a.pose.2,
+                        },
+                    },
+                    TimedPose {
+                        time: b.source,
+                        pose: Pose2 {
+                            x: b.pose.0,
+                            y: b.pose.1,
+                            yaw: b.pose.2,
+                        },
+                    },
+                ];
+                let Ok(pose) = interpolate_pose(&samples, t) else {
+                    return missing();
+                };
+                return Association {
+                    pose: Some((pose.x, pose.y, pose.yaw)),
+                    kind: "interpolated",
+                    skew: Some(((t - a.source).max(b.source - t)) * 1000.),
+                };
+            }
+        }
+        let Some(s) = samples
+            .into_iter()
+            .min_by(|a, b| (a.source - t).abs().total_cmp(&(b.source - t).abs()))
+        else {
+            return missing();
+        };
+        let skew = (s.source - t).abs() * 1000.;
+        if skew <= max_skew {
+            Association {
+                pose: Some(s.pose),
+                kind: "nearest",
+                skew: Some(skew),
+            }
+        } else {
+            missing()
+        }
+    }
 }
 
+/// Single pending latest observation, plus one in flight. Dropped observations
+/// retain motion through their absolute odometry; there is no FIFO backlog.
+struct Slot {
+    pending: Option<Observation>,
+    dropped: u64,
+}
+#[derive(Clone)]
+pub struct ObservationSender {
+    shared: Arc<(Mutex<Slot>, Condvar)>,
+}
+impl ObservationSender {
+    pub fn send(&self, obs: Observation) -> Result<(), ()> {
+        let (lock, wake) = &*self.shared;
+        let mut slot = lock.lock().unwrap();
+        if slot.pending.replace(obs).is_some() {
+            slot.dropped += 1;
+        }
+        wake.notify_one();
+        Ok(())
+    }
+}
+// Sender clones are not used by production; Arc count determines closure.
+impl Drop for ObservationSender {
+    fn drop(&mut self) {
+        self.shared.1.notify_one();
+    }
+}
+pub struct SlamThread {
+    pub observe: ObservationSender,
+}
 impl SlamThread {
     pub fn start(
         exe: PathBuf,
@@ -204,52 +514,118 @@ impl SlamThread {
         let mut adapter = Adapter::spawn(&exe)?;
         let init = if mapping {
             adapter.call(&request("start_mapping", json!({})))?
-        } else if let Some(path) = &map_path {
-            adapter.call(&request("load_map", json!({"path": path})))?
+        } else if let Some(path) = map_path {
+            adapter.call(&request("load_map", json!({"path":path})))?
         } else {
             return Err("localize mode needs --slam-map".into());
         };
         if !init.ok {
-            return Err(format!("adapter init failed: {:?}", init.error));
+            return Err("adapter init failed".into());
         }
-        let mut core = SlamCore::new(adapter, mapping);
-        let (tx, rx) = std::sync::mpsc::channel::<Observation>();
+        let shared = Arc::new((
+            Mutex::new(Slot {
+                pending: None,
+                dropped: 0,
+            }),
+            Condvar::new(),
+        ));
+        let observe = ObservationSender {
+            shared: shared.clone(),
+        };
         std::thread::spawn(move || {
-            // The occupancy grid is redrawn at a slow cadence: rebuilding it
-            // on every scan would dominate update latency for no visual gain.
-            const MAP_EVERY: u32 = 10;
-            let mut since_map = MAP_EVERY;
+            let mut core = SlamCore::new(adapter, mapping);
+            let mut last: Option<(Observation, Value)> = None;
             let mut last_map: Option<Value> = None;
-            for obs in rx {
-                // A scan without any odometry yet still updates SLAM with a
-                // zero delta; only feeding deltas requires two odom poses.
-                let (delta, _seen_before) = core.feed_odom(obs.odom);
-                let req = obs.to_update_request(delta);
-                let mut state = core.update_request(&req);
-                since_map += 1;
-                if since_map >= MAP_EVERY {
-                    since_map = 0;
-                    if let Some(m) = core.fetch_map() {
-                        last_map = Some(m);
+            let mut count = 0;
+            loop {
+                let (lock, wake) = &*shared;
+                let mut slot = lock.lock().unwrap();
+                if slot.pending.is_none() {
+                    slot = wake
+                        .wait_timeout(slot, Duration::from_millis(50))
+                        .unwrap()
+                        .0;
+                }
+                let obs = slot.pending.take();
+                let dropped = slot.dropped;
+                drop(slot);
+                if let Some(obs) = obs {
+                    let mut state = if obs.received.elapsed().as_secs_f64() * 1000. > max_age_ms() {
+                        core.error = Some("observation expired before processing".into());
+                        core.state_json(None)
+                    } else if obs.odom.is_none() {
+                        core.error = Some("missing or stale odometry".into());
+                        core.state_json(None)
+                    } else {
+                        core.process_observation(&obs)
+                    };
+                    count += 1;
+                    if count % 10 == 1 && !core.failed {
+                        if let Some(map) = core.fetch_map() {
+                            last_map = Some(map);
+                        }
+                        if core.failed {
+                            state = core.state_json(None);
+                        }
                     }
+                    if let Some(map) = &last_map {
+                        state["map"] = map.clone();
+                    }
+                    last = Some((obs, state));
                 }
-                if let Some(m) = &last_map {
-                    state["map"] = m.clone();
+                if let Some((obs, state)) = &mut last {
+                    let age = obs.received.elapsed().as_secs_f64() * 1000.;
+                    state["scan_id"] = json!(obs.scan_id);
+                    state["scan_sequence"] = json!(obs.sequence);
+                    state["scan_stamp"] = json!(obs.scan_stamp);
+                    state["age_ms"] = json!(age);
+                    state["max_age_ms"] = json!(max_age_ms());
+                    state["stale"] = json!(age > max_age_ms());
+                    state["dropped_scans"] = json!(dropped);
+                    state["odom_association"] = json!(obs.association);
+                    state["odom_skew_ms"] = json!(obs.odom_skew_ms);
+                    state["source_time_verified"] = json!(obs.source_time_verified);
+                    let requested =
+                        std::env::var("ROBOT_SLAM_DESKEW_ENABLED").is_ok_and(|v| v == "true");
+                    state["deskew"] = json!({
+                        "requested": requested, "applied": false,
+                        "status": if requested { "unavailable" } else { "disabled" },
+                        "reason": if requested { Some("Player provides no verified per-beam timing") } else { None },
+                    });
+                    on_state(state.clone());
                 }
-                on_state(state);
+                if Arc::strong_count(&shared) == 1 {
+                    break;
+                }
             }
         });
-        Ok(Self { observe: tx })
+        Ok(Self { observe })
     }
 }
 
 impl SlamCore<Adapter> {
-    /// Ask the adapter for the current occupancy grid (mapping rebuilds it
-    /// from the simplemap; localize returns the loaded map).
+    /// Ask the adapter for its current occupancy grid. Export failures remain
+    /// visible, and transport failure stops further requests to this child.
     pub fn fetch_map(&mut self) -> Option<Value> {
-        let line = self.backend.call_raw(&request("map", json!({}))).ok()?;
-        let v: Value = serde_json::from_str(&line).ok()?;
-        v.get("grid").cloned()
+        let result = self
+            .backend
+            .call_raw(&request("map", json!({})))
+            .and_then(|line| {
+                serde_json::from_str::<Value>(&line)
+                    .map_err(|_| "invalid adapter map reply".to_string())
+            });
+        match result {
+            Ok(v) if v["ok"].as_bool() == Some(true) => v.get("grid").cloned(),
+            Ok(_) => {
+                self.error = Some("adapter map request rejected".into());
+                None
+            }
+            Err(e) => {
+                self.error = Some(sanitize(&e));
+                self.failed = true;
+                None
+            }
+        }
     }
 }
 
@@ -271,7 +647,11 @@ pub fn odom_delta(
 ) -> (f64, f64, f64) {
     let (dx, dy) = (cx - px, cy - py);
     let (s, c) = (pyaw.sin(), pyaw.cos());
-    (c * dx + s * dy, -s * dx + c * dy, cyaw - pyaw)
+    (
+        c * dx + s * dy,
+        -s * dx + c * dy,
+        wrap(wrap(cyaw) - wrap(pyaw)),
+    )
 }
 
 /// Pure SLAM orchestration: update calls, quality tracking, lost detection
@@ -285,6 +665,12 @@ pub struct SlamCore<T: Backend> {
     bad: u32,
     resets: u32,
     log: Vec<String>,
+    tracking: Option<String>,
+    localization_quality: Option<f64>,
+    diagnostics: Value,
+    error: Option<String>,
+    failed: bool,
+    acknowledged: bool,
 }
 
 pub const LOST_AFTER_BAD: u32 = 4;
@@ -303,6 +689,12 @@ impl<T: Backend> SlamCore<T> {
             bad: 0,
             resets: 0,
             log: Vec::new(),
+            tracking: None,
+            localization_quality: None,
+            diagnostics: Value::Null,
+            error: None,
+            failed: false,
+            acknowledged: false,
         }
     }
     /// Feed one scan (and the absolute odom pose) through the adapter.
@@ -311,70 +703,57 @@ impl<T: Backend> SlamCore<T> {
     #[allow(dead_code)]
     pub fn update(&mut self, scan: &Value, odom: Option<(f64, f64, f64)>) -> Value {
         let delta = match (self.odom, odom) {
-            (Some(p), Some(c)) => {
-                self.odom = Some(c);
-                let (dx, dy, dyaw) = odom_delta(p, c);
-                json!({"dx": dx, "dy": dy, "dyaw": dyaw})
-            }
-            (None, c) => {
-                self.odom = c;
-                json!({"dx": 0., "dy": 0., "dyaw": 0.})
-            }
-            _ => json!({"dx": 0., "dy": 0., "dyaw": 0.}),
+            (Some(p), Some(c)) => odom_delta(p, c),
+            _ => (0., 0., 0.),
         };
-        let req = request("update", json!({"scan": scan, "odom": delta}));
-        let status = match self.backend.call(&req) {
-            Ok(s) => s,
-            Err(e) => {
-                self.log.push(format!("adapter failure: {e}"));
-                return self.state_json(None);
-            }
-        };
-        if !status.ok {
-            self.log.push(format!(
-                "adapter error: {}",
-                status.error.unwrap_or_default()
-            ));
+        let req = request(
+            "update",
+            json!({"scan":scan,"odom":{"dx":delta.0,"dy":delta.1,"dyaw":delta.2}}),
+        );
+        let state = self.update_request(&req);
+        if self.acknowledged {
+            self.odom = odom;
+        }
+        state
+    }
+    fn process_observation(&mut self, obs: &Observation) -> Value {
+        if self.failed {
             return self.state_json(None);
         }
-        if let Some(p) = status.pose.clone() {
-            self.pose = Some(p);
+        if !obs.max_range.is_finite()
+            || obs.max_range < player_bridge::scan::LDS_RANGE_MIN
+            || obs.angles.len() != obs.ranges.len()
+            || !obs.angles.iter().zip(&obs.ranges).any(|(a, r)| {
+                a.is_finite()
+                    && r.is_finite()
+                    && *r >= player_bridge::scan::LDS_RANGE_MIN
+                    && *r <= obs.max_range
+            })
+        {
+            self.error = Some("invalid or empty laser scan".into());
+            return self.state_json(None);
         }
-        // Mapping cannot be "lost" relative to a map it is building.
-        if !self.mapping {
-            let bad = status.quality.is_none_or(|q| q < QUALITY_BAD);
-            if bad {
-                self.bad += 1;
-            } else {
-                self.bad = 0;
-                self.resets = 0;
-                if self.lost {
-                    self.lost = false;
-                }
-            }
-            if self.bad == LOCAL_RESET_AT || self.bad == GLOBAL_RESET_AT {
-                let op = if self.bad == LOCAL_RESET_AT {
-                    "local_reset"
-                } else {
-                    "global_reset"
-                };
-                self.log
-                    .push(format!("{op} issued after {} bad updates", self.bad));
-                let _ = self.backend.call(&request(op, json!({})));
-                self.resets += 1;
-            }
-            if self.bad >= LOST_AFTER_BAD {
-                self.lost = true;
-            }
+        let (delta, usable) = self.feed_odom(obs.odom);
+        if !usable {
+            self.error = Some("invalid odometry or odometry jump".into());
+            return self.state_json(None);
         }
-        self.state_json(status.quality)
+        let state = self.update_request(&obs.to_update_request(delta));
+        if self.acknowledged {
+            self.odom = obs.odom;
+        }
+        state
     }
     pub fn state_json(&self, quality: Option<f64>) -> Value {
         json!({
             "mode": if self.mapping { "mapping" } else if self.lost { "lost" } else { "localize" },
             "pose": self.pose.as_ref().map(|p| json!({"x": p.x, "y": p.y, "yaw": p.yaw})),
             "quality": quality,
+            "localization_quality": self.localization_quality,
             "lost": self.lost,
+            "tracking": if self.error.is_some() { Some("error") } else { self.tracking.as_deref() },
+            "diagnostics": self.diagnostics,
+            "error": self.error.as_deref().map(sanitize),
         })
     }
     #[allow(dead_code)]
@@ -391,35 +770,40 @@ impl<T: Backend> SlamCore<T> {
     /// Track absolute odom poses; emit the delta for this observation and
     /// whether it is usable at all (first pose yields a zero delta).
     pub fn feed_odom(&mut self, odom: Option<(f64, f64, f64)>) -> ((f64, f64, f64), bool) {
-        match (self.odom, odom) {
-            (Some(p), Some(c)) => {
-                self.odom = Some(c);
-                (odom_delta(p, c), true)
-            }
-            (None, Some(c)) => {
-                self.odom = Some(c);
-                ((0., 0., 0.), true)
-            }
-            _ => ((0., 0., 0.), false),
+        let Some(c) = odom.filter(|p| valid_pose(*p)) else {
+            return ((0., 0., 0.), false);
+        };
+        match self.odom {
+            Some(p) => (odom_delta(p, c), true),
+            None => ((0., 0., 0.), true),
         }
     }
     /// One adapter update request -> panel state (keeps SlamCore::update for
     /// the pure unit-tested path).
     pub fn update_request(&mut self, req: &str) -> Value {
+        self.acknowledged = false;
+        if self.failed {
+            return self.state_json(None);
+        }
         match self.backend.call(req) {
             Ok(status) => {
                 if !status.ok {
-                    self.log.push(format!(
-                        "adapter error: {}",
-                        status.error.unwrap_or_default()
-                    ));
+                    self.error = Some(status.error.unwrap_or_else(|| "adapter error".into()));
                     return self.state_json(None);
                 }
+                self.acknowledged = true;
+                self.error = None;
+                self.tracking = status.tracking;
+                self.localization_quality = status.localization_quality;
+                self.diagnostics = status.diagnostics;
                 if let Some(p) = status.pose.clone() {
                     self.pose = Some(p);
                 }
                 if !self.mapping {
-                    let bad = status.quality.is_none_or(|q| q < QUALITY_BAD);
+                    let bad = status
+                        .localization_quality
+                        .or(status.quality)
+                        .is_none_or(|q| q < QUALITY_BAD);
                     if bad {
                         self.bad += 1;
                     } else {
@@ -435,7 +819,18 @@ impl<T: Backend> SlamCore<T> {
                         };
                         self.log
                             .push(format!("{op} issued after {} bad updates", self.bad));
-                        let _ = self.backend.call(&request(op, json!({})));
+                        match self.backend.call(&request(op, json!({}))) {
+                            Err(e) => {
+                                self.error = Some(sanitize(&e));
+                                self.failed = true;
+                            }
+                            Ok(s) if !s.ok => {
+                                self.error = Some(
+                                    s.error.unwrap_or_else(|| "adapter reset rejected".into()),
+                                );
+                            }
+                            _ => {}
+                        }
                         self.resets += 1;
                     }
                     if self.bad >= LOST_AFTER_BAD {
@@ -445,7 +840,9 @@ impl<T: Backend> SlamCore<T> {
                 self.state_json(status.quality)
             }
             Err(e) => {
-                self.log.push(format!("adapter failure: {e}"));
+                self.error = Some(sanitize(&e));
+                self.failed = true;
+                self.log.push(format!("adapter failure: {}", sanitize(&e)));
                 self.state_json(None)
             }
         }
@@ -598,6 +995,9 @@ mod tests {
                         yaw: 0.,
                     }),
                     quality: Some(0.9),
+                    localization_quality: None,
+                    tracking: None,
+                    diagnostics: Value::Null,
                 })
             })
         }
@@ -617,6 +1017,9 @@ mod tests {
                             yaw: 0.,
                         }),
                         quality: Some(q),
+                        localization_quality: None,
+                        tracking: None,
+                        diagnostics: Value::Null,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -657,6 +1060,29 @@ mod tests {
         assert_eq!(v["mode"], "localize");
     }
     #[test]
+    fn mcl_confidence_is_separate_from_icp_goodness_and_controls_localization_health() {
+        struct Localized;
+        impl Backend for Localized {
+            fn call(&mut self, _: &str) -> Result<SlamStatus, String> {
+                parse_status(
+                    r#"{"ok":true,"pose":{"x":0,"y":0,"yaw":0},"quality":null,"localization_quality":0.95,"tracking":"tracking","diagnostics":{"accepted":false,"reason":"mcl_update","goodness":null}}"#,
+                )
+            }
+        }
+        let mut core = SlamCore::new(Localized, false);
+        for _ in 0..8 {
+            let state = core.update(&scan_value(), Some((0., 0., 0.)));
+            assert_eq!(state["localization_quality"], 0.95);
+            assert!(state["quality"].is_null());
+            assert_eq!(state["mode"], "localize");
+        }
+        assert!(
+            core.log.is_empty(),
+            "healthy MCL must not trigger particle resets"
+        );
+    }
+
+    #[test]
     fn mapping_mode_never_goes_lost() {
         let mut core = SlamCore::new(scripted(&[0.0; 10]), true);
         for _ in 0..10 {
@@ -676,5 +1102,303 @@ mod tests {
         let v = core.update(&scan_value(), None);
         assert!(v["pose"].is_null());
         assert!(!core.log.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    // FEATURE: bounded, honest SLAM timing and transport.
+    // SPEC: preserve scan identity, interpolate verified clocks only, wrap yaw,
+    // retain rejected motion and fail bounded child I/O without retries.
+    // IMPLEMENTATION: bounded history/latest slot, nonblocking deadline pipes,
+    // acknowledgement-based absolute odometry and preserved adapter metadata.
+    // RESULT: IMPLEMENTED — local fakes cover timing, rejection and transport.
+    // STATUS: DONE
+    #[test]
+    fn runtime_tracking_and_wrapped_delta() {
+        let status = parse_status(
+            r#"{"ok":true,"tracking":"degraded","diagnostics":{"accepted":false,"reason":"weak"}}"#,
+        )
+        .unwrap();
+        assert_eq!(status.tracking.as_deref(), Some("degraded"));
+        assert_eq!(status.diagnostics["accepted"], false);
+        assert!((odom_delta((0., 0., 3.13), (0., 0., -3.13)).2 - 0.023185307).abs() < 1e-6);
+    }
+    #[test]
+    fn runtime_history_verified_interpolation_and_unverified_default() {
+        let now = std::time::Instant::now();
+        let mut h = OdomHistory::new();
+        h.push(1., now, (0., 0., 3.13));
+        h.push(2., now, (0.2, 0., -3.13));
+        let a = h.associate(Some(1.5), now, true, 600.);
+        assert_eq!(a.kind, "interpolated");
+        assert!((a.pose.unwrap().0 - 0.1).abs() < 1e-9);
+        assert_eq!(h.associate(Some(1.5), now, false, 600.).kind, "unverified");
+        assert!(h.associate(Some(9.), now, true, 100.).pose.is_none());
+        assert!(!h.push(1.9, now, (0., 0., 0.)));
+        assert!(!h.push(3., now, (f64::NAN, 0., 0.)));
+        assert!(OdomHistory::new()
+            .associate(None, now, false, 100.)
+            .pose
+            .is_none());
+    }
+    #[test]
+    fn repeated_absent_source_times_do_not_discard_fresh_receive_order_odometry() {
+        let now = Instant::now();
+        let mut history = OdomHistory::new();
+        assert!(history.push(0., now, (0., 0., 0.)));
+        assert!(history.push(0., now + Duration::from_millis(20), (0.01, 0., 0.)));
+        let sample = history.associate(None, now + Duration::from_millis(25), false, 100.);
+        assert_eq!(sample.pose, Some((0.01, 0., 0.)));
+        assert_eq!(sample.kind, "unverified");
+        assert!(history
+            .associate(Some(0.), now + Duration::from_millis(25), true, 100.)
+            .pose
+            .is_none());
+    }
+
+    #[test]
+    fn verified_history_interpolates_constant_twist_on_an_arc() {
+        let now = Instant::now();
+        let mut history = OdomHistory::new();
+        assert!(history.push(1., now, (0., 0., 0.)));
+        assert!(history.push(2., now, (1., 1., std::f64::consts::FRAC_PI_2)));
+        let association = history.associate(Some(1.5), now, true, 600.);
+        assert_eq!(association.kind, "interpolated");
+        let pose = association.pose.unwrap();
+        assert!((pose.0 - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-8);
+        assert!((pose.1 - (1. - std::f64::consts::FRAC_1_SQRT_2)).abs() < 1e-8);
+    }
+
+    #[test]
+    fn runtime_latest_queue_motion_rejections_and_ambiguous_failure() {
+        struct Recording {
+            requests: Arc<Mutex<Vec<Value>>>,
+            n: usize,
+        }
+        impl Backend for Recording {
+            fn call(&mut self, req: &str) -> Result<SlamStatus, String> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(req).unwrap());
+                self.n += 1;
+                parse_status(match self.n {
+                    2 => r#"{"ok":false,"error":"rejected\ninput"}"#,
+                    4 => return Err("ambiguous transport failure".into()),
+                    _ => {
+                        r#"{"ok":true,"tracking":"degraded","diagnostics":{"accepted":false},"pose":{"x":0,"y":0,"yaw":0}}"#
+                    }
+                })
+            }
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut core = SlamCore::new(
+            Recording {
+                requests: requests.clone(),
+                n: 0,
+            },
+            true,
+        );
+        let scan = player_bridge::LaserScanAngle {
+            angles: vec![0.],
+            ranges: vec![1.],
+            max_range: 6.,
+            id: 17,
+            intensities: vec![],
+        };
+        let mut obs = Observation::from_scan(&scan, Some((0., 0., 0.)));
+        obs.scan_stamp = Some(42.);
+        let first = core.process_observation(&obs);
+        assert_eq!(first["diagnostics"]["accepted"], false);
+        obs.odom = Some((0.1, 0., 0.));
+        let rejected = core.process_observation(&obs);
+        assert_eq!(rejected["tracking"], "error");
+        assert!(!rejected["error"].as_str().unwrap().contains('\n'));
+        let shared = Arc::new((
+            Mutex::new(Slot {
+                pending: None,
+                dropped: 0,
+            }),
+            Condvar::new(),
+        ));
+        let tx = ObservationSender {
+            shared: shared.clone(),
+        };
+        tx.send(obs.clone()).unwrap();
+        obs.odom = Some((0.3, 0., 0.));
+        tx.send(obs.clone()).unwrap();
+        let latest = shared.0.lock().unwrap().pending.take().unwrap();
+        assert_eq!(shared.0.lock().unwrap().dropped, 1);
+        core.process_observation(&latest);
+        assert_eq!(requests.lock().unwrap()[2]["odom"]["dx"], 0.3);
+        assert!(requests.lock().unwrap()[2].get("stamp").is_none());
+        obs.odom = Some((0.4, 0., 0.));
+        obs.source_time_verified = true;
+        core.process_observation(&obs);
+        assert_eq!(requests.lock().unwrap()[3]["stamp"], 42.);
+        core.process_observation(&obs);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "ambiguous updates must not be retried"
+        );
+        let mut h = OdomHistory::new();
+        let now = Instant::now();
+        h.push(1., now, (0., 0., 0.));
+        assert!(h
+            .associate(Some(1.), now + Duration::from_secs(1), false, 100.)
+            .pose
+            .is_none());
+        assert!(!h.push(2., now, (10., 0., 0.)));
+        let huge = player_bridge::LaserScanAngle {
+            angles: vec![f32::MAX, f32::INFINITY, f32::NAN],
+            ranges: vec![1.; 3],
+            max_range: 6.,
+            id: 9,
+            intensities: vec![],
+        };
+        let v: Value = serde_json::from_str(
+            &Observation::from_scan(&huge, None).to_update_request((0., 0., 0.)),
+        )
+        .unwrap();
+        assert_eq!(v["scan"]["angles"].as_array().unwrap().len(), 1);
+        assert_eq!(v["scan_id"], 9);
+    }
+    #[test]
+    fn runtime_invalid_geometry_and_reset_transport_failure_are_explicit() {
+        struct Never;
+        impl Backend for Never {
+            fn call(&mut self, _: &str) -> Result<SlamStatus, String> {
+                panic!("invalid observations cannot reach backend")
+            }
+        }
+        let mut core = SlamCore::new(Never, true);
+        let scan = player_bridge::LaserScanAngle {
+            angles: vec![0.],
+            ranges: vec![1.],
+            max_range: f32::NAN,
+            id: 9,
+            intensities: vec![],
+        };
+        let obs = Observation::from_scan(&scan, Some((0., 0., 0.)));
+        assert_eq!(core.process_observation(&obs)["tracking"], "error");
+        struct ResetFailure;
+        impl Backend for ResetFailure {
+            fn call(&mut self, req: &str) -> Result<SlamStatus, String> {
+                if req.contains("reset") {
+                    Err("reset transport failure".into())
+                } else {
+                    parse_status(r#"{"ok":true,"quality":0.0}"#)
+                }
+            }
+        }
+        let mut core = SlamCore::new(ResetFailure, false);
+        core.update_request("{}");
+        assert_eq!(core.update_request("{}")["tracking"], "error");
+        assert!(core.failed);
+    }
+    #[test]
+    fn runtime_accumulated_motion_is_not_a_sample_jump() {
+        struct NoCall;
+        impl Backend for NoCall {
+            fn call(&mut self, _: &str) -> Result<SlamStatus, String> {
+                unreachable!()
+            }
+        }
+        let mut core = SlamCore::new(NoCall, true);
+        core.odom = Some((0., 0., 0.));
+        assert_eq!(
+            core.feed_odom(Some((3., 0., 0.))),
+            ((3., 0., 0.), true),
+            "coalescing may accumulate many individually valid odometry samples"
+        );
+        let mut h = OdomHistory::new();
+        let now = Instant::now();
+        h.push(1., now, (0., 0., 0.));
+        assert!(
+            !h.push(2., now, (0., 0., 3.)),
+            "single-sample yaw discontinuity must be rejected"
+        );
+    }
+    #[test]
+    fn runtime_acknowledgement_survives_rejected_auxiliary_reset() {
+        struct ResetReject {
+            updates: Arc<Mutex<Vec<Value>>>,
+        }
+        impl Backend for ResetReject {
+            fn call(&mut self, req: &str) -> Result<SlamStatus, String> {
+                if req.contains("reset") {
+                    return parse_status(r#"{"ok":false,"error":"reset unsupported"}"#);
+                }
+                self.updates
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(req).unwrap());
+                parse_status(r#"{"ok":true,"quality":0.0}"#)
+            }
+        }
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let mut core = SlamCore::new(
+            ResetReject {
+                updates: updates.clone(),
+            },
+            false,
+        );
+        let scan = player_bridge::LaserScanAngle {
+            angles: vec![0.],
+            ranges: vec![1.],
+            max_range: 6.,
+            id: 1,
+            intensities: vec![],
+        };
+        for x in [0., 0.1, 0.2] {
+            core.process_observation(&Observation::from_scan(&scan, Some((x, 0., 0.))));
+        }
+        assert_eq!(
+            updates.lock().unwrap()[2]["odom"]["dx"],
+            0.1,
+            "successful update was acknowledged even though following reset failed"
+        );
+        assert!(odom_delta((0., 0., f64::MAX), (0., 0., -f64::MAX))
+            .2
+            .is_finite());
+    }
+    #[test]
+    fn runtime_transport_hung_oversize_eof_and_slow() {
+        use std::os::unix::fs::PermissionsExt;
+        for (i, script) in [
+            "read line; sleep 2",
+            "read line; yes x | tr -d '\\n'",
+            "exit 0",
+            "read line; sleep 0.02; printf '{\"ok\":true}\\n'",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let p = std::env::temp_dir().join(format!("slam-deadline-{}-{i}", std::process::id()));
+            std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut a =
+                Adapter::spawn_limits(&p, std::time::Duration::from_millis(100), 1024).unwrap();
+            let t = std::time::Instant::now();
+            let r = a.call("{}");
+            assert_eq!(r.is_ok(), i == 3, "{i}: {r:?}");
+            assert!(t.elapsed() < std::time::Duration::from_secs(1));
+            if i != 3 {
+                assert!(a.call("{}").is_err());
+            }
+            std::fs::remove_file(p).unwrap();
+        }
+        let p = std::env::temp_dir().join(format!("slam-write-deadline-{}", std::process::id()));
+        std::fs::write(&p, "#!/bin/sh\nsleep 2\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut adapter = Adapter::spawn_limits(&p, Duration::from_millis(80), 1024).unwrap();
+        let started = Instant::now();
+        let error = adapter.call_raw(&"x".repeat(1024 * 1024)).unwrap_err();
+        assert!(error.contains("write deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::remove_file(p).unwrap();
     }
 }

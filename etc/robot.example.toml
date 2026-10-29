@@ -42,6 +42,29 @@ url = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
 voice = "filipp"
 folder_id = ""
 
+[slam]
+# Opt-in local raw Player JSONL capture; creates a new private file, never overwrites.
+record_path = ""
+icp_min_goodness = 0.30
+icp_max_iterations = 40
+icp_threshold_dist = 0.75
+icp_decimation = 1
+insertion_linear = 0.10
+insertion_angular_deg = 10.0
+grid_resolution = 0.05
+max_insert_range = 5.0
+# Frame-to-frame admission budgets; these do not limit wheel speeds.
+max_uncompensated_translation = 0.08
+max_uncompensated_rotation_deg = 8.0
+adapter_timeout_ms = 1500
+max_pose_age_ms = 500
+odom_max_skew_ms = 100
+# Verification flags assert measured clock semantics, not a desired processing mode.
+source_time_verified = false
+beam_time_verified = false
+# Player does not yet provide verified per-beam times. Keep this disabled.
+deskew_enabled = false
+
 [providers]
 # Only string *_api_key entries; exports ROBOT_PROVIDER_<UPPERCASE_KEY>.
 openrouter_api_key = ""

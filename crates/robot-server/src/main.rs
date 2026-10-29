@@ -1,5 +1,6 @@
 mod audio;
 mod camera;
+mod compass;
 mod player;
 mod safety;
 mod slam;
@@ -17,6 +18,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use robot_server::player_recording::Recorder;
 use safety::Safety;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -283,6 +285,26 @@ async fn heartbeat(mut stream: TcpStream) -> Result<(), Failure> {
     }
 }
 async fn run(c: Config) -> Result<(), Failure> {
+    // File preflight must precede ACTIVATE (the CLI's earlier handoff is separate).
+    let recorder = if c.audio_only {
+        None
+    } else {
+        Recorder::from_env()?
+    };
+    let result = run_session(c, recorder.clone()).await;
+    // run_session has stopped command producers, attempted zero where connected,
+    // and dropped heartbeat before any bounded wait on the detached disk writer.
+    if let Some(recorder) = recorder {
+        let stats = recorder.finish(Duration::from_secs(2));
+        if stats.complete {
+            eprintln!("robot-server: Player recording complete: {stats:?}");
+        } else {
+            eprintln!("robot-server: Player recording INCOMPLETE: {stats:?}");
+        }
+    }
+    result
+}
+async fn run_session(c: Config, recorder: Option<Arc<Recorder>>) -> Result<(), Failure> {
     let audio = audio::Audio::new()?;
     if c.audio_only {
         let listener = TcpListener::bind((c.listen.as_str(), c.port)).await?;
@@ -355,13 +377,14 @@ async fn run(c: Config) -> Result<(), Failure> {
         }
     });
     let connected = tokio::select! {
-     r=player::connect(&c)=>r,
+     r=player::connect(&c, recorder)=>r,
      r=&mut hb=>return r.map_err(|e|->Failure{e.into()}).and_then(|r|r),
     };
     let (reader, mut writer) = match connected {
         Ok(c) => c,
         Err(e) => {
             hb.abort();
+            let _ = hb.await;
             return Err(e);
         }
     };
@@ -373,6 +396,7 @@ async fn run(c: Config) -> Result<(), Failure> {
         slam_tx,
     ));
     let mut drive_task = tokio::spawn(player::drive(writer.clone(), safety.clone()));
+    let _compass_task = compass::start(states.clone());
     let (_vision_tasks, vision) = if let Some(exe) = c.yolo_adapter {
         let (tasks, updates) = vision::Vision::start(camera.clone(), exe);
         (Some(tasks), Some(updates))
@@ -393,7 +417,15 @@ async fn run(c: Config) -> Result<(), Failure> {
         Err(e) => {
             read_task.abort();
             drive_task.abort();
+            let _ = read_task.await;
+            let _ = drive_task.await;
+            let _ = tokio::time::timeout(
+                Duration::from_millis(300),
+                player::velocity(&mut writer, 0., 0.),
+            )
+            .await;
             hb.abort();
+            let _ = hb.await;
             return Err(e.into());
         }
     };

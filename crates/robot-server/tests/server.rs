@@ -6,6 +6,11 @@
 // client ownership, shared unchanged drive protections and incremental HTTP proxy.
 // RESULT: IMPLEMENTED — offline fake Player, HTTP/WS, supervisor and camera checks pass.
 // STATUS: DONE
+// FEATURE: raw recording uses the sole Player stream, including subscription replies.
+// SPEC: record before filtering; shutdown still sends zero; open failure never ACTIVATEs.
+// IMPLEMENTATION: recorder preflight before supervisor, capture at receipt, finish after teardown.
+// RESULT: IMPLEMENTED — fake Player capture and activation preflight checks pass.
+// STATUS: DONE
 use futures_util::{SinkExt, StreamExt};
 use player_bridge::*;
 use serde_json::{json, Value};
@@ -218,6 +223,8 @@ impl Session {
         .args(extra)
         .env_remove("ROBOT_SERVER_HEARTBEAT")
         .env_remove("ROBOT_BRIDGE_HEARTBEAT")
+        .env_remove("ROBOT_SUPERVISOR_ADDR")
+        .env_remove("ROBOT_SUPERVISOR_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
         if let Some(hb) = hb {
@@ -293,6 +300,176 @@ impl Session {
         );
     }
 }
+// BUG: vendor position3d:2 publishes thresholded XYZ, never a compass yaw.
+// HYPOTHESIS: a separate authenticated raw stream must own compass state, including freshness.
+// SOLUTION: independent authenticated evdev observer with bounded framing and freshness.
+// RESULT: FIXED — raw updates, vendor isolation, expiry and nonfatal failures pass offline.
+// STATUS: FIXED
+async fn compass_line(stream: &mut TcpStream) -> String {
+    timeout(WAIT, async {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = stream.read_u8().await.unwrap();
+            if byte == b'\n' {
+                return String::from_utf8(bytes).unwrap();
+            }
+            assert!(bytes.len() < 256);
+            bytes.push(byte);
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn wait_compass(w: &mut Ws, status: &str, stamp: Option<f64>) -> Value {
+    timeout(WAIT, async {
+        loop {
+            let state = frame(w, "state").await;
+            let compass = &state["sensors"]["compass"];
+            if compass["status"] == status && stamp.is_none_or(|s| compass["stamp"] == s) {
+                return state;
+            }
+        }
+    })
+    .await
+    .expect("compass state never reached expected status")
+}
+#[tokio::test]
+async fn raw_compass_authenticates_updates_and_expires_without_blocking_drive() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut s = Session::start_env(
+        &[],
+        None,
+        true,
+        Duration::ZERO,
+        &[
+            ("ROBOT_SUPERVISOR_ADDR", &address),
+            ("ROBOT_SUPERVISOR_TOKEN", "compass-test-token"),
+        ],
+    )
+    .await;
+    let (mut raw, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("raw compass connection was never opened")
+        .unwrap();
+    assert_eq!(compass_line(&mut raw).await, "AUTH compass-test-token");
+    raw.write_all(b"AUTHENTICATED\n").await.unwrap();
+    assert_eq!(compass_line(&mut raw).await, "COMPASS");
+    let mut w = s.ws().await;
+    raw.write_all(b"COMPASS 42.5 -139 ").await.unwrap();
+    sleep(Duration::from_millis(10)).await;
+    raw.write_all(b"164 66\n").await.unwrap();
+    let state = wait_compass(&mut w, "uncalibrated", Some(42.5)).await;
+    let magnetic = &state["sensors"]["compass"];
+    assert_eq!(magnetic["source"], "st480-evdev");
+    assert_eq!(magnetic["calibrated"], false);
+    assert_eq!(
+        (
+            magnetic["x"].as_i64(),
+            magnetic["y"].as_i64(),
+            magnetic["z"].as_i64()
+        ),
+        (Some(-139), Some(164), Some(66))
+    );
+    assert!((magnetic["yaw"].as_f64().unwrap() - 164f64.atan2(-139.)).abs() < 1e-6);
+    s.send(compass([0.; 6])).await;
+    let state = timeout(WAIT, async {
+        loop {
+            let state = frame(&mut w, "state").await;
+            if state["sensors"]["service_channels"]["position3d:2"].is_object() {
+                break state;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state["sensors"]["compass"]["stamp"], 42.5);
+    raw.write_all(b"COMPASS 42.6 100 0 7\n").await.unwrap();
+    assert_eq!(
+        wait_compass(&mut w, "uncalibrated", Some(42.6)).await["sensors"]["compass"]["yaw"],
+        0.
+    );
+    let stale = wait_compass(&mut w, "stale", None).await;
+    assert!(stale["sensors"]["compass"]["yaw"].is_null());
+    s.send(bumper(false)).await;
+    cmd(&mut w, r#"{"v":0.1,"w":0.0}"#).await;
+    assert_eq!(
+        s.command().await.1,
+        0.1,
+        "a silent compass must not block driving"
+    );
+    let mut byte = [0];
+    assert_eq!(
+        timeout(WAIT, raw.read(&mut byte)).await.unwrap().unwrap(),
+        0,
+        "stale stream must be closed, not leaked"
+    );
+}
+#[tokio::test]
+async fn refused_compass_is_explicit_and_nonfatal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut s = Session::start_env(
+        &[],
+        None,
+        true,
+        Duration::ZERO,
+        &[
+            ("ROBOT_SUPERVISOR_ADDR", &address),
+            ("ROBOT_SUPERVISOR_TOKEN", ""),
+        ],
+    )
+    .await;
+    let (mut raw, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("raw compass connection was never opened")
+        .unwrap();
+    assert_eq!(compass_line(&mut raw).await, "COMPASS");
+    raw.write_all(b"REFUSED\n").await.unwrap();
+    let mut w = s.ws().await;
+    let state = wait_compass(&mut w, "unsupported", None).await;
+    assert!(state["sensors"]["compass"]["yaw"].is_null());
+    cmd(&mut w, r#"{"v":0.1,"w":0.0}"#).await;
+    assert_eq!(s.command().await.1, 0.1);
+}
+
+#[tokio::test]
+async fn raw_compass_rejects_invalid_zero_and_oversized_samples() {
+    for (line, expected) in [
+        ("COMPASS 1 0 0 40\n".to_owned(), "invalid"),
+        ("COMPASS NaN 1 2 3\n".to_owned(), "invalid"),
+        ("COMPASS -1 1 2 3\n".to_owned(), "invalid"),
+        ("COMPASS 1 NaN 2 3\n".to_owned(), "invalid"),
+        ("COMPASS 1 1 2 3 unexpected\n".to_owned(), "invalid"),
+        (format!("COMPASS {}\n", "1".repeat(300)), "invalid"),
+        ("COMPASS_UNAVAILABLE\n".to_owned(), "unavailable"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let mut s = Session::start_env(
+            &[],
+            None,
+            true,
+            Duration::ZERO,
+            &[
+                ("ROBOT_SUPERVISOR_ADDR", &address),
+                ("ROBOT_SUPERVISOR_TOKEN", ""),
+            ],
+        )
+        .await;
+        let (mut raw, _) = timeout(WAIT, listener.accept())
+            .await
+            .expect("raw compass connection was never opened")
+            .unwrap();
+        assert_eq!(compass_line(&mut raw).await, "COMPASS");
+        let mut w = s.ws().await;
+        raw.write_all(line.as_bytes()).await.unwrap();
+        let state = wait_compass(&mut w, expected, None).await;
+        assert!(state["sensors"]["compass"]["yaw"].is_null(), "{line}");
+        assert!(s.child.try_wait().unwrap().is_none());
+    }
+}
+
 async fn cmd(w: &mut Ws, s: &str) {
     w.send(WsMessage::Text(s.into())).await.unwrap();
 }
@@ -590,7 +767,7 @@ async fn scan_and_raw_sensor_schema() {
     let state = timeout(WAIT, async {
         loop {
             let v = frame(&mut w, "state").await;
-            if v.get("compass").is_some() {
+            if v["sensors"]["service_channels"]["position3d:2"].is_object() {
                 break v;
             }
         }
@@ -604,9 +781,10 @@ async fn scan_and_raw_sensor_schema() {
     // The dock row is the charging fact restated, not an extra sensor: the
     // vendor merges dock status into the power frame's charging field.
     assert_eq!(state["sensors"]["dock"], json!(true));
+    assert!(state["sensors"]["compass"].is_null());
     assert_eq!(
-        state["compass"],
-        json!({"x":0.1,"y":0.2,"z":0.3,"yaw":1.25,"stall":false,"status":"received","stamp":10.})
+        state["sensors"]["service_channels"]["position3d:2"],
+        json!({"pos":[0.1,0.2,0.3,0.04,0.05,1.25],"vel":[0.,0.,0.,0.,0.,0.],"stall":false,"stamp":10.})
     );
     assert_eq!(
         state["odom"],
@@ -1161,11 +1339,11 @@ async fn camera_proxy_streams_with_server_only_auth_and_no_redirects() {
 // ---- SLAM adapter integration ----
 // FEATURE: optional MRPT adapter subprocess feeding the panel slam state.
 // SPEC: --slam-adapter EXE spawns the line-JSON adapter; scans+odom flow to
-// it as update; its pose/mode/quality appear as state.slam; lost mode stops
-// and blocks manual commands until quality recovers.
+// it as update; pose/mode/quality appear as state.slam; neither lost status
+// nor adapter errors interfere with explicit manual commands.
 // IMPLEMENTATION: dedicated blocking thread owns the adapter process; slam
 // state lands in the shared watch channel of "state".
-// RESULT: IMPLEMENTED — adapter feeding, lost gating and no-slam default
+// RESULT: IMPLEMENTED — adapter feeding, independent drive and no-slam default
 // verified against a shell fake.
 // STATUS: DONE
 fn slam_fake(dir: &std::path::Path, mode_by_scan: usize) -> std::path::PathBuf {
@@ -1236,6 +1414,13 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
     .await
     .expect("slam state must appear after the first scan");
     assert_eq!(st["mode"], "mapping");
+    assert_eq!(st["scan_id"], 1);
+    assert_eq!(st["scan_stamp"], 1.1);
+    assert_eq!(st["source_time_verified"], false);
+    assert_eq!(st["odom_association"], "unverified");
+    assert!(st["age_ms"].as_f64().unwrap() >= 0.);
+    assert_eq!(st["max_age_ms"], 500.);
+    assert_eq!(st["stale"], false);
     // Mapping drives the robot (that is how the map gets drawn).
     cmd(&mut w, r#"{"v":0.1,"w":0.0}"#).await;
     let m = s.command().await;
@@ -1256,7 +1441,10 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
     s2.send(packet(4, 0, 1, 1., &odom)).await;
     // SlamCore declares lost after LOST_AFTER_BAD consecutive bad updates.
     for i in 0..4 {
+        s2.send(packet(4, 0, 1, 1.1 + i as f64, &odom)).await;
         s2.send(scan_packet(1.1 + i as f64)).await;
+        // Exercise sustained processed updates, not a deliberately coalesced burst.
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let st = timeout(WAIT, async {
         loop {
@@ -1280,7 +1468,9 @@ async fn slam_adapter_feeds_state_and_lost_blocks_teleop() {
     s2.quiet(120).await;
     // The fake localizes from its 10th update on; send enough scans.
     for i in 0..8 {
-        s2.send(scan_packet(2. + i as f64)).await;
+        s2.send(packet(4, 0, 1, 10. + i as f64, &odom)).await;
+        s2.send(scan_packet(10. + i as f64)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let st = timeout(WAIT, async {
         loop {
@@ -1430,21 +1620,24 @@ async fn real_adapter_maps_synthetic_room() {
         let off = 97.6f64.to_radians();
         let mut ang = Vec::new();
         let mut rng = Vec::new();
-        for k in 0..72 {
-            let a = -std::f64::consts::PI + 2. * std::f64::consts::PI * k as f64 / 72.;
+        let lx = x + player_bridge::scan::LDS_X * yaw.cos();
+        let ly = y + player_bridge::scan::LDS_X * yaw.sin();
+        for k in 0..360 {
+            let a = -std::f64::consts::PI + 2. * std::f64::consts::PI * k as f64 / 360.;
             let (c, sn) = ((yaw + a + off).cos(), (yaw + a + off).sin());
             let mut best = 8.0f64;
             for seg in walls {
-                best = best.min(seg_hit(x, y, c, sn, seg));
+                best = best.min(seg_hit(lx, ly, c, sn, seg));
             }
-            best = best.min(seg_hit(x, y, c, sn, pillar));
-            ang.push(a as f32 + off as f32);
+            best = best.min(seg_hit(lx, ly, c, sn, pillar));
+            ang.push(a as f32);
             rng.push(best as f32);
         }
         (ang, rng)
     };
     let mut x = -2.0f64;
     let mut odom_x = 0.0f64;
+    let mut last = Value::Null;
     for i in 0..10 {
         odom_x += 0.1;
         let mut odom = vec![0u8; 49];
@@ -1455,18 +1648,40 @@ async fn real_adapter_maps_synthetic_room() {
         s.send(packet(4, 0, 1, 1. + i as f64, &odom)).await;
         let (ang, rng) = scan_room(x, -2.0, 0.);
         let mut p = 8.0f32.to_be_bytes().to_vec();
-        p.extend(arr(&ang));
         p.extend(arr(&rng));
+        p.extend(arr(&ang));
         p.extend(arr(&[]));
         p.extend(1u32.to_be_bytes());
+        let decoded = decode_laser_scanangle(&p).unwrap();
+        assert_eq!(
+            decoded.ranges, rng,
+            "fixture must encode Player ranges before bearings"
+        );
+        assert_eq!(decoded.angles, ang);
+        assert!(
+            (ang[0] as f64 + std::f64::consts::PI).abs() < 1e-6,
+            "wire bearings must remain relative to the LDS"
+        );
         s.send(packet(6, 0, 3, 1.1 + i as f64, &p)).await;
+        last = timeout(WAIT, async {
+            loop {
+                let state = frame(&mut w, "state").await;
+                if state["slam"]["scan_sequence"] == i + 1 && state["slam"]["pose"].is_object() {
+                    break state["slam"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap();
         x += 0.1;
     }
     // This test checks plumbing: scans reach the MRPT adapter and poses
     // stream back to the panel, advancing roughly with the driven 1 m path.
-    // Absolute ICP accuracy on synthetic square rooms is limited by their
-    // symmetry; real-data tuning happens on the robot.
-    let mut last = Value::Null;
+    // The input must be geometrically valid; odometry progression alone is
+    // not evidence that the adapter matched the room.
+    assert_eq!(last["diagnostics"]["used_points"], 360);
+    assert_eq!(last["diagnostics"]["accepted"], true);
+    assert!((last["pose"]["x"].as_f64().unwrap() - 0.9).abs() < 0.05);
     let deadline = Duration::from_secs(8);
     timeout(deadline, async {
         loop {
@@ -1662,4 +1877,180 @@ async fn yolo_disabled_by_default_has_no_camera_channel() {
         result.is_err(),
         "disabled detector must not expose a video socket"
     );
+}
+
+// FEATURE: SLAM freshness and backend failures remain visible without drive coupling.
+// SPEC: scan identity/source clock and diagnostics survive telemetry; no odometry
+// means no synthetic update; a timed-out update is not retried; idle poses stale.
+// IMPLEMENTATION: bounded worker and receive-age metadata, independent drive path.
+// RESULT: IMPLEMENTED — missing odometry, child timeout and stale state verified.
+// STATUS: DONE
+#[tokio::test]
+async fn slam_runtime_metadata_missing_odom_and_hung_update_do_not_gate_drive() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "robot-slam-runtime-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("adapter");
+    std::fs::write(
+        &fake,
+        r##"#!/bin/sh
+while read line; do
+case "$line" in
+*start_mapping*) echo '{"ok":true}';;
+*update*) sleep 2; echo '{"ok":true,"tracking":"tracking","pose":{"x":0,"y":0,"yaw":0}}';;
+*) echo '{"ok":true}';;
+esac
+done
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut s = Session::start_env(
+        &["--slam-adapter", fake.to_str().unwrap()],
+        None,
+        true,
+        Duration::ZERO,
+        &[
+            ("ROBOT_SLAM_ADAPTER_TIMEOUT_MS", "80"),
+            ("ROBOT_SLAM_DESKEW_ENABLED", "true"),
+        ],
+    )
+    .await;
+    let mut ws = s.ws().await;
+    s.send(scan_packet(23.)).await;
+    let missing = timeout(WAIT, async {
+        loop {
+            let state = frame(&mut ws, "state").await;
+            if state["slam"]["scan_stamp"] == 23. {
+                break state["slam"].clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(missing["tracking"], "error");
+    assert_eq!(missing["scan_sequence"], 1);
+    assert_eq!(missing["deskew"]["requested"], true);
+    assert_eq!(missing["deskew"]["applied"], false);
+    assert_eq!(missing["deskew"]["status"], "unavailable");
+    assert_eq!(missing["odom_association"], "missing");
+    assert!(missing["error"].as_str().unwrap().contains("odometry"));
+    let odom = vec![0; 49];
+    s.send(packet(4, 0, 1, 24., &odom)).await;
+    s.send(scan_packet(24.)).await;
+    let failed = timeout(WAIT, async {
+        loop {
+            let state = frame(&mut ws, "state").await;
+            if state["slam"]["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("deadline"))
+            {
+                break state["slam"].clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["mode"], "mapping");
+    assert_eq!(failed["tracking"], "error");
+    assert_eq!(failed["scan_stamp"], 24.);
+    assert_eq!(failed["scan_id"], 1);
+    assert_eq!(failed["scan_sequence"], 2);
+    assert_eq!(failed["source_time_verified"], false);
+    let stale = timeout(WAIT, async {
+        loop {
+            let state = frame(&mut ws, "state").await;
+            if state["slam"]["stale"] == true {
+                break state["slam"].clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(stale["age_ms"].as_f64().unwrap() >= 500.);
+    assert_eq!(stale["scan_stamp"], 24.);
+    cmd(&mut ws, r#"{"v":0.1,"w":0.0}"#).await;
+    assert_eq!(s.command().await.1, 0.1);
+}
+
+#[tokio::test]
+async fn raw_recording_captures_subscription_and_unfiltered_frames() {
+    let path = std::env::temp_dir().join(format!("server-raw-{}.jsonl", std::process::id()));
+    let mut s = Session::start_env(
+        &[],
+        None,
+        true,
+        Duration::ZERO,
+        &[("ROBOT_SLAM_RECORD_PATH", path.to_str().unwrap())],
+    )
+    .await;
+    s.send(packet(999, 7, 42, f64::NAN, &[0, 255, 128])).await;
+    sleep(Duration::from_millis(50)).await;
+    assert!(Command::new("kill")
+        .args(["-TERM", &s.child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    timeout(WAIT, async {
+        loop {
+            if let Some(status) = s.child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, v, w) = s.command().await;
+    assert_eq!((v, w), (0., 0.));
+    let text = std::fs::read_to_string(&path).expect("requested recording not created");
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.iter().filter(|r| r["msg_type"] == 4).count(), 17);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["interface"] == BUMPER_CODE)
+            .count(),
+        1,
+        "subscription-buffered DATA must not be lost or recorded twice"
+    );
+    let raw = rows.iter().find(|r| r["interface"] == 999).unwrap();
+    assert_eq!(raw["payload_base64"], "AP+A");
+    assert!(raw["source_stamp"].is_null());
+    assert_eq!(rows.last().unwrap()["complete"], true);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn recording_open_failure_precedes_supervisor_activation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let path = std::env::temp_dir().join(format!("server-existing-{}.jsonl", std::process::id()));
+    std::fs::write(&path, b"keep").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_robot-server"))
+        .env("ROBOT_SLAM_RECORD_PATH", &path)
+        .env(
+            "ROBOT_SERVER_HEARTBEAT",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // No supervisor connection is needed when opening the recording fails.
+    assert!(
+        timeout(Duration::from_millis(500), listener.accept())
+            .await
+            .is_err(),
+        "file preflight must precede supervisor connection/ACTIVATE"
+    );
+    assert!(child.try_wait().unwrap().is_some_and(|s| !s.success()));
+    assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    std::fs::remove_file(path).unwrap();
 }
