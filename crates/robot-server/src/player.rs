@@ -225,6 +225,7 @@ fn validate(m: &Message) -> Result<(), Failure> {
 pub struct DataProcessor {
     telemetry: telemetry::Telemetry,
     odom_history: crate::slam::OdomHistory,
+    recent_stamps: Vec<f64>,
     scan_sequence: u64,
     states: watch::Sender<Value>,
     scans: watch::Sender<Option<Value>>,
@@ -241,6 +242,7 @@ impl DataProcessor {
         Self {
             telemetry: telemetry::Telemetry::new(),
             odom_history: crate::slam::OdomHistory::new(),
+            recent_stamps: Vec::new(),
             scan_sequence: 0,
             states,
             scans,
@@ -278,6 +280,25 @@ impl DataProcessor {
                     obs.association = association.kind;
                     obs.odom_skew_ms = association.skew;
                     obs.source_time_verified = verified;
+                    if verified
+                        && stamp.is_some()
+                        && crate::slam::beam_time_verified()
+                        && crate::slam::deskew_enabled()
+                    {
+                        // Verified slot timing (PLAYER_TIMING.md): apply the
+                        // measured-period deskew; any gap keeps the raw scan.
+                        if let Ok(result) =
+                            crate::slam::apply_deskew(&obs, &self.odom_history, &self.recent_stamps)
+                        {
+                            obs.deskewed = Some((result.angles, result.ranges, result.period_ms));
+                        }
+                    }
+                    if let Some(stamp) = stamp {
+                        self.recent_stamps.push(stamp);
+                        if self.recent_stamps.len() > 8 {
+                            self.recent_stamps.remove(0);
+                        }
+                    }
                     let _ = tx.send(obs);
                 }
             }

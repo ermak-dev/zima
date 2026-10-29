@@ -253,6 +253,9 @@ pub struct Observation {
     pub association: &'static str,
     pub odom_skew_ms: Option<f64>,
     pub source_time_verified: bool,
+    /// Slot-model compensated scan (PLAYER_TIMING.md verified timing). The
+    /// adapter request then honestly declares motion_compensated.
+    pub deskewed: Option<(Vec<f32>, Vec<f32>, f64)>,
 }
 
 impl Observation {
@@ -283,6 +286,7 @@ impl Observation {
             },
             odom_skew_ms: None,
             source_time_verified: false,
+            deskewed: None,
         }
     }
     /// Request line for the adapter: valid beams only, each with its own
@@ -290,9 +294,14 @@ impl Observation {
     /// `delta` is the odom pose change since the previous update, in the
     /// previous robot frame.
     pub fn to_update_request(&self, delta: (f64, f64, f64)) -> String {
-        let mut angles = Vec::with_capacity(self.angles.len());
-        let mut ranges = Vec::with_capacity(self.ranges.len());
-        for (a, r) in self.angles.iter().zip(&self.ranges) {
+        let (source_angles, source_ranges, compensated) = if let Some((a, r, _)) = &self.deskewed {
+            (a, r, true)
+        } else {
+            (&self.angles, &self.ranges, false)
+        };
+        let mut angles = Vec::with_capacity(source_angles.len());
+        let mut ranges = Vec::with_capacity(source_ranges.len());
+        for (a, r) in source_angles.iter().zip(source_ranges) {
             if a.is_finite()
                 && r.is_finite()
                 && *r >= player_bridge::scan::LDS_RANGE_MIN
@@ -309,6 +318,10 @@ impl Observation {
             "sensor_x": player_bridge::scan::LDS_X,
             "odom": {"dx": round(delta.0), "dy": round(delta.1), "dyaw": round(delta.2)}
         });
+        if compensated {
+            // Honest declaration consumed by the adapter's admission gate.
+            fields["motion_compensated"] = json!(true);
+        }
         if self.source_time_verified {
             if let Some(stamp) = self.scan_stamp.filter(|s| s.is_finite()) {
                 fields["stamp"] = json!(stamp);
@@ -585,12 +598,20 @@ impl SlamThread {
                     state["odom_association"] = json!(obs.association);
                     state["odom_skew_ms"] = json!(obs.odom_skew_ms);
                     state["source_time_verified"] = json!(obs.source_time_verified);
-                    let requested =
-                        std::env::var("ROBOT_SLAM_DESKEW_ENABLED").is_ok_and(|v| v == "true");
+                    let requested = deskew_enabled();
+                    let applied = obs.deskewed.is_some();
                     state["deskew"] = json!({
-                        "requested": requested, "applied": false,
-                        "status": if requested { "unavailable" } else { "disabled" },
-                        "reason": if requested { Some("Player provides no verified per-beam timing") } else { None },
+                        "requested": requested, "applied": applied,
+                        "status": if applied { "applied" }
+                            else if requested && beam_time_verified() { "degraded" }
+                            else if requested { "unverified_timing" }
+                            else { "disabled" },
+                        "reason": if requested && !applied && !beam_time_verified() {
+                            Some("beam timing not verified; enable ROBOT_SLAM_BEAM_TIME_VERIFIED after the PLAYER_TIMING evidence")
+                        } else if requested && !applied {
+                            Some("missing stamp, unstable revolution period or uncovered trajectory")
+                        } else { None },
+                        "period_ms": obs.deskewed.as_ref().map(|d| d.2),
                     });
                     on_state(state.clone());
                 }
@@ -1105,6 +1126,81 @@ mod tests {
     }
 }
 
+/// Apply the verified slot-model deskew to one observation. Requires a
+/// finite publication stamp, a stable measured revolution period from the
+/// last stamps, and an odometry trajectory covering the whole revolution on
+/// the verified source clock. Errors keep the caller on the raw scan path;
+/// compensation is never silently approximated.
+pub fn apply_deskew(
+    obs: &Observation,
+    history: &OdomHistory,
+    recent_stamps: &[f64],
+) -> Result<DeskewedScan, &'static str> {
+    let stamp = obs
+        .scan_stamp
+        .filter(|s| s.is_finite() && *s > 0.)
+        .ok_or("missing_scan_stamp")?;
+    let period_ms = revolution_period_ms(recent_stamps).ok_or("unstable_revolution_period")?;
+    let period = period_ms / 1000.;
+    let from = stamp - period;
+    let trajectory = history
+        .trajectory_between(from, stamp)
+        .ok_or("trajectory_does_not_cover_revolution")?;
+    // Slot timing needs the ORIGINAL revolution length: invalid beams keep
+    // their slot position, so valid beams keep exact acquisition times. A
+    // beam measured before the first odometry sample (at most one frame step
+    // into the revolution) is skipped rather than extrapolated.
+    let n = obs.angles.len();
+    let first_time = trajectory.first().map(|t| t.time).unwrap_or(f64::INFINITY);
+    let mut angles = Vec::new();
+    let mut ranges = Vec::new();
+    for (slot, (a, r)) in obs.angles.iter().zip(&obs.ranges).enumerate() {
+        if !(a.is_finite()
+            && r.is_finite()
+            && *r >= player_bridge::scan::LDS_RANGE_MIN
+            && *r <= obs.max_range)
+        {
+            continue;
+        }
+        let time = stamp - (n - 1 - slot) as f64 * period / n as f64;
+        if time < first_time {
+            continue;
+        }
+        match robot_server::motion_compensation::deskew(
+            &[robot_server::motion_compensation::TimedRay {
+                time,
+                angle: *a as f64,
+                range: *r as f64,
+            }],
+            &trajectory,
+            stamp,
+            player_bridge::scan::LDS_X,
+        ) {
+            Ok(corrected) => {
+                angles.push(corrected[0].angle as f32);
+                ranges.push(corrected[0].range as f32);
+            }
+            Err(_) => return Err("deskew_kernel_rejected"),
+        }
+    }
+    if angles.is_empty() {
+        return Err("no_valid_beams");
+    }
+    Ok(DeskewedScan {
+        angles,
+        ranges,
+        period_ms,
+        stamp,
+    })
+}
+
+pub struct DeskewedScan {
+    pub angles: Vec<f32>,
+    pub ranges: Vec<f32>,
+    pub period_ms: f64,
+    pub stamp: f64,
+}
+
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
@@ -1169,6 +1265,136 @@ mod runtime_tests {
         let pose = association.pose.unwrap();
         assert!((pose.0 - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-8);
         assert!((pose.1 - (1. - std::f64::consts::FRAC_1_SQRT_2)).abs() < 1e-8);
+    }
+
+    // FEATURE: verified slot-model deskew applied to Player observations.
+    // SPEC: beam times come from the measured revolution period and slot
+    // indices; requires verified source clocks and an odometry trajectory
+    // covering the whole scan; success is reported honestly, and any gap
+    // keeps the raw scan without claiming compensation.
+    #[test]
+    fn revolution_period_is_measured_and_gated() {
+        assert!((revolution_period_ms(&[100., 100.2, 100.4, 100.6]).unwrap() - 200.).abs() < 1e-6);
+        assert!(revolution_period_ms(&[100., 100.5, 100.4]).is_none()); // non-monotonic
+        assert!(revolution_period_ms(&[100., 100.01, 100.02]).is_none()); // too fast
+        assert!(revolution_period_ms(&[100., 100., 100.]).is_none()); // zero
+        assert!(revolution_period_ms(&[100., 100.2, 100.9]).is_none()); // jitter
+        assert!(revolution_period_ms(&[100., 100.2]).is_none()); // too few
+    }
+
+    #[test]
+    fn trajectory_between_covers_only_verified_source_bounds() {
+        let now = Instant::now();
+        let mut history = OdomHistory::new();
+        for i in 0..=10 {
+            assert!(history.push(
+                100. + i as f64 * 0.04,
+                now + Duration::from_millis(40 * i),
+                (0., 0., 0.1 * i as f64)
+            ));
+        }
+        let trajectory = history.trajectory_between(100.0, 100.4).unwrap();
+        assert_eq!(trajectory.len(), 11);
+        assert!((trajectory[0].time - 100.).abs() < 1e-9);
+        assert!((trajectory[10].pose.yaw - 1.0).abs() < 1e-9);
+        assert!(history.trajectory_between(99.9, 100.4).is_none());
+        assert!(history.trajectory_between(100.0, 100.5).is_none());
+        let empty = OdomHistory::new();
+        assert!(empty.trajectory_between(100., 100.1).is_none());
+    }
+
+    #[test]
+    fn deskew_apply_uses_slot_model_with_measured_period() {
+        let period = 0.2;
+        let n = 360;
+        let w = 1.0f64;
+        let stamp = 100.4;
+        let t0 = stamp - 2. * period;
+        let (wx, wy) = (2.0f64, 0.5);
+        let rays: Vec<robot_server::motion_compensation::TimedRay> = (0..n)
+            .map(|slot| {
+                let time = stamp - (n - 1 - slot) as f64 * period / n as f64;
+                let yaw = w * (time - t0);
+                let bx = yaw.cos() * wx + yaw.sin() * wy;
+                let by = -yaw.sin() * wx + yaw.cos() * wy;
+                robot_server::motion_compensation::TimedRay {
+                    time,
+                    angle: by.atan2(bx + 0.1),
+                    range: (bx + 0.1).hypot(by),
+                }
+            })
+            .collect();
+        let mut angles = vec![0f32; n];
+        let mut ranges = vec![0f32; n];
+        for (slot, ray) in rays.iter().enumerate() {
+            angles[slot] = ray.angle as f32;
+            ranges[slot] = ray.range as f32;
+        }
+        let mut observation = Observation::from_scan(
+            &player_bridge::LaserScanAngle {
+                max_range: 6.,
+                ranges,
+                angles,
+                intensities: vec![],
+                id: 1,
+            },
+            None,
+        );
+        observation.scan_stamp = Some(stamp);
+        let mut history = OdomHistory::new();
+        let now = Instant::now();
+        for i in 0..=30 {
+            assert!(history.push(
+                t0 + i as f64 * 0.02,
+                now + Duration::from_millis(20 * i),
+                (0., 0., w * 0.02 * i as f64)
+            ));
+        }
+        let applied = apply_deskew(&observation, &history, &stamp_positions(stamp, 3));
+        let result = applied.expect("deskew must apply with full coverage");
+        assert_eq!(result.angles.len(), n);
+        // The compensated scan must reproduce the fixed world point from the reference pose.
+        let ref_yaw = w * (stamp - t0);
+        for (a, r) in result.angles.iter().zip(&result.ranges) {
+            let x = player_bridge::scan::LDS_X + *r as f64 * (*a as f64).cos();
+            let y = *r as f64 * (*a as f64).sin();
+            let mx = ref_yaw.cos() * x - ref_yaw.sin() * y;
+            let my = ref_yaw.sin() * x + ref_yaw.cos() * y;
+            assert!((mx - wx).abs() < 1e-3, "x {mx} vs {wx}");
+            assert!((my - wy).abs() < 1e-3, "y {my} vs {wy}");
+        }
+    }
+
+    #[test]
+    fn deskew_declines_without_coverage_or_stamps() {
+        let observation = Observation::from_scan(
+            &player_bridge::LaserScanAngle {
+                max_range: 6.,
+                ranges: vec![1.; 4],
+                angles: vec![0.1, 0.2, 0.3, 0.4],
+                intensities: vec![],
+                id: 1,
+            },
+            None,
+        );
+        let empty = OdomHistory::new();
+        assert!(apply_deskew(&observation, &empty, &[]).is_err());
+        let mut history = OdomHistory::new();
+        let now = Instant::now();
+        for i in 0..=10 {
+            assert!(history.push(100. + i as f64 * 0.05, now, (0., 0., 0.)));
+        }
+        let no_stamp = Observation {
+            scan_stamp: None,
+            ..observation.clone()
+        };
+        assert!(apply_deskew(&no_stamp, &history, &[100., 100.2, 100.4]).is_err());
+    }
+
+    fn stamp_positions(latest: f64, count: usize) -> Vec<f64> {
+        let mut stamps: Vec<f64> = (0..count).map(|i| latest - i as f64 * 0.2).collect();
+        stamps.reverse();
+        stamps
     }
 
     #[test]
@@ -1400,5 +1626,110 @@ mod runtime_tests {
         assert!(error.contains("write deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
         std::fs::remove_file(p).unwrap();
+    }
+}
+
+// Verified physical beam timing (PLAYER_TIMING.md, 2026-10-29): slots are
+// acquired in order, the revolution spans the measured publication period
+// and the scan is published right after the last beam. The revolution
+// period is measured live from consecutive scan stamps, never assumed.
+pub fn beam_time_verified() -> bool {
+    std::env::var("ROBOT_SLAM_BEAM_TIME_VERIFIED").is_ok_and(|v| v == "true")
+}
+pub fn deskew_enabled() -> bool {
+    std::env::var("ROBOT_SLAM_DESKEW_ENABLED").is_ok_and(|v| v == "true")
+}
+pub fn revolution_period_ms(stamps: &[f64]) -> Option<f64> {
+    if stamps.len() < 3 {
+        return None;
+    }
+    let deltas: Vec<f64> = stamps.windows(2).map(|w| (w[1] - w[0]) * 1000.).collect();
+    let n = deltas.len() as f64;
+    let mean = deltas.iter().sum::<f64>() / n;
+    let variance = deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / n;
+    // Reject unstable periods: jitter beyond 15 ms means the revolution
+    // timing is not observable from these stamps.
+    if !mean.is_finite() || !(150. ..=400.).contains(&mean) || variance.sqrt() > 15. {
+        return None;
+    }
+    Some(mean)
+}
+
+impl OdomHistory {
+    /// Trajectory samples covering [from, to] on the verified source clock.
+    /// Both bounds must lie inside the sampled odometry interval; `to` may
+    /// extend one sample step past the last sample because the scan is
+    /// published right after the final beam, before the next odometry frame.
+    pub fn trajectory_between(
+        &self,
+        from: f64,
+        to: f64,
+    ) -> Option<Vec<robot_server::motion_compensation::TimedPose>> {
+        if !(from.is_finite() && to.is_finite()) || to < from {
+            return None;
+        }
+        let samples: Vec<_> = self
+            .samples
+            .iter()
+            .filter(|s| s.source.is_finite() && s.source > 0.)
+            .collect();
+        if samples.len() < 2 {
+            return None;
+        }
+        let first = samples.first()?.source;
+        let last = samples.last()?.source;
+        let step = samples
+            .windows(2)
+            .map(|w| w[1].source - w[0].source)
+            .fold(f64::MIN, f64::max);
+        if from < first - 2. * step.max(0.) || to > last + 2. * step.max(0.) {
+            return None;
+        }
+        let mut trajectory: Vec<robot_server::motion_compensation::TimedPose> = samples
+            .iter()
+            .filter(|s| s.source >= from && s.source <= to)
+            .map(|s| robot_server::motion_compensation::TimedPose {
+                time: s.source,
+                pose: robot_server::motion_compensation::Pose2 {
+                    x: s.pose.0,
+                    y: s.pose.1,
+                    yaw: s.pose.2,
+                },
+            })
+            .collect();
+        if to > last && trajectory.len() >= 2 {
+            // The scan is published between odometry frames: continue the
+            // constant twist of the last two samples by that sub-step so the
+            // kernel has an exact sample at the reference instant. Bounded by
+            // the caller's coverage check above (at most one frame step).
+            let a = trajectory[trajectory.len() - 2];
+            let b = trajectory[trajectory.len() - 1];
+            let span = b.time - a.time;
+            if span > 0. {
+                let f = (to - b.time) / span;
+                let (ca, sa) = a.pose.yaw.sin_cos();
+                let dx = ca * (b.pose.x - a.pose.x) + sa * (b.pose.y - a.pose.y);
+                let dy = -sa * (b.pose.x - a.pose.x) + ca * (b.pose.y - a.pose.y);
+                let yaw = wrap(b.pose.yaw - a.pose.yaw);
+                let fr = f * yaw;
+                let (uf, vf) = if fr.abs() < 1e-7 {
+                    (1. - fr * fr / 6., fr / 2. - fr.powi(3) / 24.)
+                } else {
+                    (fr.sin() / fr, (1. - fr.cos()) / fr)
+                };
+                let (cb, sb) = b.pose.yaw.sin_cos();
+                let ex = f * (uf * dx - vf * dy);
+                let ey = f * (vf * dx + uf * dy);
+                trajectory.push(robot_server::motion_compensation::TimedPose {
+                    time: to,
+                    pose: robot_server::motion_compensation::Pose2 {
+                        x: b.pose.x + cb * ex - sb * ey,
+                        y: b.pose.y + sb * ex + cb * ey,
+                        yaw: wrap(b.pose.yaw + fr),
+                    },
+                });
+            }
+        }
+        Some(trajectory)
     }
 }

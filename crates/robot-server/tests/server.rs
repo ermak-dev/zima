@@ -2014,6 +2014,7 @@ done
         &[
             ("ROBOT_SLAM_ADAPTER_TIMEOUT_MS", "80"),
             ("ROBOT_SLAM_DESKEW_ENABLED", "true"),
+            ("ROBOT_SLAM_SOURCE_TIME_VERIFIED", "true"),
         ],
     )
     .await;
@@ -2033,7 +2034,9 @@ done
     assert_eq!(missing["scan_sequence"], 1);
     assert_eq!(missing["deskew"]["requested"], true);
     assert_eq!(missing["deskew"]["applied"], false);
-    assert_eq!(missing["deskew"]["status"], "unavailable");
+    // Beam timing stays unverified in this fixture: deskew is requested but
+    // honestly reported as unverified_timing, never silently applied.
+    assert_eq!(missing["deskew"]["status"], "unverified_timing");
     assert_eq!(missing["odom_association"], "missing");
     assert!(missing["error"].as_str().unwrap().contains("odometry"));
     let odom = vec![0; 49];
@@ -2057,7 +2060,7 @@ done
     assert_eq!(failed["scan_stamp"], 24.);
     assert_eq!(failed["scan_id"], 1);
     assert_eq!(failed["scan_sequence"], 2);
-    assert_eq!(failed["source_time_verified"], false);
+    assert_eq!(failed["source_time_verified"], true);
     let stale = timeout(WAIT, async {
         loop {
             let state = frame(&mut ws, "state").await;
