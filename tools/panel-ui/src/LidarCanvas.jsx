@@ -145,7 +145,7 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
       // overlay and must not pretend to align with another scan or stale pose.
       const world = v.frame === 'map'
       const map = s.slam?.map, pose = s.slam?.pose
-      if (map?.cells && (world || s.freshness.aligned)) {
+      if (v.showMap !== false && map?.cells && (world || s.freshness.aligned)) {
         const image = gridImage(gridCacheRef.current, map)
         if (image) {
           const [a, b, c, d, e, f] = gridTransform(map, pose, { W, H, k, ox, oy }, v.frame)
@@ -158,7 +158,7 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
       }
 
       // Points already include the static lidar mount correction.
-      if (s.scan?.frame === 'base_link' && (!world || s.freshness.matched)) {
+      if (v.showScan !== false && s.scan?.frame === 'base_link' && (!world || s.freshness.matched)) {
         ctx.fillStyle = '#2a78d6'
         const points = s.scan?.points || []
         for (const [x, y] of world ? scanToMap(points, pose) : points) {

@@ -1,7 +1,7 @@
 // Leak-focused frontend tests: mount/unmount under StrictMode must leave
 // no sockets, timers or listeners behind; collapsed camera stops decoding.
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, act } from '@testing-library/react'
+import { render, cleanup, act, screen } from '@testing-library/react'
 
 vi.mock('../src/usePanelSocket.js', () => ({
   default: (onMessage) => mockSocket(onMessage),
@@ -197,25 +197,6 @@ describe('App lifecycle', () => {
   // IMPLEMENTATION: an always-visible read-only inventory distinguishes blocked subscriptions.
   // RESULT: IMPLEMENTED — missing values, raw arrays and inert viewing verified.
   // STATUS: DONE
-  it('shows service channels without sending commands', () => {
-    const { getByRole } = render(<App />)
-    for (const key of ['ir:3', 'ir:4', 'ir:6', 'ir:7', 'ir:8']) {
-      expect(document.getElementById(`service-${key}`).textContent).toBe('нет данных')
-    }
-    for (const key of ['motor:0', 'motor:1', 'motor:2']) {
-      expect(document.getElementById(`service-${key}`).textContent).toMatch(/подписка отключена/)
-    }
-    expect(document.getElementById('service-keypad:0').textContent).toMatch(/формат не подтверждён/)
-    act(() => lastHandler({ type: 'state', data: { sensors: { service_channels: {
-      'ir:7': { voltages: [0, 12, null], ranges: [17], stamp: 42 },
-      'position3d:0': { pos: [1, 2, 3, 0.1, 0.2, 0.3], vel: [0, 0, 0, 0, 0, null], stall: false },
-    } } } }))
-    expect(document.getElementById('service-ir:7').textContent).toBe('voltages [0, 12, —] · ranges [17]')
-    expect(document.getElementById('service-position3d:0')).toBeNull()
-    expect(getByRole('group', { name: 'Служебные каналы' })).toBeTruthy()
-    expect(sockets.flatMap((s) => s.sent)).toEqual([])
-  })
-
   it('speed slider scales teleop commands within the hard limits', () => {
     const { container } = render(<App />)
     const sent = () => sockets.flatMap((s) => s.sent)
@@ -322,20 +303,17 @@ describe('App lifecycle', () => {
     expect(getByRole('img', { name: 'Гироскоп' }).dataset.known).toBe('true')
     expect(container.querySelector('[data-gyro-heading]').getAttribute('transform')).toBe('rotate(-90 60 60)')
     expect(container.querySelector('.attitude-horizon')).toBeNull()
-    expect(getByRole('group', { name: 'Служебные каналы' }).textContent).not.toContain('Гироскоп')
     act(() => lastHandler({ type: 'state', data: { sensors: { compass: rawCompass(0) } } }))
     expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
     expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(0 60 60)')
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
 
-  it('keeps every service value exposed without a collapsed disclosure', () => {
-    const { getByRole, container } = render(<App />)
-    const service = getByRole('group', { name: 'Служебные каналы' })
-    expect(service.closest('details:not([open])')).toBeNull()
+  it('keeps sensor widgets visible without a collapsed disclosure', () => {
+    const { container } = render(<App />)
     expect(container.querySelector('.sensor-readings')).toBeTruthy()
     expect(container.querySelector('.orientation-instruments')).toBeTruthy()
-    expect(service.querySelectorAll('[id^="service-"]').length).toBe(9)
+    expect(container.querySelector('details:not([open])')).toBeNull()
   })
 
   it('allows the chassis turn ceiling without changing the initial speed', () => {
@@ -367,8 +345,6 @@ describe('App lifecycle', () => {
     expect(velocity.dataset.known).toBe('false')
     expect(container.querySelector('[data-odometry-position]')).toBeNull()
     expect(document.getElementById('pose-v').textContent).toBe('—')
-    const services = getByRole('group', { name: 'Служебные каналы' })
-    expect(services.textContent).not.toMatch(/Одометрия|position3d:1|position3d:4/)
     expect(container.querySelector('#panel-lidar #odom')).toBeNull()
     act(() => lastHandler({ type: 'state', data: { odom: { x: 3, y: 4, yaw: Math.PI / 2, vx: -0.25, yaw_rate: 1.57 } } }))
     expect(pose.dataset.known).toBe('true')
@@ -398,7 +374,8 @@ describe('App lifecycle', () => {
   it('shows only lidar, camera, sensors and telemetry without sending commands', () => {
     const { container, getByRole } = render(<App />)
     expect(getByRole('heading', { name: 'Лидар' })).toBeTruthy()
-    expect(container.textContent).not.toMatch(/ROS|SLAM|TF|Ожидание карты|Свободно|Стены|Неизвестно/)
+    expect(container.textContent).not.toMatch(/ROS|TF|Ожидание карты|Свободно|Стены|Неизвестно/)
+    expect(screen.queryByLabelText('SLAM')).toBeNull()
     expect(document.getElementById('frame-label').textContent).toBe('base_link')
     expect(container.querySelector('#map-fit, #map-scan, #map-message')).toBeNull()
     expect(sockets.flatMap((s) => s.sent)).toEqual([])

@@ -5,9 +5,8 @@ import useVision from './useVision.js'
 import VisionFrame from './VisionFrame.jsx'
 import useTeleop, { LIMITS as HARD_LIMITS, DEFAULT_LINEAR_SPEED, DEFAULT_ANGULAR_SPEED } from './useTeleop.js'
 import LidarCanvas from './LidarCanvas.jsx'
-import SlamStatus from './SlamStatus.jsx'
 import useSlamState from './useSlamState.js'
-import ServiceChannels from './ServiceChannels.jsx'
+import { MotorsFooter } from './MotorsPanel.jsx'
 import OrientationInstruments from './OrientationInstruments.jsx'
 import useCompass, { compassYaw } from './useCompass.js'
 import OdometryInstruments from './OdometryInstruments.jsx'
@@ -43,7 +42,7 @@ export default function App() {
   const [scan, setScan] = useState({})
   // Keep result age above collapsible panels: reopening a canvas is not a new result.
   const slamState = useSlamState(state.slam, scan)
-  const [view, setView] = useState({ radius: 3, center: null, frame: 'robot' })
+  const [view, setView] = useState({ radius: 3, center: null, frame: 'robot', showScan: true, showMap: true })
   const [collapsed, setCollapsed] = useState({ lidar: false, camera: false, sensors: false })
   const [expanded, setExpanded] = useState(null)
   const [visionEnabled, setVisionEnabled] = useState(false)
@@ -169,6 +168,12 @@ export default function App() {
                 <span className="frame-label"> · <span id="frame-label">{view.frame === 'map' ? 'map' : 'base_link'}</span></span>
               </span>
               <div className="panel-actions">
+                <label className="layer-toggle" title="Показывать точки текущего скана">
+                  <input type="checkbox" checked={view.showScan} onChange={(e) => setView((v) => ({ ...v, showScan: e.target.checked }))} />Скан лидара
+                </label>
+                <label className="layer-toggle" title="Показывать карту SLAM (occupancy)">
+                  <input type="checkbox" checked={view.showMap} onChange={(e) => setView((v) => ({ ...v, showMap: e.target.checked }))} />Карта SLAM
+                </label>
                 <button id="lidar-frame" type="button" aria-pressed={view.frame === 'map'}
                   title="Фиксированный кадр карты: отличить повреждение карты от скачка позы"
                   onClick={() => setView((v) => ({ ...v, frame: v.frame === 'map' ? 'robot' : 'map', center: null }))}>Кадр карты</button>
@@ -192,7 +197,6 @@ export default function App() {
               </div>
             </div>
           )}
-          <SlamStatus slam={state.slam} scan={scan} slamState={slamState} />
         </section>
         <aside>
           <section id="panel-camera" className={`camera${collapsed.camera ? ' is-collapsed' : ''}${expanded === 'camera' ? ' is-expanded' : ''}`} aria-labelledby="camera-title">
@@ -259,7 +263,6 @@ export default function App() {
                 </td></tr>
               </tbody></table>
               </div>
-              <ServiceChannels channels={sensors.service_channels} />
               </div>
             )}
             {!collapsed.sensors && <p className="sensor-note">Сырые показания, калибровка не подтверждена. Нули ИК не означают безопасность; 65.534 м сонара — sentinel. Последний кадр не гарантирует свежесть.</p>}
@@ -280,6 +283,7 @@ export default function App() {
         </label>
         <button id="stop" type="button" onClick={stop}>Стоп · Space</button>
         <span className="limits">≤ {HARD_LIMITS.v} м/с &nbsp; ≤ {HARD_LIMITS.w} рад/с</span>
+        <MotorsFooter motors={state.motors} send={send} />
         <SpeechPanel settings={audioSettings} />
       </footer>
     </>
