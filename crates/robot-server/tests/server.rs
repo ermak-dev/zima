@@ -224,6 +224,19 @@ impl Session {
                     if rd.read_exact(&mut p).await.is_err() {
                         break;
                     }
+                    if h.addr.interf == 170 {
+                        // motor PWM: one XDR float (4 bytes), subtype 1
+                        assert_eq!((h.msg_type, h.subtype, h.size), (2, 1, 4));
+                        let duty = f32::from_be_bytes(p[0..4].try_into().unwrap());
+                        if log
+                            .send((Instant::now(), (h.addr.index + 1000) as f64, duty as f64))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     assert_eq!((h.msg_type, h.addr.interf, h.subtype), (2, 4, 1));
                     let f = |i| f64::from_be_bytes(p[i..i + 8].try_into().unwrap());
                     if log.send((Instant::now(), f(0), f(16))).await.is_err() {
@@ -303,6 +316,19 @@ impl Session {
             .await
             .expect("Player never got command")
             .unwrap()
+    }
+    async fn exited_ok(&mut self) {
+        timeout(WAIT, async {
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success(), "clean shutdown must exit successfully");
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server did not exit");
     }
     async fn quiet(&mut self, ms: u64) {
         assert!(
@@ -2341,4 +2367,108 @@ async fn recording_open_failure_precedes_supervisor_activation() {
     assert!(child.try_wait().unwrap().is_some_and(|s| !s.success()));
     assert_eq!(std::fs::read(&path).unwrap(), b"keep");
     std::fs::remove_file(path).unwrap();
+}
+
+// FEATURE: panel-controlled cleaning motors over the sole Player connection.
+// SPEC: {"type":"motors","fan":N,"main":N,"side":N} publishes one XDR float
+// PWM (interf 170, CMD subtype 1) per motor, clamped 0..=100, gated by the
+// exclusive wheel-command owner; owner disconnect and session shutdown send
+// zeros; no motor subscriptions are ever made (vendor zero-on-unsubscribe).
+#[tokio::test]
+async fn motors_command_publishes_pwm_and_stops_on_disconnect_and_shutdown() {
+    let mut s = Session::start(&[], None, true).await;
+    let mut ws = s.ws().await;
+    cmd(&mut ws, r#"{"v":0,"w":0}"#).await;
+    cmd(&mut ws, r#"{"type":"motors","fan":60,"main":40,"side":80}"#).await;
+    // State must expose the requested duties for the panel.
+    let state = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut ws, "state").await;
+            if v["motors"] == json!({"fan": 60.0, "main": 40.0, "side": 80.0}) {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Clamped: negative -> 0, over-range -> 100, NaN rejected as a whole.
+    cmd(&mut ws, r#"{"type":"motors","fan":-5,"main":140,"side":0}"#).await;
+    timeout(WAIT, async {
+        loop {
+            let v = frame(&mut ws, "state").await;
+            if v["motors"] == json!({"fan": 0.0, "main": 100.0, "side": 0.0}) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // A non-owner viewer cannot command motors: force a fresh state publish
+    // (telemetry preserves the motor fields) and verify they did not change.
+    let mut viewer = s.ws().await;
+    cmd(
+        &mut viewer,
+        r#"{"type":"motors","fan":99,"main":0,"side":0}"#,
+    )
+    .await;
+    s.send(bumper(false)).await;
+    timeout(WAIT, async {
+        loop {
+            let v = frame(&mut viewer, "state").await;
+            assert_ne!(
+                v["motors"],
+                json!({"fan": 99.0, "main": 0.0, "side": 0.0}),
+                "viewer must not change motor state"
+            );
+            if v["motors"] == json!({"fan": 0.0, "main": 100.0, "side": 0.0}) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no state after viewer command");
+    // Owner disconnect stops the motors.
+    drop(ws);
+    let state2 = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut viewer, "state").await;
+            if v["motors"] == json!({"fan": 0.0, "main": 0.0, "side": 0.0}) {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // The wire log must contain the actual PWM duties per motor index and
+    // final zeros from teardown; owner disconnect already published zeros.
+    drop(viewer);
+    let mut motor_log: Vec<(usize, f64)> = Vec::new();
+    while let Ok((_, a, b)) = s.cmds.try_recv() {
+        if a >= 1000. {
+            motor_log.push((a as usize - 1000, b));
+        }
+    }
+    assert!(
+        motor_log.contains(&(0, 60.0)),
+        "fan PWM missing: {motor_log:?}"
+    );
+    assert!(
+        motor_log.contains(&(1, 40.0)),
+        "main PWM missing: {motor_log:?}"
+    );
+    assert!(
+        motor_log.contains(&(2, 80.0)),
+        "side PWM missing: {motor_log:?}"
+    );
+    assert!(motor_log.contains(&(0, 0.0)));
+    assert!(
+        !motor_log.contains(&(0, 99.0)),
+        "viewer PWM must not reach Player"
+    );
+    assert!(Command::new("kill")
+        .args(["-TERM", &s.child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    s.exited_ok().await;
 }

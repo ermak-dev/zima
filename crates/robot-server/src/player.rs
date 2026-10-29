@@ -16,7 +16,7 @@ use tokio::{
     },
     sync::{watch, Mutex as AsyncMutex},
 };
-type Writer = Arc<AsyncMutex<OwnedWriteHalf>>;
+pub type Writer = Arc<AsyncMutex<OwnedWriteHalf>>;
 pub struct Reader {
     stream: OwnedReadHalf,
     processor: DataProcessor,
@@ -330,7 +330,7 @@ impl DataProcessor {
                 let mut next = v.clone();
                 if let (Some(dst), Some(src)) = (next.as_object_mut(), old.as_object()) {
                     for (k, val) in src {
-                        if k == "slam" {
+                        if matches!(k.as_str(), "slam" | "motors") {
                             dst.insert(k.clone(), val.clone());
                         }
                     }
@@ -539,4 +539,13 @@ mod tests {
         );
         drop(fake.await.unwrap());
     }
+}
+
+// Cleaning motors publish PWM commands on the same connection without any
+// subscription (vendor enqueues a zero on last unsubscribe). Zero duties are
+// still sent explicitly: teardown must not rely on the vendor queue.
+pub async fn motor_pwm(writer: &Writer, index: u8, duty: f32) -> Result<(), Failure> {
+    let mut wr = writer.lock().await;
+    wr.write_all(&motor_pwm_packet(index, duty)).await?;
+    Ok(())
 }

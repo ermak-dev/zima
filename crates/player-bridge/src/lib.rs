@@ -660,3 +660,62 @@ pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
         id,
     })
 }
+
+// --- vendor motor command (interface 170) ---
+// Ground truth: installed-firmware XDR table + RubyChassisDriver::ProcessMessage
+// (docs/player-platform-survey.md, 2026-10-03): motor:0 fan, motor:1 main brush,
+// motor:2 side brush; CMD subtype 1 = player_motor_cmd_pwm_pack, one XDR float.
+// The driver scales by 100 internally; clients publish the raw duty value.
+// Subscriptions are never made: the vendor enqueues a zero on the last
+// unsubscribe and the queue is not reliably cancellable.
+pub const MOTOR_CODE: u16 = 170;
+pub const MOTOR_CMD_PWM: u8 = 1;
+pub const MOTOR_MAX_PWM: f32 = 100.0;
+
+/// Clamp a requested duty to the safe [0, 100] range; negative or non-finite
+/// requests become zero, mirroring the drive path's non-finite handling.
+pub fn motor_pwm_clamp(value: f64) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value.min(MOTOR_MAX_PWM as f64) as f32
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod motor_tests {
+    use super::*;
+
+    // BUG/FEATURE: motor PWM command wire format for interface 170.
+    // SPEC: one XDR float, MSGTYPE_CMD subtype 1; duty clamped to 0..=100,
+    // negative/NaN -> 0; never a subscribe (vendor zero-on-unsubscribe side effect).
+    #[test]
+    fn motor_pwm_command_encodes_one_clamped_xdr_float() {
+        assert_eq!(motor_pwm_clamp(50.0), 50.0);
+        assert_eq!(motor_pwm_clamp(120.0), 100.0);
+        assert_eq!(motor_pwm_clamp(-5.0), 0.0);
+        assert_eq!(motor_pwm_clamp(f64::NAN), 0.0);
+        assert_eq!(motor_pwm_clamp(f64::INFINITY), 0.0);
+    }
+}
+
+/// One vendor motor PWM command on the existing connection (no subscribe).
+/// `index`: 0 fan, 1 main brush, 2 side brush; duty already clamped.
+pub fn motor_pwm_packet(index: u8, duty: f32) -> Vec<u8> {
+    let h = MsgHeader {
+        addr: DevAddr {
+            host: 0,
+            robot: 0,
+            interf: MOTOR_CODE,
+            index: index as u16,
+        },
+        msg_type: 2, // PLAYER_MSGTYPE_CMD
+        subtype: MOTOR_CMD_PWM,
+        timestamp: 0.,
+        seq: 0,
+        size: 4,
+    };
+    let mut out = encode_header(&h).to_vec();
+    out.extend_from_slice(&duty.to_be_bytes());
+    out
+}

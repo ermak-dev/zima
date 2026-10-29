@@ -126,12 +126,46 @@ struct App {
     vision: Option<watch::Receiver<Value>>,
     ids: Arc<AtomicU64>,
     recording: Option<Arc<SessionRecording>>,
+    motors: Arc<std::sync::Mutex<Motors>>,
+    player: player::Writer,
+}
+/// Cleaning-motor duties shared with the panel state; the write half sends
+/// PWM commands on the sole Player connection.
+struct Motors {
+    owner: Option<u64>,
+    fan: f64,
+    main: f64,
+    side: f64,
+}
+impl Default for Motors {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            fan: 0.,
+            main: 0.,
+            side: 0.,
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Command {
     v: f64,
     w: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MotorsCommand {
+    #[serde(rename = "type")]
+    kind: MotorsKind,
+    fan: Option<f64>,
+    main: Option<f64>,
+    side: Option<f64>,
+}
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum MotorsKind {
+    Motors,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,11 +236,52 @@ impl Drop for DriverGuard {
         self.safety.lock().unwrap().disconnect(self.id);
     }
 }
+// Dropping the motor owner publishes zeros on the shared Player writer; the
+// vendor queue is not a reliable cancel path.
+struct MotorsGuard {
+    id: u64,
+    motors: Arc<Mutex<Motors>>,
+    writer: player::Writer,
+    states: watch::Sender<Value>,
+}
+impl Drop for MotorsGuard {
+    fn drop(&mut self) {
+        let stop = {
+            let mut motors = self.motors.lock().unwrap();
+            if motors.owner != Some(self.id) {
+                None
+            } else {
+                motors.owner = None;
+                motors.fan = 0.;
+                motors.main = 0.;
+                motors.side = 0.;
+                Some(())
+            }
+        };
+        if stop.is_some() {
+            self.states.send_modify(|state| {
+                state["motors"] = json!({"fan": 0.0, "main": 0.0, "side": 0.0});
+            });
+            let writer = self.writer.clone();
+            tokio::spawn(async move {
+                for index in 0..3u8 {
+                    let _ = player::motor_pwm(&writer, index, 0.).await;
+                }
+            });
+        }
+    }
+}
 async fn session(socket: WebSocket, app: App) {
     let id = app.ids.fetch_add(1, Ordering::Relaxed);
     let _guard = DriverGuard {
         id,
         safety: app.safety.clone(),
+    };
+    let _motors_guard = MotorsGuard {
+        id,
+        motors: app.motors.clone(),
+        writer: app.player.clone(),
+        states: app.states.clone(),
     };
     let (mut output, mut input) = socket.split();
     let mut state = app.state;
@@ -228,6 +303,51 @@ async fn session(socket: WebSocket, app: App) {
                                 c.w,
                                 std::time::Instant::now(),
                             );
+                        }
+                    } else if let Ok(m) = serde_json::from_str::<MotorsCommand>(&text) {
+                        let duties = (m.fan, m.main, m.side);
+                        if duties.0.map(|v| v.is_finite()).unwrap_or(true)
+                            && duties.1.map(|v| v.is_finite()).unwrap_or(true)
+                            && duties.2.map(|v| v.is_finite()).unwrap_or(true)
+                        {
+                            let updates: [(u8, f64); 3] = [
+                                (0, duties.0.unwrap_or(0.)),
+                                (1, duties.1.unwrap_or(0.)),
+                                (2, duties.2.unwrap_or(0.)),
+                            ];
+                            let writer = app.player.clone();
+                            let allowed = {
+                                let mut motors = app.motors.lock().unwrap();
+                                if motors.owner.is_none() || motors.owner == Some(id) {
+                                    motors.owner = Some(id);
+                                    motors.fan = updates[0].1;
+                                    motors.main = updates[1].1;
+                                    motors.side = updates[2].1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if allowed {
+                                app.states.send_modify(|state| {
+                                    state["motors"] = json!({
+                                        "fan": player_bridge::motor_pwm_clamp(updates[0].1),
+                                        "main": player_bridge::motor_pwm_clamp(updates[1].1),
+                                        "side": player_bridge::motor_pwm_clamp(updates[2].1),
+                                    });
+                                });
+                                for (index, duty) in updates {
+                                    if let Err(e) = player::motor_pwm(
+                                        &writer,
+                                        index,
+                                        player_bridge::motor_pwm_clamp(duty),
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("robot-server: motor command failed: {e}");
+                                    }
+                                }
+                            }
                         }
                     } else if serde_json::from_str::<ResetCommand>(&text).is_ok() {
                         if let Some(r) = &app.recording {
@@ -361,6 +481,7 @@ async fn run_session(
     let safety = Arc::new(Mutex::new(Safety::new()));
     let mut initial = telemetry::Telemetry::new().json();
     initial["blocked"] = json!(false);
+    initial["motors"] = json!({"fan": 0.0, "main": 0.0, "side": 0.0});
     let (states, state) = watch::channel(initial);
     let (scans, scan) = watch::channel(None);
     let _recording_tasks = recording.as_ref().map(|r| {
@@ -439,6 +560,7 @@ async fn run_session(
     } else {
         (None, None)
     };
+    let motors = Arc::new(Mutex::new(Motors::default()));
     let app = App {
         safety,
         state,
@@ -448,6 +570,8 @@ async fn run_session(
         vision,
         ids: Arc::new(AtomicU64::new(1)),
         recording,
+        motors,
+        player: writer.clone(),
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
         Ok(l) => l,
@@ -504,6 +628,13 @@ async fn run_session(
         player::velocity(&mut writer, 0., 0.),
     )
     .await;
+    for index in 0..3u8 {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            player::motor_pwm(&writer, index, 0.),
+        )
+        .await;
+    }
     result
 }
 #[tokio::main]
