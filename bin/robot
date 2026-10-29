@@ -13,7 +13,7 @@
 #        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
 #        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
 #        robot mask restore
-#        robot run [--port N] [--listen HOST] [--no-slam] [--no-yolo]  # MRPT + YOLO by default
+#        robot run [--port N] [--listen HOST] [--no-slam] [--no-yolo] [--record-dir NEW_DIR]
 #                  [--slam-adapter EXE] [--yolo-adapter EXE] [--supervisor HOST:PORT]
 #        robot panel [--port N] [--listen HOST]  # alias for run (hands over controller)
 #        robot bridge [--port N] [--listen HOST] # alias for run
@@ -507,9 +507,12 @@ case $cmd in
         if [[ $cmd == serve ]]; then slam_adapter=; yolo_adapter=; fi
         while (( $# )); do
             case $1 in
-                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter|--yolo-adapter|--supervisor)
+                --port|--listen|--heartbeat-port|--timeout-ms|--slam-adapter|--yolo-adapter|--supervisor|--record-dir)
                     (( $# >= 2 )) || fail "missing value for $1"
                     case $1 in
+                        --record-dir)
+                            [[ -n $2 ]] || fail '--record-dir requires a new directory'
+                            export ROBOT_SESSION_RECORD_DIR=$2 ;;
                         --port) port=$2 ;;
                         --listen) listen=$2 ;;
                         --heartbeat-port) heartbeat_port=$2 ;;
@@ -528,9 +531,12 @@ case $cmd in
                     shift 2 ;;
                 --no-slam) slam_adapter=; shift ;;
                 --no-yolo) yolo_adapter=; shift ;;
-                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE|--no-slam] [--yolo-adapter EXE|--no-yolo]' ;;
+                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE|--no-slam] [--yolo-adapter EXE|--no-yolo] [--record-dir NEW_DIR]' ;;
             esac
         done
+        if [[ -n ${ROBOT_SESSION_RECORD_DIR:-} ]]; then
+            [[ ! -e $ROBOT_SESSION_RECORD_DIR && ! -L $ROBOT_SESSION_RECORD_DIR ]] || fail 'session recording requires a new directory'
+        fi
         for number in "$port" "$heartbeat_port"; do
             if [[ ! $number =~ ^[0-9]{1,5}$ ]] || (( 10#$number < 1 || 10#$number > 65535 )); then
                 fail 'port must be an integer in 1..65535'

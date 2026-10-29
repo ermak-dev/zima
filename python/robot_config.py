@@ -23,7 +23,7 @@ def defaults(root):
                        'token': '', 'listen': '0.0.0.0',
                        'binary': str(root / 'crates/target/armv7-unknown-linux-gnueabihf/release/robot-supervisor')},
         'run': {'slam_adapter': str(root / 'tools/mrpt-adapter/adapter'),
-                'yolo_adapter': str(root / 'tools/yolo/adapter')},
+                'yolo_adapter': str(root / 'tools/yolo/adapter'), 'record_dir': ''},
         'camera': {'netrc': str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'robot/camera.netrc'),
                    'snapshot_url': 'http://cam/image.jpg', 'mjpeg_url': 'http://cam/mjpeg',
                    'audio_url': 'http://cam/audio.opus'},
@@ -53,6 +53,7 @@ ENV = {
     'ROBOT_SUPERVISOR_BIN': ('supervisor', 'binary'),
     'ROBOT_SUPERVISOR_LISTEN': ('supervisor', 'listen'),
     'ROBOT_SLAM_ADAPTER': ('run', 'slam_adapter'), 'ROBOT_YOLO_ADAPTER': ('run', 'yolo_adapter'),
+    'ROBOT_SESSION_RECORD_DIR': ('run', 'record_dir'),
     'ROBOT_CAMERA_NETRC': ('camera', 'netrc'), 'ROBOT_CAMERA_URL': ('camera', 'mjpeg_url'),
     'ROBOT_CAMERA_SNAPSHOT_URL': ('camera', 'snapshot_url'),
     'ROBOT_CAMERA_AUDIO_URL': ('camera', 'audio_url'),
@@ -69,7 +70,7 @@ ENV = {
                    'max_uncompensated_rotation_deg', 'record_path')},
 }
 PATHS = {('supervisor', 'binary'), ('run', 'slam_adapter'), ('run', 'yolo_adapter'),
-         ('camera', 'netrc'), ('audio', 'profile'), ('slam', 'record_path')}
+         ('camera', 'netrc'), ('audio', 'profile'), ('slam', 'record_path'), ('run', 'record_dir')}
 
 
 def validate(config, schema):

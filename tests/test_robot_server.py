@@ -109,6 +109,35 @@ exit 0
     # IMPLEMENTATION: repository-relative default with environment and CLI overrides.
     # RESULT: IMPLEMENTED — defaults, overrides and preflight verified with fakes.
     # STATUS: DONE
+    # FEATURE: --record-dir passes a single session directory without changing run lifecycle.
+    # SPEC: CLI overrides environment; missing/empty values fail before any handoff.
+    def test_record_directory_flag_overrides_environment(self):
+        self.executable('server', '#!/bin/sh\nprintf "recording=%s\\n" "$ROBOT_SESSION_RECORD_DIR" >> "$ROBOT_TEST_LOG"\n')
+        destination = str(self.directory/'new recording')
+        result = self.run_cli('run', '--record-dir', destination, ROBOT_SESSION_RECORD_DIR='env-recording')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('recording='+destination, self.log.read_text())
+        self.assertEqual(self.state.read_text().strip(), 'enabled')
+
+    def test_invalid_record_directory_flag_fails_before_handoff(self):
+        for args in [('run','--record-dir'), ('run','--record-dir','')]:
+            with self.subTest(args=args):
+                self.log.write_text('')
+                result = self.run_cli(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.log.read_text(), '')
+
+    def test_existing_session_record_target_fails_before_handoff(self):
+        dangling = self.directory/'dangling-recording'
+        dangling.symlink_to(self.directory/'absent-target')
+        for target in (self.directory, self.log, dangling):
+            with self.subTest(target=target):
+                self.log.write_text('')
+                result = self.run_cli('run', '--record-dir', str(target))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.log.read_text(), '')
+                self.assertEqual(self.state.read_text().strip(), 'enabled')
+
     def test_slam_enabled_by_default(self):
         result = self.run_cli('run')
         self.assertEqual(result.returncode, 0, result.stderr)

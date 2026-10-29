@@ -21,6 +21,8 @@ token = ""
 [run]
 slam_adapter = "../tools/mrpt-adapter/adapter"
 yolo_adapter = "../tools/yolo/adapter"
+# Unified session bundle; empty disables. Choose a new directory for each run.
+record_dir = ""
 
 [camera]
 netrc = "~/.config/robot/camera.netrc"

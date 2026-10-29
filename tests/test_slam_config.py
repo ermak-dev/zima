@@ -84,6 +84,21 @@ class SlamConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 self.load('[slam]\nrecord_path='+value+'\n')
 
+    # FEATURE: unified session recording shares run configuration and explicit env override.
+    # SPEC: off by default, TOML-relative directory, string/control-character validation.
+    def test_session_record_directory_is_opt_in_and_private_config_relative(self):
+        config = self.load()
+        self.assertIn('record_dir', config['run'])
+        self.assertEqual(config['run']['record_dir'], '')
+        config = self.load('[run]\nrecord_dir="runs/new-run"\n')
+        self.assertEqual(config['run']['record_dir'], str(self.root/'runs/new-run'))
+        self.assertEqual(export_env(config, environ={})['ROBOT_SESSION_RECORD_DIR'], str(self.root/'runs/new-run'))
+        config = self.load('[run]\nrecord_dir="runs/new-run"\n', {'ROBOT_SESSION_RECORD_DIR':'explicit-run'})
+        self.assertEqual(config['run']['record_dir'], 'explicit-run')
+        for value in ('false', '12', '"bad\\npath"'):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                self.load('[run]\nrecord_dir='+value+'\n')
+
     def test_enabled_deskew_requires_both_explicit_time_verifications(self):
         for text in ('deskew_enabled=true', 'deskew_enabled=true\nsource_time_verified=true',
                      'deskew_enabled=true\nbeam_time_verified=true'):
