@@ -314,11 +314,12 @@ elif sys.argv[-2:] == ['bash', '-s']:
         self.assertNotIn('pkill', script)
         self.assertNotIn('synthetic-supervisor-token', self.ssh_log.read_text())
 
-    def test_real_probe_accepts_idle_but_refuses_active_without_side_effects(self):
+    # SPEC: PONG IDLE alone cannot identify the expected supervisor ELF.
+    def test_real_probe_refuses_unidentified_idle_or_active_listener_without_side_effects(self):
         self.env['ROBOT_SUPERVISOR_TOKEN'] = 'synthetic-probe-token'
         self.child(self.run_cli('run', '--no-slam', '--no-yolo'))
         template = Path(self.env['TEST_SCRIPT']).read_text()
-        for reply, expected in ((b'PONG IDLE\n', 0), (b'PONG ACTIVE\n', 2), (b'INVALID\n', 4)):
+        for reply, expected in ((b'PONG IDLE\n', 4), (b'PONG ACTIVE\n', 2), (b'INVALID\n', 4)):
             with self.subTest(reply=reply):
                 requests = []
                 with socket.socket() as listener:

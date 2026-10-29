@@ -57,6 +57,14 @@ if [[ "$*" == 'robot bash -s' ]]; then
             [[ ${SUPERVISOR_ACTIVE:-0} == 0 && ${SUPERVISOR_BUSY:-0} == 0 ]] || { echo 'refusing to use busy or unavailable supervisor' >&2; exit 2; }
             [[ ${SUPERVISOR_FOREIGN:-0} == 0 ]] || exit 4
             if [[ $script == *mode=check* && ${SUPERVISOR_MISSING:-0} == 1 ]]; then exit 3; fi
+            if [[ $script == *mode=check* && ${SUPERVISOR_OUTDATED:-0} == 1 ]]; then exit 5; fi
+            if [[ $script == *mode=update* ]]; then
+                echo supervisor-update >> "$ROBOT_TEST_LOG"
+                [[ ${BUSY_ON_UPDATE:-0} == 0 ]] || exit 2
+                [[ ${FAIL_SUPERVISOR_UPDATE:-0} == 0 ]] || exit 1
+                echo supervisor-stop >> "$ROBOT_TEST_LOG"
+                echo supervisor-promote >> "$ROBOT_TEST_LOG"
+            fi
             if [[ $script == *mode=auto* || $script == *mode=start* ]]; then
                 echo supervisor-start >> "$ROBOT_TEST_LOG"
                 [[ ${FAIL_SUPERVISOR_START:-0} == 0 ]] || exit 1
@@ -297,13 +305,52 @@ exit 0
                 self.assertTrue(any(line.startswith('server:') for line in lines))
                 self.assertEqual(self.state.read_text().strip(), 'enabled')
 
-    def test_run_reuses_idle_supervisor_without_upload_or_local_binary(self):
+    # FEATURE: update a changed supervisor before robot run hands over the controller.
+    # SPEC: compare the running ELF, stage before stopping, and never replace an active owner.
+    # IMPLEMENTATION: update runs before controller handoff and requires the selected local ELF.
+    # RESULT: IMPLEMENTED — reuse, bootstrap, staged updates and failures verified with fakes.
+    # STATUS: DONE
+    def test_run_updates_outdated_supervisor_before_handoff(self):
+        for command in ('run', 'panel', 'bridge'):
+            with self.subTest(command=command):
+                self.log.write_text('')
+                result = self.run_cli(command, SUPERVISOR_OUTDATED='1')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = self.log.read_text().splitlines()
+                for first, second in zip(
+                        ('upload', 'supervisor-stop', 'supervisor-promote', 'supervisor-start'),
+                        ('supervisor-stop', 'supervisor-promote', 'supervisor-start', 'disable')):
+                    self.assertLess(lines.index(first), lines.index(second))
+                self.assertEqual(self.state.read_text().strip(), 'enabled')
+
+    def test_run_requires_local_supervisor_even_if_remote_is_idle(self):
         result = self.run_cli('run', ROBOT_SUPERVISOR_BIN=str(self.directory / 'missing'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('disable', self.log.read_text().splitlines())
+        self.assertNotIn('upload', self.log.read_text().splitlines())
+
+    def test_run_reuses_unchanged_idle_supervisor_without_upload(self):
+        result = self.run_cli('run')
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = self.log.read_text().splitlines()
         self.assertLess(lines.index('supervisor'), lines.index('disable'))
         self.assertNotIn('supervisor-start', lines)
         self.assertNotIn('upload', lines[:lines.index('disable')])
+
+    def test_update_failures_and_busy_race_never_handoff_controller(self):
+        for override in ({'FAIL_UPLOAD': '1'}, {'BUSY_ON_UPDATE': '1'},
+                         {'FAIL_SUPERVISOR_UPDATE': '1'}, {'FAIL_SUPERVISOR_START': '1'}):
+            with self.subTest(override=override):
+                self.log.write_text('')
+                result = self.run_cli('run', SUPERVISOR_OUTDATED='1', **override)
+                self.assertNotEqual(result.returncode, 0)
+                lines = self.log.read_text().splitlines()
+                self.assertNotIn('disable', lines)
+                self.assertNotIn('enable', lines)
+                self.assertFalse(any(line.startswith('server:') for line in lines))
+                if 'FAIL_UPLOAD' in override or 'BUSY_ON_UPDATE' in override:
+                    self.assertNotIn('supervisor-stop', lines)
+                self.assertEqual(self.state.read_text().strip(), 'enabled')
 
     def test_failed_bootstrap_never_changes_controller(self):
         for override in ({'FAIL_UPLOAD':'1'}, {'FAIL_SUPERVISOR_START':'1'},

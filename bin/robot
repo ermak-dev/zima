@@ -220,31 +220,127 @@ mask_owner_remote() {
 }
 
 supervisor_request() {
-    local port=$1 timeout_ms=$2 mode=$3
-    # %q assignments travel over SSH stdin. Neither token nor any derived
-    # credential is placed in SSH argv, logs, or a remote shell command string.
+    local port=$1 timeout_ms=$2 mode=$3 expected_sha=$4
+    # Credentials travel only over SSH stdin, never argv or logs.
     {
-        printf 'port=%q\ntimeout_ms=%q\nmode=%q\nlisten=%q\n' "$port" "$timeout_ms" "$mode" "${ROBOT_SUPERVISOR_LISTEN:-0.0.0.0}"
+        printf 'port=%q\ntimeout_ms=%q\nmode=%q\nlisten=%q\nexpected_sha=%q\n' "$port" "$timeout_ms" "$mode" "${ROBOT_SUPERVISOR_LISTEN:-0.0.0.0}" "$expected_sha"
         printf 'export ROBOT_SUPERVISOR_TOKEN=%q\n' "${ROBOT_SUPERVISOR_TOKEN:-}"
         cat <<'REMOTE'
 set -euo pipefail
 # ROBOT_SUPERVISOR_START
-probe() {
-    # A separate bounded subshell avoids leaving a blocked socket on failures.
+remote=/tmp/mask-owner/robot-supervisor
+[[ $expected_sha =~ ^[0-9a-f]{64}$ ]] || exit 4
+request() {
     (
         exec 3<>"/dev/tcp/127.0.0.1/$port" || exit 3
         printf 'AUTH %s\n' "$ROBOT_SUPERVISOR_TOKEN" >&3 || exit 4
         IFS= read -r -t 3 reply <&3 || exit 4
         [[ $reply == AUTHENTICATED ]] || exit 4
-        printf 'PING\n' >&3 || exit 4
+        printf '%s\n' "$1" >&3 || exit 4
         IFS= read -r -t 3 reply <&3 || exit 4
-        case $reply in
-            'PONG IDLE') exit 0 ;;
-            'PONG ACTIVE') exit 2 ;;
-            *) exit 4 ;;
-        esac
+        printf '%s\n' "$reply"
     ) 2>/dev/null
 }
+listener_pid() {
+    local hex inodes executable target candidate='' pid descriptor socket inode
+    local tables=(/proc/net/tcp)
+    [[ ! -r /proc/net/tcp6 ]] || tables+=(/proc/net/tcp6)
+    hex=$(printf '%04X' "$port")
+    inodes=$(awk -v p="$hex" '$4=="0A" && ($2=="0100007F:"p || $2=="00000000:"p || $2=="00000000000000000000000000000000:"p) {print $10}' "${tables[@]}") || return 4
+    [[ -n $inodes ]] || return 4
+    for executable in /proc/[0-9]*/exe; do
+        target=$(readlink "$executable" 2>/dev/null) || continue
+        [[ $target == "$remote" || $target == "$remote (deleted)" ]] || continue
+        pid=${executable%/exe}; pid=${pid##*/}
+        for descriptor in /proc/"$pid"/fd/*; do
+            socket=$(readlink "$descriptor" 2>/dev/null) || continue
+            for inode in $inodes; do
+                if [[ $socket == "socket:[$inode]" ]]; then
+                    [[ -z $candidate || $candidate == "$pid" ]] || return 4
+                    candidate=$pid
+                fi
+            done
+        done
+    done
+    [[ -n $candidate ]] || return 4
+    printf '%s\n' "$candidate"
+}
+probe() {
+    local reply
+    reply=$(request PING) || return "$?"
+    case $reply in
+        'PONG ACTIVE') return 2 ;;
+        'PONG IDLE') ;;
+        *) return 4 ;;
+    esac
+    daemon_pid=$(listener_pid) || return 4
+    daemon_sha=$(sha256sum "/proc/$daemon_pid/exe" | cut -d' ' -f1) || return 4
+    [[ $daemon_sha != "$expected_sha" ]] || return 0
+    return 5
+}
+legacy_shutdown() {
+    local fd extra reply status started=$SECONDS previous='' arg activate_ms=10000
+    local held=()
+    while IFS= read -r -d '' arg; do
+        if [[ $previous == --activate-timeout-ms ]]; then activate_ms=$arg; fi
+        previous=$arg
+    done < "/proc/$daemon_pid/cmdline"
+    [[ $activate_ms =~ ^[0-9]+$ && ${#activate_ms} -le 9 ]] || return 4
+    (( 10#$activate_ms >= 10000 )) || return 4
+    # Legacy listeners have 32 lifetime client slots. Holding all of them after
+    # AUTH proves there is no owner, rollback or audio handler, and prevents a
+    # new ACTIVATE racing the stop. Never rely on a previous PONG IDLE alone.
+    for _ in {1..32}; do
+        (( SECONDS - started < 3 )) || return 2
+        exec {fd}<>"/dev/tcp/127.0.0.1/$port" || return 2
+        held+=("$fd")
+        printf 'AUTH %s\n' "$ROBOT_SUPERVISOR_TOKEN" >&"$fd" || return 2
+        IFS= read -r -t 1 reply <&"$fd" || return 2
+        [[ $reply == AUTHENTICATED ]] || return 4
+    done
+    # Refuse unknown generations with more slots instead of assuming the gate
+    # is closed. Capacity rejection must be EOF, not a silent accepted socket.
+    exec {extra}<>"/dev/tcp/127.0.0.1/$port" || return 4
+    if IFS= read -r -n 1 -t 1 reply <&"$extra"; then return 4; else status=$?; fi
+    exec {extra}<&-
+    [[ $status == 1 ]] || return 4
+    (( SECONDS - started < 3 )) || return 2
+    [[ $(listener_pid) == "$daemon_pid" ]] || return 4
+    [[ $(sha256sum "/proc/$daemon_pid/exe" | cut -d' ' -f1) == "$daemon_sha" ]] || return 4
+    (( SECONDS - started < 3 )) || return 2
+    kill -TERM "$daemon_pid"
+}
+if [[ $mode == update ]]; then
+    lock=/tmp/mask-owner/update.lock
+    mkdir "$lock" 2>/dev/null || { echo 'robot: supervisor update already locked' >&2; exit 2; }
+    trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+    if probe; then exit 0; else status=$?; fi
+    [[ $status == 5 ]] || exit "$status"
+    stage="$remote.$expected_sha.next"
+    [[ -f $stage && ! -L $stage && -x $stage ]] || exit 4
+    [[ $(sha256sum "$stage" | cut -d' ' -f1) == "$expected_sha" ]] || exit 4
+    reply=$(request SHUTDOWN) || exit "$?"
+    case $reply in
+        STOPPING) ;;
+        BUSY) echo 'robot: supervisor is busy; update refused' >&2; exit 2 ;;
+        REFUSED) legacy_shutdown || exit "$?" ;;
+        *) exit 4 ;;
+    esac
+    for _ in {1..30}; do
+        [[ -e /proc/$daemon_pid/exe ]] || break
+        sleep 0.1
+    done
+    [[ ! -e /proc/$daemon_pid/exe ]] || { echo 'robot: supervisor did not stop; update aborted' >&2; exit 2; }
+    for executable in /proc/[0-9]*/exe; do
+        if test "$executable" -ef "$remote"; then
+            echo 'robot: supervisor executable is still in use; update aborted' >&2
+            exit 2
+        fi
+    done
+    [[ $(sha256sum "$stage" | cut -d' ' -f1) == "$expected_sha" ]] || exit 4
+    mv -f -- "$stage" "$remote"
+    exit 0
+fi
 if probe; then
     exit 0
 else
@@ -257,10 +353,9 @@ else
     fi
     [[ $status == 3 ]] || exit "$status"
 fi
-# Never kill or replace a daemon holding the port. Bind failure is authoritative.
 nohup /tmp/mask-owner/robot-supervisor listen --listen "$listen" --heartbeat-port "$port" --timeout-ms "$timeout_ms" >> /tmp/robot-supervisor.log 2>&1 < /dev/null &
 pid=$!
-for attempt in {1..30}; do
+for _ in {1..30}; do
     kill -0 "$pid" 2>/dev/null || { echo 'robot: supervisor failed to start' >&2; exit 1; }
     if probe; then
         exit 0
@@ -281,7 +376,11 @@ REMOTE
 
 supervisor_start() {
     local port=${1:-7665} timeout_ms=${2:-5000} mode=${3:-auto} status
-    if supervisor_request "$port" "$timeout_ms" check; then
+    local repo binary=${ROBOT_SUPERVISOR_BIN:-} sha
+    repo=$(repo_root)
+    [[ -f $binary && -x $binary ]] || fail 'robot-supervisor binary is missing; build: tools/build-supervisor.sh'
+    sha=$(sha256sum "$binary" | cut -d' ' -f1)
+    if supervisor_request "$port" "$timeout_ms" check "$sha"; then
         return
     else
         status=$?
@@ -290,13 +389,18 @@ supervisor_start() {
         [[ $mode == start ]] && return
         fail 'supervisor has an active session; controller was not changed'
     fi
-    [[ $status == 3 ]] || fail 'cannot authenticate supervisor; controller was not changed'
-    local repo binary=${ROBOT_SUPERVISOR_BIN:-}
-    repo=$(repo_root)
-    [[ -x $binary ]] || fail 'robot-supervisor binary is missing; build: tools/build-supervisor.sh'
-    deploy_file "$binary" /tmp/mask-owner/robot-supervisor
-    deploy_file "$repo/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh
-    supervisor_request "$port" "$timeout_ms" "$mode" \
+    case $status in
+        3)
+            deploy_file "$binary" /tmp/mask-owner/robot-supervisor
+            deploy_file "$repo/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh ;;
+        5)
+            printf '%s\n' 'robot: updating idle supervisor' >&2
+            deploy_file "$binary" "/tmp/mask-owner/robot-supervisor.$sha.next"
+            supervisor_request "$port" "$timeout_ms" update "$sha" \
+                || fail 'cannot update idle supervisor; controller was not changed' ;;
+        *) fail 'cannot authenticate or identify supervisor; controller was not changed' ;;
+    esac
+    supervisor_request "$port" "$timeout_ms" "$mode" "$sha" \
         || fail 'cannot start authenticated supervisor; controller was not changed'
 }
 
