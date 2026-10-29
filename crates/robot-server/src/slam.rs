@@ -256,8 +256,8 @@ pub struct Observation {
 }
 
 impl Observation {
-    /// Convert a raw Player scan (bearings relative to the LDS zero) into
-    /// base_link bearings by adding the LDS mounting yaw.
+    /// Preserve vendor body-aligned bearings and normalize their angular range.
+    /// Ranges still originate at the LDS, not the center of base_link.
     pub fn from_scan(s: &player_bridge::LaserScanAngle, odom: Option<(f64, f64, f64)>) -> Self {
         let offset = player_bridge::scan::LDS_YAW_DEG.to_radians() as f32;
         // Normalize to [-pi, pi): the adapter bins beams into fixed angular
@@ -853,7 +853,7 @@ impl<T: Backend> SlamCore<T> {
 mod tests {
     use super::*;
     // FEATURE: update request carries exact LDS geometry to the adapter.
-    // SPEC: bearings are base_link (mount yaw added, wrapped to [-pi,pi));
+    // SPEC: vendor bearings are already body-aligned and wrapped to [-pi,pi);
     // beams inside the body (< LDS_RANGE_MIN) or invalid are dropped; the
     // LDS lever arm is sent so the adapter can place the ray origin.
     // IMPLEMENTATION: Observation::from_scan + to_update_request.
@@ -864,7 +864,7 @@ mod tests {
         let scan = player_bridge::LaserScanAngle {
             max_range: 6.0,
             ranges: vec![0.1, 1.0, f32::NAN, 7.0, 2.0],
-            angles: vec![0.0, 0.0, 0.5, 1.0, 3.0],
+            angles: vec![0.0, 0.0, 0.5, 1.0, 7.0],
             intensities: vec![],
             id: 0,
         };
@@ -875,9 +875,9 @@ mod tests {
         assert_eq!(v["scan"]["ranges"][0], 1.0);
         assert_eq!(v["sensor_x"], -0.1);
         let a0 = v["scan"]["angles"][0].as_f64().unwrap();
-        assert!((a0 - 97.6f64.to_radians()).abs() < 1e-3);
+        assert!(a0.abs() < 1e-3, "vendor yaw must not be applied twice");
         let a1 = v["scan"]["angles"][1].as_f64().unwrap();
-        let expected = 3.0 + 97.6f64.to_radians() - 2. * std::f64::consts::PI;
+        let expected = 7.0 - 2. * std::f64::consts::PI;
         assert!(
             (a1 - expected).abs() < 1e-3,
             "bearing must wrap into [-pi,pi)"

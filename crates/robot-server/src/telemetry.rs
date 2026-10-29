@@ -224,6 +224,38 @@ mod tests {
             payload,
         }
     }
+    // BUG: vendor SCANANGLE bearings already include the configured mounting yaw.
+    // SPEC: panel and SLAM preserve body-aligned bearings and apply only LDS translation.
+    // RESULT: FIXED — native bearings reach both consumers without duplicate yaw.
+    #[test]
+    fn native_scan_bearings_are_not_rotated_a_second_time() {
+        let mut payload = 6f32.to_be_bytes().to_vec();
+        for array in [
+            vec![1f32, 2.],
+            vec![0., std::f32::consts::FRAC_PI_2],
+            vec![],
+        ] {
+            payload.extend((array.len() as u32).to_be_bytes());
+            payload.extend((array.len() as u32).to_be_bytes());
+            for value in array {
+                payload.extend(value.to_be_bytes());
+            }
+        }
+        payload.extend(41u32.to_be_bytes());
+        let mut message = data(LASER_CODE, payload);
+        message.header.subtype = LASER_DATA_SCANANGLE;
+        let rendered = scan(&message).unwrap().unwrap();
+        let points = rendered["points"].as_array().unwrap();
+        assert!((points[0][0].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        assert!(points[0][1].as_f64().unwrap().abs() < 1e-6);
+        assert!((points[1][0].as_f64().unwrap() + 0.1).abs() < 1e-6);
+        assert!((points[1][1].as_f64().unwrap() - 2.).abs() < 1e-6);
+        let decoded = decode_laser_scanangle(&message.payload).unwrap();
+        let observation = crate::slam::Observation::from_scan(&decoded, None);
+        assert!(observation.angles[0].abs() < 1e-6);
+        assert!((observation.angles[1] - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
     // FEATURE: service-channel inventory without inferred units or motor commands.
     // SPEC: preserve raw arrays, null nonfinite values, and expose missing readings.
     // IMPLEMENTATION: optional IR/position3d channels live in sensors.service_channels.

@@ -834,7 +834,7 @@ async fn scan_and_raw_sensor_schema() {
     let points = scan["points"].as_array().unwrap();
     assert_eq!(points.len(), 2);
     for (i, (r, a)) in [(1f64, 0f64), (2., 0.7f32 as f64)].iter().enumerate() {
-        let angle = a + 97.6f64.to_radians();
+        let angle = *a;
         assert!((points[i][0].as_f64().unwrap() - (-0.1 + r * angle.cos())).abs() < 1e-5);
         assert!((points[i][1].as_f64().unwrap() - r * angle.sin()).abs() < 1e-5);
     }
@@ -1714,7 +1714,7 @@ async fn real_adapter_maps_synthetic_room() {
         }
     };
     let scan_room = |x: f64, y: f64, yaw: f64| {
-        let off = 97.6f64.to_radians();
+        let off = 0.0f64;
         let mut ang = Vec::new();
         let mut rng = Vec::new();
         let lx = x + player_bridge::scan::LDS_X * yaw.cos();
@@ -2072,6 +2072,194 @@ done
     assert_eq!(stale["scan_stamp"], 24.);
     cmd(&mut ws, r#"{"v":0.1,"w":0.0}"#).await;
     assert_eq!(s.command().await.1, 0.1);
+}
+
+// FEATURE: unified recording from local fake Player, camera, and inbound WS.
+// SPEC: no second Player, exact raw bytes, credential privacy, camera partial/unavailable,
+// snapshots/commands without a viewer dependency; refused directory precedes ACTIVATE.
+// IMPLEMENTATION: preflight and typed command hooks; independent recording source tasks.
+// RESULT: IMPLEMENTED — fake camera EOF/redirect/idle timeout/cancellation and Player pass.
+// STATUS: DONE
+#[tokio::test]
+async fn unified_session_records_fake_player_camera_and_commands() {
+    use axum::{
+        body::Body,
+        http::{header, HeaderMap},
+        response::Response,
+        routing::get,
+        Router,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    fn jpeg_response(h: HeaderMap, live: bool) -> Response {
+        assert_eq!(h[header::AUTHORIZATION], "Basic dXNlcjpzZWNyZXQ=");
+        let chunks = futures_util::stream::iter(
+            [
+                b"--frame\r\n\xff".to_vec(),
+                b"\xd8test\xff".to_vec(),
+                b"\xd9".to_vec(),
+            ]
+            .map(Ok::<_, std::io::Error>),
+        );
+        let tail = futures_util::stream::poll_fn(move |_| {
+            if live {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        });
+        Response::builder()
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/x-mixed-replace; boundary=frame",
+            )
+            .body(Body::from_stream(chunks.chain(tail)))
+            .unwrap()
+    }
+    let app = Router::new()
+        .route(
+            "/mjpeg",
+            get(|h: HeaderMap| async move { jpeg_response(h, false) }),
+        )
+        .route(
+            "/live",
+            get(|h: HeaderMap| async move { jpeg_response(h, true) }),
+        )
+        .route(
+            "/redirect",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(header::LOCATION, "/mjpeg")],
+                )
+            }),
+        );
+    let camera_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let netrc = std::env::temp_dir().join(format!("session-netrc-{}-{port}", std::process::id()));
+    std::fs::write(&netrc, "machine 127.0.0.1 login user password secret\n").unwrap();
+    std::fs::set_permissions(&netrc, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for route in ["mjpeg", "redirect", "live", "timeout"] {
+        let dir = std::env::temp_dir().join(format!(
+            "unified-session-{}-{port}-{route}",
+            std::process::id()
+        ));
+        let camera_route = if route == "timeout" { "live" } else { route };
+        let url = format!("http://127.0.0.1:{port}/{camera_route}");
+        let mut s = Session::start_env(
+            &["--camera-url", &url, "--netrc", netrc.to_str().unwrap()],
+            None,
+            true,
+            Duration::ZERO,
+            &[("ROBOT_SESSION_RECORD_DIR", dir.to_str().unwrap())],
+        )
+        .await;
+        let mut ws = s.ws().await;
+        cmd(&mut ws, r#"{"v":0.1,"w":0.2}"#).await;
+        assert_eq!(s.command().await.1, 0.1);
+        cmd(&mut ws, r#"{"type":"reset_blocked"}"#).await;
+        cmd(
+            &mut ws,
+            r#"{"token":"never-record-this","text":"private TTS"}"#,
+        )
+        .await;
+        s.send(packet(999, 7, 42, 1., &[0, 255, 128])).await;
+        s.send(scan_packet(24.)).await;
+        if route == "timeout" {
+            // Keep the independent fake Player healthy while only camera HTTP idles.
+            for _ in 0..53 {
+                s.send(packet(999, 7, 42, 1., &[0, 255, 128])).await;
+                sleep(Duration::from_millis(100)).await;
+            }
+        } else {
+            sleep(Duration::from_millis(350)).await;
+        }
+        assert!(Command::new("kill")
+            .args(["-TERM", &s.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        timeout(WAIT, async {
+            loop {
+                if let Some(status) = s.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let text =
+            std::fs::read_to_string(dir.join("events.jsonl")).expect("session events missing");
+        assert!(
+            !text.contains("never-record-this")
+                && !text.contains("private TTS")
+                && !text.contains("secret")
+        );
+        let events: Vec<Value> = text
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        for kind in ["state", "scan", "wheel_command", "reset_blocked"] {
+            assert!(
+                events.iter().any(|v| v["type"] == kind),
+                "missing {kind}: {text}"
+            );
+        }
+        let raw = std::fs::read_to_string(dir.join("player.jsonl")).unwrap();
+        assert!(raw.contains("AP+A"));
+        let report: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["raw_player"]["complete"], true);
+        assert_eq!(
+            report["camera"]["status"],
+            match route {
+                "live" => "recorded_until_cancel",
+                "redirect" => "unavailable",
+                _ => "partial",
+            }
+        );
+        assert_eq!(
+            report["camera"]["frames"],
+            if route == "redirect" { 0 } else { 1 }
+        );
+        assert_eq!(report["complete"], route == "live");
+        if route == "timeout" {
+            assert_eq!(report["camera"]["end_reason"], "timeout");
+        }
+        if route != "redirect" {
+            assert_eq!(
+                std::fs::read(dir.join("frame-00000000.jpg")).unwrap(),
+                b"\xff\xd8test\xff\xd9"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    camera_task.abort();
+    std::fs::remove_file(netrc).unwrap();
+}
+#[tokio::test]
+async fn unified_session_preflight_precedes_activation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = std::env::temp_dir().join(format!("session-refuse-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_robot-server"))
+        .env("ROBOT_SESSION_RECORD_DIR", &dir)
+        .env(
+            "ROBOT_SERVER_HEARTBEAT",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(timeout(Duration::from_millis(500), listener.accept())
+        .await
+        .is_err());
+    assert!(child.try_wait().unwrap().is_some_and(|s| !s.success()));
+    std::fs::remove_dir(dir).unwrap();
 }
 
 #[tokio::test]
