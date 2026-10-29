@@ -1,27 +1,31 @@
+import { compassYaw } from './useCompass.js'
+
 const degrees = (v) => {
   const result = typeof v === 'number' ? v * 180 / Math.PI : NaN
   return Number.isFinite(result) ? Number(result.toFixed(3)) : null
 }
 const angleText = (v) => v === null ? '—' : `${v.toFixed(1)}°`
 
-export function compassYaw(compass) {
-  if (!compass || compass.status === 'empty' || compass.status === 'invalid') return null
-  // Older server bundles did not distinguish the observed zero initialization frame.
-  if (compass.status == null && [compass.x, compass.y, compass.z, compass.yaw].every((v) => v === 0)) return null
-  return Number.isFinite(compass.yaw) ? compass.yaw : null
+const compassStatus = {
+  connecting: 'Подключение датчика',
+  stale: 'Нет свежих измерений',
+  disconnected: 'Нет связи с сервером',
+  unsupported: 'Обновите супервизор',
+  unavailable: 'Датчик недоступен',
+  invalid: 'Недостоверные измерения',
 }
 
 export default function OrientationInstruments({ compass, gyro }) {
   const yaw = degrees(compassYaw(compass))
   const gyroYaw = degrees(gyro?.pos?.[5])
   const heading = yaw === null ? null : (yaw % 360 + 360) % 360
-  const emptyCompass = compass && heading === null && (compass.status === 'empty' || [compass.x, compass.y, compass.z, compass.yaw].every((v) => v === 0))
+  const compassNote = heading !== null ? 'Без калибровки · оси датчика' : compassStatus[compass?.status] || 'Нет измерений ST480'
   return (
     <div className="orientation-instruments">
       <figure className="instrument">
         <h3>Компас</h3>
         <svg viewBox="0 0 120 120" role="img" aria-label="Компас" data-known={heading !== null}>
-          <title>{heading === null ? (emptyCompass ? 'Канал компаса возвращает нулевой кадр без измерения' : 'Нет данных компаса') : `Курс датчика ${heading.toFixed(1)}°, не калиброванный север`}</title>
+          <title>{heading === null ? compassNote : `Угол магнитного поля в осях датчика ${heading.toFixed(1)}°. Без калибровки; не курс робота и не север.`}</title>
           <circle className="instrument-ring" cx="60" cy="60" r="44" />
           {Array.from({ length: 24 }, (_, i) => <path key={i} className="instrument-tick" d={i % 6 ? 'M60 18v3' : 'M60 16v7'} transform={`rotate(${i * 15} 60 60)`} />)}
           <text x="60" y="12" textAnchor="middle">0°</text>
@@ -37,7 +41,7 @@ export default function OrientationInstruments({ compass, gyro }) {
         </svg>
         <figcaption>
           <b>{heading === null ? 'нет данных' : angleText(heading)}</b>
-          <small>{emptyCompass ? 'Канал передаёт нули' : 'Угол датчика, не север'}</small>
+          <small>{compassNote}</small>
         </figcaption>
       </figure>
       <figure className="instrument">

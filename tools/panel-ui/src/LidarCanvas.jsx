@@ -1,14 +1,15 @@
 import { useEffect, useRef } from 'react'
+import useSlamState from './useSlamState.js'
 
 // Decode the adapter's CSV occupancy string ("50,-1,0,...") into per-cell
 // occupancy percent; unknown cells (-1) become 255.
 export function parseGrid(cells, w, h) {
-  const out = new Uint8Array(w * h)
+  const out = new Uint8Array(w * h).fill(255)
   if (typeof cells !== 'string') return out
   const parts = cells.split(',')
   const n = Math.min(parts.length, w * h)
   for (let i = 0; i < n; i++) {
-    const v = Number(parts[i])
+    const v = parts[i].trim() === '' ? NaN : Number(parts[i])
     out[i] = Number.isFinite(v) && v >= 0 ? Math.min(100, Math.max(0, v)) : 255
   }
   return out
@@ -29,7 +30,8 @@ export function cellRGBA(occ) {
 // Canvas affine [a,b,c,d,e,f] taking grid image pixels (u right, v down,
 // row 0 = highest y) through the map frame into base_link (inverse SLAM
 // pose) and onto the screen used by `at()`.
-export function gridTransform(grid, pose, { W, H, k, ox, oy }) {
+export function gridTransform(grid, pose, { W, H, k, ox, oy }, frame = 'robot') {
+  if (frame === 'map') pose = { x: 0, y: 0, yaw: 0 }
   const c = Math.cos(pose.yaw), s = Math.sin(pose.yaw)
   const res = grid.res
   const X0 = grid.x_min - pose.x
@@ -42,6 +44,13 @@ export function gridTransform(grid, pose, { W, H, k, ox, oy }) {
     W / 2 - ox * k + k * (c * X0 + s * Y0),
     H / 2 + oy * k - k * (-s * X0 + c * Y0),
   ]
+}
+
+// SE(2) base_link -> map. Points remain discrete; missing angular sectors
+// never become lines, interpolated returns or free-space geometry.
+export function scanToMap(points, pose) {
+  const c = Math.cos(pose.yaw), s = Math.sin(pose.yaw)
+  return points.map(([x, y]) => [pose.x + c * x - s * y, pose.y + s * x + c * y])
 }
 
 // Rasterize the grid once per distinct payload; redraws only re-project it.
@@ -74,14 +83,16 @@ function gridImage(cache, m) {
 // The canvas is an imperative island: React never renders into it. The
 // backing buffer is sized only when the element resizes (not on every
 // frame), and redraws happen on data/interaction, not on a fixed timer.
-export default function LidarCanvas({ scan, view, onView, slam }) {
+export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
+  const localState = useSlamState(slamState ? null : slam, scan)
+  const freshness = slamState || localState
   const canvasRef = useRef(null)
   const stateRef = useRef({})
-  stateRef.current = { scan, view, onView, slam }
+  stateRef.current = { scan, view, onView, slam, freshness }
   const scheduleRef = useRef(null)
   const gridCacheRef = useRef({})
 
-  useEffect(() => { scheduleRef.current?.() }, [scan, view, slam])
+  useEffect(() => { scheduleRef.current?.() }, [scan, view, slam, freshness.aligned, freshness.matched])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -130,14 +141,14 @@ export default function LidarCanvas({ scan, view, onView, slam }) {
       ctx.font = '11px system-ui'
       ctx.fillText(`${step} м`, W - 44, H - 12)
 
-      // SLAM occupancy grid under the live scan. The view is robot-centred,
-      // so the map is projected through the inverse of the SLAM pose; without
-      // a pose there is no consistent place to draw it.
+      // A fixed map is useful even with a bad pose; a robot-frame map is an
+      // overlay and must not pretend to align with another scan or stale pose.
+      const world = v.frame === 'map'
       const map = s.slam?.map, pose = s.slam?.pose
-      if (map?.cells && pose && [pose.x, pose.y, pose.yaw].every(Number.isFinite)) {
+      if (map?.cells && (world || s.freshness.aligned)) {
         const image = gridImage(gridCacheRef.current, map)
         if (image) {
-          const [a, b, c, d, e, f] = gridTransform(map, pose, { W, H, k, ox, oy })
+          const [a, b, c, d, e, f] = gridTransform(map, pose, { W, H, k, ox, oy }, v.frame)
           ctx.save()
           ctx.setTransform(dpr * a, dpr * b, dpr * c, dpr * d, dpr * e, dpr * f)
           ctx.imageSmoothingEnabled = false
@@ -147,21 +158,22 @@ export default function LidarCanvas({ scan, view, onView, slam }) {
       }
 
       // Points already include the static lidar mount correction.
-      if (s.scan?.frame === 'base_link') {
+      if (s.scan?.frame === 'base_link' && (!world || s.freshness.matched)) {
         ctx.fillStyle = '#2a78d6'
-        for (const [x, y] of s.scan?.points || []) {
+        const points = s.scan?.points || []
+        for (const [x, y] of world ? scanToMap(points, pose) : points) {
           const [a, b] = at(x, y)
           ctx.beginPath()
           ctx.arc(a, b, 2, 0, 2 * Math.PI)
           ctx.fill()
         }
       }
-      {
-        const [x, y] = at(0, 0)
+      if (!world || s.freshness.matched) {
+        const [x, y] = world ? at(pose.x, pose.y) : at(0, 0)
         const radius = 0.1725 * k
         ctx.save()
         ctx.translate(x, y)
-        ctx.rotate(-Math.PI / 2)
+        ctx.rotate(-Math.PI / 2 - (world ? pose.yaw : 0))
         ctx.fillStyle = '#fff'
         ctx.strokeStyle = '#223446'
         ctx.lineWidth = 2
@@ -236,5 +248,5 @@ export default function LidarCanvas({ scan, view, onView, slam }) {
     }
   }, [])
 
-  return <canvas id="scan" ref={canvasRef} style={{ touchAction: 'none', cursor: 'grab', display: 'block', width: '100%', height: '100%' }} aria-label="Текущий скан лидара относительно робота. X вправо, Y вверх. Перетаскивание — сдвиг, колесо — масштаб." />
+  return <canvas id="scan" ref={canvasRef} style={{ touchAction: 'none', cursor: 'grab', display: 'block', width: '100%', height: '100%' }} aria-label={`${view.frame === 'map' ? 'Карта в фиксированном кадре map. Скан и робот только при совпадении с актуальной позой.' : 'Текущий скан лидара относительно робота.'} X вправо, Y вверх. Перетаскивание — сдвиг, колесо — масштаб.`} />
 }

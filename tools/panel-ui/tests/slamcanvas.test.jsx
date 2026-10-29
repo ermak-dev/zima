@@ -1,5 +1,39 @@
 import { describe, it, expect } from 'vitest'
-import { parseGrid, cellRGBA, gridTransform } from '../src/LidarCanvas.jsx'
+import { parseGrid, cellRGBA, gridTransform, scanToMap } from '../src/LidarCanvas.jsx'
+
+// FEATURE: Honest occupancy gaps and fixed-map diagnostic geometry.
+// SPEC: Empty/missing CSV cells stay unknown; map view is independent of pose;
+// only actual scan points are transformed through the matching SE(2) pose.
+// IMPLEMENTATION: unknown-filled grid decoding and explicit map-frame SE(2) projection.
+// RESULT: IMPLEMENTED — gaps stay unknown and existing inverse-pose geometry is preserved.
+// STATUS: DONE
+describe('diagnostic geometry', () => {
+  it('does not fabricate free space from empty tokens or truncated payloads', () => {
+    expect([...parseGrid('0,, ,100', 3, 2)]).toEqual([0, 255, 255, 100, 255, 255])
+    expect([...parseGrid(null, 2, 1)]).toEqual([255, 255])
+  })
+
+  it('keeps map image pixels fixed as the pose jumps in map frame', () => {
+    const grid = { x_min: -2, y_min: -3, res: 0.5, w: 4, h: 6 }
+    const view = { W: 200, H: 100, k: 10, ox: 1, oy: -1 }
+    const m = gridTransform(grid, { x: 9, y: 7, yaw: 1.7 }, view, 'map')
+    const n = gridTransform(grid, { x: -5, y: 2, yaw: -0.4 }, view, 'map')
+    expect(m).toEqual(n)
+    const [a, b, c, d, e, f] = m
+    expect([a * 0 + c * 6 + e, b * 0 + d * 6 + f]).toEqual([70, 70])
+  })
+
+  it('maps a gapped raw scan into world coordinates without connecting or filling gaps', () => {
+    const points = [[1, 0], [0, -2]]
+    const result = scanToMap(points, { x: 2, y: -1, yaw: Math.PI / 2 })
+    expect(result).toHaveLength(2)
+    expect(result[0][0]).toBeCloseTo(2)
+    expect(result[0][1]).toBeCloseTo(0)
+    expect(result[1][0]).toBeCloseTo(4)
+    expect(result[1][1]).toBeCloseTo(-1)
+    expect(points).toEqual([[1, 0], [0, -2]])
+  })
+})
 
 describe('parseGrid', () => {
   it('decodes probabilities and unknowns', () => {
@@ -9,7 +43,7 @@ describe('parseGrid', () => {
   it('clamps out-of-range values and tolerates short input', () => {
     const g = parseGrid('300,-5,abc', 3, 1)
     expect([...g]).toEqual([100, 255, 255])
-    expect([...parseGrid('', 1, 1)]).toEqual([0])
+    expect([...parseGrid('', 1, 1)]).toEqual([255])
   })
 })
 

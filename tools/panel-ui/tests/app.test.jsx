@@ -23,6 +23,11 @@ function mockSocket(onMessage) {
 
 import App from '../src/App.jsx'
 
+const rawCompass = (yaw) => ({
+  source: 'st480-evdev', status: 'uncalibrated', calibrated: false, stamp: 42,
+  x: Math.round(100 * Math.cos(yaw)), y: Math.round(100 * Math.sin(yaw)), z: 20, yaw,
+})
+
 afterEach(() => {
   cleanup()
   sockets.length = 0
@@ -140,9 +145,44 @@ describe('App lifecycle', () => {
     expect(document.getElementById('bumper-left').className).toBe('')
   })
 
+  // BUG: vendor yaw was treated as a measured course and could remain visible indefinitely.
+  // HYPOTHESIS: only fresh ST480 samples may drive the needle; raw-field angles are not north.
+  // SOLUTION: validate the source and expire unchanged sample stamps independently of other telemetry.
+  // RESULT: FIXED — vendor yaw rejected, raw angle rendered and stale sample hidden.
+  // STATUS: FIXED
+  it('rejects nonzero vendor compass yaw rather than displaying a fabricated heading', () => {
+    const { container } = render(<App />)
+    act(() => lastHandler({ type: 'state', data: { sensors: {
+      compass: { x: 600, y: 1, z: 2, yaw: 1.25, status: 'received' },
+    } } }))
+    expect(container.querySelector('[data-compass-needle]')).toBeNull()
+    expect(document.getElementById('compass').textContent).toBe('нет данных')
+  })
+
+  it('expires a raw compass sample even while unrelated state frames keep arriving', () => {
+    vi.useFakeTimers()
+    const { container, getByRole } = render(<App />)
+    const compass = { x: 0, y: 100, z: 20, yaw: Math.PI / 2, stamp: 42,
+      source: 'st480-evdev', status: 'uncalibrated', calibrated: false }
+    const publish = (sample = compass) => act(() => lastHandler({ type: 'state', data: { sensors: { compass: sample } } }))
+    publish()
+    expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(-90 60 60)')
+    expect(getByRole('img', { name: 'Компас' }).querySelector('title').textContent).toContain('осях датчика')
+    expect(container.querySelector('.orientation-instruments').textContent).toContain('Без калибровки')
+    act(() => vi.advanceTimersByTime(1000))
+    publish({ ...compass })
+    act(() => vi.advanceTimersByTime(600))
+    expect(container.querySelector('[data-compass-needle]')).toBeNull()
+    expect(document.getElementById('compass').textContent).toBe('нет данных')
+    expect(container.querySelector('.orientation-instruments').textContent).toContain('Нет свежих измерений')
+    publish({ ...compass, stamp: 43, yaw: 0, x: 100, y: 0 })
+    expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(0 60 60)')
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
   it('renders compass yaw and dock state from telemetry', () => {
     render(<App />)
-    act(() => lastHandler({ type: 'state', data: { sensors: { dock: true, compass: { x: 0, y: 0, z: 0, yaw: 1.256, stall: false } } } }))
+    act(() => lastHandler({ type: 'state', data: { sensors: { dock: true, compass: rawCompass(1.256) } } }))
     expect(document.getElementById('compass').textContent).toBe('1.256 рад · 72.0°')
     expect(document.getElementById('dock').textContent).toBe('На доке')
     expect(document.getElementById('dock').className).toBe('')
@@ -253,7 +293,7 @@ describe('App lifecycle', () => {
     expect(getByRole('img', { name: 'Гироскоп' }).dataset.known).toBe('false')
     expect(container.querySelector('[data-compass-needle]')).toBeNull()
     act(() => lastHandler({ type: 'state', data: { sensors: {
-      compass: { yaw: Math.PI / 2 },
+      compass: rawCompass(Math.PI / 2),
       service_channels: { 'position3d:0': { pos: [0, 0, 0, Math.PI / 6, Math.PI / 12, -Math.PI / 4], vel: [0, 0, 0, 0, 0, 0] } },
     } } }))
     expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
@@ -283,7 +323,7 @@ describe('App lifecycle', () => {
     expect(container.querySelector('[data-gyro-heading]').getAttribute('transform')).toBe('rotate(-90 60 60)')
     expect(container.querySelector('.attitude-horizon')).toBeNull()
     expect(getByRole('group', { name: 'Служебные каналы' }).textContent).not.toContain('Гироскоп')
-    act(() => lastHandler({ type: 'state', data: { sensors: { compass: { x: 1, y: 0, z: 0, yaw: 0, status: 'received' } } } }))
+    act(() => lastHandler({ type: 'state', data: { sensors: { compass: rawCompass(0) } } }))
     expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
     expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(0 60 60)')
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
@@ -361,6 +401,26 @@ describe('App lifecycle', () => {
     expect(container.textContent).not.toMatch(/ROS|SLAM|TF|Ожидание карты|Свободно|Стены|Неизвестно/)
     expect(document.getElementById('frame-label').textContent).toBe('base_link')
     expect(container.querySelector('#map-fit, #map-scan, #map-message')).toBeNull()
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
+  // FEATURE: Fixed-map diagnostic view is local-only and preserves manual controls.
+  // SPEC: frame toggle resets pan; centering keeps the selected frame; no robot commands.
+  // IMPLEMENTATION: local view-frame toggle, preserving manual control and instrument components.
+  // RESULT: IMPLEMENTED — toggle test red before implementation; existing control suite stays green.
+  // STATUS: DONE
+  it('toggles map diagnostics locally without replacing branding or instruments', () => {
+    const { getByRole } = render(<App />)
+    const frame = getByRole('button', { name: 'Кадр карты' })
+    act(() => frame.click())
+    expect(frame.getAttribute('aria-pressed')).toBe('true')
+    expect(document.getElementById('frame-label').textContent).toBe('map')
+    act(() => document.getElementById('lidar-center').click())
+    expect(document.getElementById('frame-label').textContent).toBe('map')
+    expect(getByRole('img', { name: 'Логотип Zima' })).toBeTruthy()
+    expect(getByRole('img', { name: 'Положение одометрии' })).toBeTruthy()
+    act(() => frame.click())
+    expect(document.getElementById('frame-label').textContent).toBe('base_link')
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
 

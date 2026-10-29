@@ -6,8 +6,10 @@ import VisionFrame from './VisionFrame.jsx'
 import useTeleop, { LIMITS as HARD_LIMITS, DEFAULT_LINEAR_SPEED, DEFAULT_ANGULAR_SPEED } from './useTeleop.js'
 import LidarCanvas from './LidarCanvas.jsx'
 import SlamStatus from './SlamStatus.jsx'
+import useSlamState from './useSlamState.js'
 import ServiceChannels from './ServiceChannels.jsx'
-import OrientationInstruments, { compassYaw } from './OrientationInstruments.jsx'
+import OrientationInstruments from './OrientationInstruments.jsx'
+import useCompass, { compassYaw } from './useCompass.js'
 import OdometryInstruments from './OdometryInstruments.jsx'
 import SpeechPanel from './SpeechPanel.jsx'
 import zimaLogo from './assets/zima-logo.png?inline'
@@ -39,7 +41,9 @@ function SensorRow({ id, name, value }) {
 export default function App() {
   const [state, setState] = useState({})
   const [scan, setScan] = useState({})
-  const [view, setView] = useState({ radius: 3, center: null })
+  // Keep result age above collapsible panels: reopening a canvas is not a new result.
+  const slamState = useSlamState(state.slam, scan)
+  const [view, setView] = useState({ radius: 3, center: null, frame: 'robot' })
   const [collapsed, setCollapsed] = useState({ lidar: false, camera: false, sensors: false })
   const [expanded, setExpanded] = useState(null)
   const [visionEnabled, setVisionEnabled] = useState(false)
@@ -84,10 +88,11 @@ export default function App() {
     ? `YOLO · ${visionStatus}${camStatus === 'live' && Number.isFinite(vision.frame?.inference_ms) ? ` · ${Math.round(vision.frame.inference_ms)} мс` : ''}`
     : camStatus === 'live' ? 'Прямой поток' : camStatus === 'off' ? 'Панель свёрнута' : camStatus === 'retrying' ? 'Нет потока' : 'Подключение'
 
-  // Odometry is telemetry only; the lidar view stays in the robot frame.
+  // Odometry is telemetry only; only an associated SLAM pose can globalize a scan.
   const odom = state.odom || {}
   const sensors = state.sensors || {}
-  const compassAngle = compassYaw(sensors.compass)
+  const compass = useCompass(sensors.compass, connected)
+  const compassAngle = compassYaw(compass)
   const battery = sensors.battery
   const batteryKnown = battery && (Number.isFinite(battery.percent) || Number.isFinite(battery.volts) || typeof battery.charging === 'boolean')
   const batteryText = batteryKnown ? `${Number.isFinite(battery.percent) ? battery.percent : '—'}% / ${Number.isFinite(battery.volts) ? battery.volts : '—'} V${battery.charging === true ? ' · заряд' : ''}` : null
@@ -161,24 +166,33 @@ export default function App() {
             <div className="heading-end">
               <span className="meta lidar-meta" title="Колесо мыши меняет масштаб">
                 <span className="zoom-hint">Колесо · </span><span id="scale-value">{fmt(view.radius, view.radius < 1 ? 2 : 1)} м</span>
-                <span className="frame-label"> · <span id="frame-label">base_link</span></span>
+                <span className="frame-label"> · <span id="frame-label">{view.frame === 'map' ? 'map' : 'base_link'}</span></span>
               </span>
               <div className="panel-actions">
-                <button id="lidar-center" type="button" title="Вернуть обзор к роботу" onClick={() => setView({ radius: 3, center: null })}>К роботу</button>
+                <button id="lidar-frame" type="button" aria-pressed={view.frame === 'map'}
+                  title="Фиксированный кадр карты: отличить повреждение карты от скачка позы"
+                  onClick={() => setView((v) => ({ ...v, frame: v.frame === 'map' ? 'robot' : 'map', center: null }))}>Кадр карты</button>
+                <button id="lidar-center" type="button" title="Вернуть обзор к роботу" onClick={() => setView((v) => {
+                  const p = state.slam?.pose
+                  const center = v.frame === 'map' && Number.isFinite(p?.x) && Number.isFinite(p?.y) ? { x: p.x, y: p.y } : null
+                  return { ...v, radius: 3, center }
+                })}>К роботу</button>
                 {panelBtn('lidar', 'Лидар')}
               </div>
             </div>
           </div>
           {!collapsed.lidar && (
             <div className="lidar-stage">
-              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} />
+              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} slamState={slamState} />
               <div className="legend">
                 <span><i className="dot" />Скан лидара</span>
-                <span><i className="robot-dot" />Робот · начало координат</span>
+                <span><i className="robot-dot" />{view.frame === 'map' ? 'Робот · поза SLAM' : 'Робот · начало координат'}</span>
+                <span>Карта · занято / свободно / неизвестно</span>
+                {view.frame === 'map' && <span>Фиксированный map · скан только при совпадении с позой</span>}
               </div>
             </div>
           )}
-          <SlamStatus slam={state.slam} />
+          <SlamStatus slam={state.slam} scan={scan} slamState={slamState} />
         </section>
         <aside>
           <section id="panel-camera" className={`camera${collapsed.camera ? ' is-collapsed' : ''}${expanded === 'camera' ? ' is-expanded' : ''}`} aria-labelledby="camera-title">
@@ -212,7 +226,7 @@ export default function App() {
             {!collapsed.sensors && (
               <div className="sensor-content">
               <div className="navigation-instruments">
-                <OrientationInstruments compass={sensors.compass} gyro={sensors.service_channels?.['position3d:0']} />
+                <OrientationInstruments compass={compass} gyro={sensors.service_channels?.['position3d:0']} />
                 <OdometryInstruments odom={odom} />
               </div>
               <div className="sensor-readings">
