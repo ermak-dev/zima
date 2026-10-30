@@ -88,11 +88,25 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
   const freshness = slamState || localState
   const canvasRef = useRef(null)
   const stateRef = useRef({})
-  stateRef.current = { scan, view, onView, slam, freshness }
+  const pairRef = useRef(null)
   const scheduleRef = useRef(null)
   const gridCacheRef = useRef({})
+  if (freshness.matched) {
+    const previous = pairRef.current
+    const same = previous && previous.scan.sequence === scan.sequence && previous.scan.id === scan.id &&
+      previous.scan.stamp === scan.stamp && previous.slam.scan_stamp === slam.scan_stamp
+    pairRef.current = { scan, slam, receivedAt: same ? previous.receivedAt : performance.now() - (freshness.ageMs ?? 0) }
+  }
+  stateRef.current = { scan, view, onView, slam, freshness }
 
-  useEffect(() => { scheduleRef.current?.() }, [scan, view, slam, freshness.aligned, freshness.matched])
+  useEffect(() => {
+    scheduleRef.current?.()
+    const pair = pairRef.current
+    if (!pair) return
+    const remaining = Math.max(0, freshness.maxAgeMs - (performance.now() - pair.receivedAt))
+    const timer = setTimeout(() => scheduleRef.current?.(), remaining + 1)
+    return () => clearTimeout(timer)
+  }, [scan, view, slam, freshness.aligned, freshness.matched, freshness.maxAgeMs])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -144,8 +158,14 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
       // A fixed map is useful even with a bad pose; a robot-frame map is an
       // overlay and must not pretend to align with another scan or stale pose.
       const world = v.frame === 'map'
-      const map = s.slam?.map, pose = s.slam?.pose
-      if (v.showMap !== false && map?.cells && (world || s.freshness.aligned)) {
+      const pair = pairRef.current
+      const pairFresh = pair && !s.freshness.stale && !s.freshness.failed &&
+        performance.now() - pair.receivedAt <= s.freshness.maxAgeMs
+      const matchedSlam = pairFresh ? pair.slam : null
+      const matchedScan = pairFresh ? pair.scan : null
+      const map = world ? s.slam?.map : matchedSlam?.map
+      const pose = matchedSlam?.pose
+      if (v.showMap !== false && map?.cells && (world || matchedSlam)) {
         const image = gridImage(gridCacheRef.current, map)
         if (image) {
           const [a, b, c, d, e, f] = gridTransform(map, pose, { W, H, k, ox, oy }, v.frame)
@@ -158,9 +178,10 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
       }
 
       // Points already include the static lidar mount correction.
-      if (v.showScan !== false && s.scan?.frame === 'base_link' && (!world || s.freshness.matched)) {
+      const visibleScan = matchedScan || (!world ? s.scan : null)
+      if (v.showScan !== false && visibleScan?.frame === 'base_link' && (!world || matchedSlam)) {
         ctx.fillStyle = '#2a78d6'
-        const points = s.scan?.points || []
+        const points = visibleScan.points || []
         for (const [x, y] of world ? scanToMap(points, pose) : points) {
           const [a, b] = at(x, y)
           ctx.beginPath()
@@ -168,7 +189,7 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
           ctx.fill()
         }
       }
-      if (!world || s.freshness.matched) {
+      if (!world || matchedSlam) {
         const [x, y] = world ? at(pose.x, pose.y) : at(0, 0)
         const radius = 0.1725 * k
         ctx.save()

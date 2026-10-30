@@ -71,6 +71,42 @@ describe('SLAM overlay rendering', () => {
     expect(ctx.drawImage).not.toHaveBeenCalled()
   })
 
+  it('keeps the last matched scan and pose while the next result is in flight', () => {
+    const first = { ...slam, scan_sequence: 101 }
+    const firstScan = { ...scan, sequence: 101, points: [[1, 0]] }
+    const { rerender } = mount(first, 'robot', firstScan); draw()
+    expect(ctx.drawImage).toHaveBeenCalled()
+    ctx.drawImage.mockClear(); ctx.arc.mockClear()
+    rerender(<LidarCanvas scan={{ ...scan, sequence: 102, points: [[2, 0]] }} slam={first} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    draw()
+    expect(ctx.drawImage).toHaveBeenCalled()
+    expect(ctx.arc).toHaveBeenCalledWith(127 + 100 / 3, 127, 2, 0, 2 * Math.PI)
+    expect(ctx.arc).not.toHaveBeenCalledWith(127 + 200 / 3, 127, 2, 0, 2 * Math.PI)
+    ctx.drawImage.mockClear(); ctx.arc.mockClear()
+    rerender(<LidarCanvas scan={{ ...scan, sequence: 102, points: [[2, 0]] }} slam={{ ...first, scan_sequence: 102 }} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    draw()
+    expect(ctx.drawImage).toHaveBeenCalled()
+    expect(ctx.arc).toHaveBeenCalledWith(127 + 200 / 3, 127, 2, 0, 2 * Math.PI)
+    act(() => vi.advanceTimersByTime(650)); ctx.drawImage.mockClear(); draw()
+    expect(ctx.drawImage).not.toHaveBeenCalled()
+  })
+
+  it('keeps the previous pair when the SLAM result arrives before its scan, but hides it on errors', () => {
+    const first = { ...slam, scan_sequence: 101 }
+    const firstScan = { ...scan, sequence: 101, points: [[1, 0]] }
+    const { rerender } = mount(first, 'robot', firstScan); draw()
+    ctx.drawImage.mockClear(); ctx.arc.mockClear()
+    const next = { ...first, scan_sequence: 102 }
+    rerender(<LidarCanvas scan={firstScan} slam={next} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    draw()
+    expect(ctx.drawImage).toHaveBeenCalled()
+    expect(ctx.arc).toHaveBeenCalledWith(127 + 100 / 3, 127, 2, 0, 2 * Math.PI)
+    ctx.drawImage.mockClear()
+    rerender(<LidarCanvas scan={firstScan} slam={{ ...next, tracking: 'error', error: 'adapter timeout' }} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    draw()
+    expect(ctx.drawImage).not.toHaveBeenCalled()
+  })
+
   it('uses server sequence identity when source IDs and stamps are reused', () => {
     const first = { ...slam, scan_sequence: 101 }
     const firstScan = { ...scan, sequence: 101 }
@@ -84,6 +120,8 @@ describe('SLAM overlay rendering', () => {
     ctx.drawImage.mockClear()
     rerender(<LidarCanvas scan={{ ...scan, sequence: 103 }} slam={next} view={view} onView={() => {}} />)
     draw()
+    expect(ctx.drawImage).toHaveBeenCalled()
+    act(() => vi.advanceTimersByTime(650)); ctx.drawImage.mockClear(); draw()
     expect(ctx.drawImage).not.toHaveBeenCalled()
   })
 
