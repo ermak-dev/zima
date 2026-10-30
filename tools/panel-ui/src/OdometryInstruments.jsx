@@ -61,7 +61,6 @@ export default function OdometryInstruments({ odom = {} }) {
           <span>v <b id="pose-v">{value(odom.vx, 'м/с')}</b></span>
           <span>ω <b id="pose-w">{value(odom.yaw_rate, 'рад/с')}</b></span>
         </figcaption>
-        <small>Измерение, не команда</small>
       </figure>
     </div>
   )

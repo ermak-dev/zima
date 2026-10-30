@@ -30,6 +30,10 @@ const deferred = () => {
 }
 const tick = async (ms = 1000) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
 const flush = async () => act(async () => {})
+const openModal = () => {
+  const trigger = screen.getByRole('button', { name: 'Открыть окно речи' })
+  fireEvent.click(trigger)
+}
 const input = () => screen.getByRole('textbox', { name: 'Текст для озвучивания' })
 const submit = () => screen.getByRole('button', { name: 'Произнести' })
 const cancel = () => screen.getByRole('button', { name: 'Отменить речь' })
@@ -52,6 +56,9 @@ const expectUncertain = () => {
 beforeEach(() => {
   vi.useFakeTimers()
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unexpected fetch')))
+  // Mock HTMLDialogElement methods for jsdom
+  HTMLDialogElement.prototype.showModal = vi.fn(function() { this.open = true })
+  HTMLDialogElement.prototype.close = vi.fn(function() { this.open = false })
 })
 afterEach(() => {
   cleanup()
@@ -65,6 +72,7 @@ describe('speech panel', () => {
     queued()
     fetch.mockResolvedValue(task('playing'))
     render(<SpeechPanel settings={{ enabled: true, volume: 0.45, max_volume: 0.6 }} />)
+    openModal()
     const slider = screen.getByRole('slider', { name: 'Громкость речи' })
     expect(Number(slider.value)).toBe(0.45)
     expect(Number(slider.max)).toBe(0.6)
@@ -74,6 +82,7 @@ describe('speech panel', () => {
 
   it('does not submit when server configuration disables speech', async () => {
     render(<SpeechPanel settings={{ enabled: false, volume: 0.35, max_volume: 0.9 }} />)
+    openModal()
     enter('Привет')
     expect(submit().disabled).toBe(true)
     fireEvent.click(submit())
@@ -84,7 +93,8 @@ describe('speech panel', () => {
     fetch.mockResolvedValueOnce(response({ enabled: true, volume: 0.45, max_volume: 0.6 }))
     render(<App />)
     await flush()
-    expect(screen.getByRole('form', { name: 'Речь робота' }).closest('footer')).not.toBeNull()
+    openModal()
+    expect(screen.getByRole('dialog', { name: 'Речь робота' })).toBeTruthy()
     expect(input()).not.toBeNull()
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(fetch.mock.calls[0][0]).toBe('/api/audio/config')
@@ -94,6 +104,7 @@ describe('speech panel', () => {
 
   it('is idle on mount and exposes labelled Russian controls with safe defaults', async () => {
     render(<SpeechPanel />)
+    openModal()
     expect(input().value).toBe('')
     expect(input().maxLength).toBe(2000)
     const volume = screen.getByRole('slider', { name: 'Громкость речи' })
@@ -112,6 +123,7 @@ describe('speech panel', () => {
     queued()
     fetch.mockResolvedValue(task('synthesizing'))
     render(<SpeechPanel />)
+    openModal()
     await say('  Привет, робот  ')
     expect(posts()).toHaveLength(1)
     const [url, options] = posts()[0]
@@ -127,6 +139,7 @@ describe('speech panel', () => {
 
   it.each(['', '   \n\t', 'до\0после', 'я'.repeat(2001)])('rejects invalid speech text case %# without a request', async (text) => {
     render(<SpeechPanel />)
+    openModal()
     enter(text)
     fireEvent.click(submit())
     await flush()
@@ -137,6 +150,7 @@ describe('speech panel', () => {
     queued()
     fetch.mockResolvedValue(task('playing'))
     render(<SpeechPanel />)
+    openModal()
     await say(text)
     expect(posts()).toHaveLength(1)
     expect(JSON.parse(posts()[0][1].body).text).toBe(text)
@@ -146,6 +160,7 @@ describe('speech panel', () => {
     queued()
     fetch.mockResolvedValue(task('playing'))
     render(<SpeechPanel />)
+    openModal()
     fireEvent.change(screen.getByRole('slider', { name: 'Громкость речи' }), { target: { value: volume } })
     await say()
     expect(JSON.parse(posts()[0][1].body)).toEqual({ text: 'Привет, робот', volume })
@@ -155,6 +170,7 @@ describe('speech panel', () => {
     const send = vi.fn()
     function Harness() { useTeleop(send); return <SpeechPanel /> }
     render(<Harness />)
+    openModal()
     for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
       fireEvent.keyDown(input(), { code })
       fireEvent.keyUp(input(), { code })
@@ -168,6 +184,7 @@ describe('speech panel', () => {
     const pending = deferred()
     fetch.mockReturnValueOnce(pending.promise)
     render(<SpeechPanel />)
+    openModal()
     await say()
     fireEvent.click(submit())
     expect(posts()).toHaveLength(1)
@@ -181,6 +198,7 @@ describe('speech panel', () => {
     let state = 'synthesizing'
     fetch.mockImplementation(async () => task(state))
     render(<SpeechPanel />)
+    openModal()
     await say()
     await tick()
     expect(polls().length).toBeGreaterThan(0)
@@ -203,6 +221,7 @@ describe('speech panel', () => {
     queued()
     fetch.mockResolvedValue(task(state, { error: 'Динамик недоступен <script>bad()</script>' }))
     render(<SpeechPanel />)
+    openModal()
     await say()
     await tick()
     if (state === 'failed') expect(statusText()).toContain('Динамик недоступен')
@@ -222,6 +241,7 @@ describe('speech panel', () => {
       ? response({ id: 'speech-1', state: 'playing' }, 202)
       : task(cancelled ? 'cancelled' : 'playing'))
     render(<SpeechPanel />)
+    openModal()
     await say()
     await tick()
     fireEvent.click(cancel())
@@ -242,6 +262,7 @@ describe('speech panel', () => {
       throw new Error('Connection lost')
     })
     render(<SpeechPanel />)
+    openModal()
     await say()
     if (phase !== 'submit') await tick()
     if (phase === 'cancel') { fireEvent.click(cancel()); await flush() }
@@ -254,6 +275,7 @@ describe('speech panel', () => {
   it('reports an HTTP rejection without treating it as queued or completed', async () => {
     fetch.mockResolvedValue(response({ error: 'Аудиосервис недоступен' }, 503))
     render(<SpeechPanel />)
+    openModal()
     await say()
     expectUncertain()
     await tick(60_000)
@@ -266,6 +288,7 @@ describe('speech panel', () => {
     const pending = deferred()
     fetch.mockReturnValueOnce(pending.promise)
     render(<SpeechPanel />)
+    openModal()
     await say()
     await tick(5000)
     expect(polls()).toHaveLength(1)
@@ -284,6 +307,7 @@ describe('speech panel', () => {
   it('bounds a hung POST without automatically repeating it', async () => {
     fetch.mockReturnValue(new Promise(() => {}))
     render(<SpeechPanel />)
+    openModal()
     await say()
     await tick(600_000)
     expect(posts()).toHaveLength(1)
@@ -296,6 +320,7 @@ describe('speech panel', () => {
     if (phase === 'poll') queued()
     fetch.mockReturnValue(pending.promise)
     const { unmount } = render(<StrictMode><SpeechPanel /></StrictMode>)
+    openModal()
     await say()
     if (phase === 'poll') await tick()
     const count = fetch.mock.calls.length

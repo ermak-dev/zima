@@ -25,7 +25,7 @@ describe('teleop safety', () => {
     act(() => vi.advanceTimersByTime(1000))
     expect(send).not.toHaveBeenCalled()
     key('keydown', 'KeyW')
-    expect(send).toHaveBeenLastCalledWith({ v: 0.1, w: 0 })
+    expect(send).toHaveBeenLastCalledWith({ v: 0.25, w: 0 })
     act(() => vi.advanceTimersByTime(150))
     expect(send).toHaveBeenCalledTimes(2)
     key('keyup', 'KeyW')
@@ -51,7 +51,7 @@ describe('teleop safety', () => {
   })
 
   // FEATURE: driver-ceiling linear teleop with an unchanged angular ceiling.
-  // SPEC: allow 0.5 m/s, retain 0.4 rad/s, and reject nonfinite/oversized limits.
+  // SPEC: allow 0.5 m/s linear, retain default 1.57 rad/s angular, and reject nonfinite/oversized limits.
   // IMPLEMENTATION: shared UI limits with bounded linear and angular scaling.
   // RESULT: IMPLEMENTED — maximum speed, invalid limits and turn ceiling verified.
   // STATUS: DONE
@@ -61,7 +61,7 @@ describe('teleop safety', () => {
     key('keydown', 'KeyW')
     expect(send).toHaveBeenLastCalledWith({ v: speed, w: 0 })
     key('keydown', 'KeyA')
-    expect(send).toHaveBeenLastCalledWith({ v: speed, w: 0.4 })
+    expect(send).toHaveBeenLastCalledWith({ v: speed, w: 1.57 })
     key('keyup', 'KeyW')
     key('keyup', 'KeyA')
     expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
@@ -78,7 +78,7 @@ describe('teleop safety', () => {
     expect(command.v).toBeLessThanOrEqual(0.5)
     expect(Number.isFinite(command.w)).toBe(true)
     expect(command.w).toBeGreaterThanOrEqual(0)
-    expect(command.w).toBeLessThanOrEqual(0.4)
+    expect(command.w).toBeLessThanOrEqual(1.57)
   })
 
   // FEATURE: independently adjustable angular speed.
@@ -161,7 +161,7 @@ describe('teleop safety', () => {
     expect(send).toHaveBeenLastCalledWith({ v: 0.06, w: 0 })
     key('keyup', 'KeyW')
     key('keydown', 'KeyA')
-    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0.4 })
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: 1.57 })
     key('keyup', 'KeyA')
     expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
   })
@@ -223,7 +223,7 @@ describe('teleop safety', () => {
     input.remove()
     expect(send).not.toHaveBeenCalled()
     key('keydown', 'ArrowRight')
-    expect(send).toHaveBeenLastCalledWith({ v: 0, w: -0.4 })
+    expect(send).toHaveBeenLastCalledWith({ v: 0, w: -1.57 })
     key('keydown', 'Space')
     expect(send).toHaveBeenLastCalledWith({ v: 0, w: 0 })
     key('keydown', 'KeyS')

@@ -9,8 +9,8 @@ const KEYS = {
   ArrowLeft: ['w', 1], KeyA: ['w', 1], ArrowRight: ['w', -1], KeyD: ['w', -1],
 }
 export const LIMITS = { v: 0.5, w: 3.14 }
-export const DEFAULT_LINEAR_SPEED = 0.1
-export const DEFAULT_ANGULAR_SPEED = 0.4
+export const DEFAULT_LINEAR_SPEED = 0.25
+export const DEFAULT_ANGULAR_SPEED = 1.57
 
 export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angularLimit = DEFAULT_ANGULAR_SPEED, blocked = false) {
   const held = useRef(new Set())
@@ -38,7 +38,10 @@ export default function useTeleop(send, linearLimit = DEFAULT_LINEAR_SPEED, angu
 
   useEffect(() => {
     const isTyping = (target, code) => {
-      if (target?.tagName === 'INPUT' && target.type === 'range' && code.startsWith('Key')) return false
+      // Allow WASD on range sliders (for robot control), but not arrows (they adjust the slider)
+      if (target?.tagName === 'INPUT' && target.type === 'range') {
+        return !['KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(code)
+      }
       return ['SELECT', 'INPUT', 'BUTTON', 'TEXTAREA'].includes(target?.tagName)
     }
 

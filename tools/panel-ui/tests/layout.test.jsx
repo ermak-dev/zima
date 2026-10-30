@@ -13,6 +13,23 @@ vi.mock('../src/usePanelSocket.js', () => ({ default: (handler) => {
 afterEach(() => cleanup())
 
 describe('Panel layout', () => {
+  it('shows robot diagram with sensors and no implementation notes', () => {
+    const { container } = render(<App />)
+    expect(container.querySelector('.robot-diagram')).toBeTruthy()
+    expect(screen.getByRole('img', { name: 'Робот сверху' })).toBeTruthy()
+    expect(container.querySelector('.bumper-arc')).toBeTruthy()
+    expect(container.querySelector('.sonar-indicator')).toBeTruthy()
+    for (const text of ['Сырые показания', 'Без калибровки · оси датчика', 'Относительный курс · вид сверху', 'Последний кадр не гарантирует свежесть']) {
+      expect(container.textContent).not.toContain(text)
+    }
+  })
+  it('keeps compass numeric values out of the lower sensor panel', () => {
+    const { container } = render(<App />)
+    expect(container.querySelector('#panel-sensors #compass')).toBeNull()
+    const compass = screen.getByRole('img', { name: 'Компас' })
+    expect(compass.closest('figure').querySelector('figcaption b')).toBeNull()
+    expect(screen.getByRole('img', { name: 'Гироскоп' })).toBeTruthy()
+  })
   it('shows lidar and SLAM layer checkboxes instead of a SLAM section', () => {
     const { container } = render(<App />)
     expect(screen.getByRole('checkbox', { name: /скан лидара/i })).toBeTruthy()
@@ -55,6 +72,8 @@ describe('Panel layout', () => {
     expect(screen.getByRole('img', { name: 'Компас' })).toBeTruthy()
     expect(screen.getByRole('img', { name: 'Гироскоп' })).toBeTruthy()
     expect(screen.getByRole('img', { name: 'Положение одометрии' })).toBeTruthy()
-    expect(container.querySelector('.sensor-readings')).toBeTruthy()
+    expect(container.querySelector('.status-badges')).toBeTruthy()
+    expect(container.querySelector('#battery')).toBeTruthy()
+    expect(container.querySelector('#dock')).toBeTruthy()
   })
 })

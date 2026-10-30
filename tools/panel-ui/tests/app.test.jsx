@@ -65,7 +65,7 @@ describe('App lifecycle', () => {
     const sent = () => sockets.flatMap((s) => s.sent)
     const cameraSrc = document.getElementById('cam').getAttribute('src')
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
-    expect(sent().at(-1)).toEqual({ v: 0.1, w: 0 })
+    expect(sent().at(-1)).toEqual({ v: 0.25, w: 0 })
     act(() => lastHandler({ type: 'state', data: { blocked: true, sensors: { bumper: 'PRESSED' } } }))
     expect(document.getElementById('cam').getAttribute('src')).toBe(cameraSrc)
     expect(getByRole('alert').textContent).toContain('Наезд на препятствие')
@@ -84,7 +84,7 @@ describe('App lifecycle', () => {
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyS', repeat: true, bubbles: true })))
     expect(sent()).toHaveLength(afterReset)
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyS', bubbles: true })))
-    expect(sent().at(-1)).toEqual({ v: -0.1, w: 0 })
+    expect(sent().at(-1)).toEqual({ v: -0.25, w: 0 })
     act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyS', bubbles: true })))
   })
 
@@ -97,11 +97,14 @@ describe('App lifecycle', () => {
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
 
-  it('mounts sensor table with explicit missing values', () => {
-    render(<App />)
-    for (const id of ['battery', 'dock', 'bumper', 'wall', 'cliff-0', 'cliff-1', 'cliff-2', 'cliff-3', 'drop-0', 'drop-1', 'sonar', 'bumper-left', 'bumper-front', 'bumper-right', 'compass']) {
-      expect(document.getElementById(id).textContent).toBe('нет данных')
-    }
+  it('mounts sensor display with explicit missing values', () => {
+    const { container } = render(<App />)
+    expect(document.getElementById('battery').querySelector('.badge-value').textContent).toBe('—')
+    expect(document.getElementById('dock').querySelector('.badge-value').textContent).toBe('—')
+    expect(document.getElementById('bumper').querySelector('.badge-value').textContent).toBe('—')
+    // Bumper segments and sonar are in the robot diagram SVG
+    expect(container.querySelectorAll('.bumper-arc.unknown').length).toBe(3)
+    expect(container.querySelector('.sonar-indicator.unknown')).toBeTruthy()
   })
 
   // BUG: native telemetry preserves unknown power fields as null.
@@ -112,37 +115,52 @@ describe('App lifecycle', () => {
   it('keeps unknown battery fields explicit instead of rendering null measurements', () => {
     render(<App />)
     act(() => lastHandler({ type: 'state', data: { sensors: { battery: { percent: null, volts: null, charging: null } } } }))
-    expect(document.getElementById('battery').textContent).toBe('нет данных')
-    expect(document.getElementById('battery').className).toBe('missing')
+    expect(document.getElementById('battery').querySelector('.badge-value').textContent).toBe('—')
+    expect(document.getElementById('battery').classList.contains('unknown')).toBe(true)
     act(() => lastHandler({ type: 'state', data: { sensors: { battery: { percent: null, volts: 20.5, charging: null } } } }))
-    expect(document.getElementById('battery').textContent).toBe('—% / 20.5 V')
+    expect(document.getElementById('battery').querySelector('.badge-value').textContent).toBe('—% / 20.5 V')
   })
 
-  it('voltage and unknown range are not conflated', () => {
-    render(<App />)
-    act(() => lastHandler({ type: 'state', data: { sensors: { cliff_ir: [0, 0, 0, 0] } } }))
-    expect(document.getElementById('cliff-0').textContent).toBe('— м / 0.00 V')
+  it('shows cliff sensors as availability indicators in the robot diagram', () => {
+    const { container } = render(<App />)
+    const cliffDots = container.querySelectorAll('.sensor-dot.cliff')
+    expect(cliffDots.length).toBe(4)
+    expect([...cliffDots].every((d) => d.classList.contains('unknown'))).toBe(true)
+    act(() => lastHandler({ type: 'state', data: { sensors: { cliff_ir: [0, null, 1, 0], cliff_ranges: [null, null, null, null] } } }))
+    const updatedDots = container.querySelectorAll('.sensor-dot.cliff')
+    expect(updatedDots[0].classList.contains('received')).toBe(true)
+    expect(updatedDots[1].classList.contains('unknown')).toBe(true)
+    expect(updatedDots[2].classList.contains('received')).toBe(true)
+    expect(updatedDots[3].classList.contains('received')).toBe(true)
   })
 
-  it('sonar sentinel is flagged, not shown as distance', () => {
-    render(<App />)
+  it('sonar indicator in robot diagram shows distance or no-echo state', () => {
+    const { container } = render(<App />)
+    expect(container.querySelector('.sonar-indicator.unknown')).toBeTruthy()
     act(() => lastHandler({ type: 'state', data: { sensors: { sonar: 65.534 } } }))
-    expect(document.getElementById('sonar').textContent).toBe('65.534 м · sentinel')
-    expect(document.getElementById('sonar').className).toBe('alert')
+    expect(container.querySelector('.sonar-indicator.no-echo')).toBeTruthy()
+    expect(container.querySelector('.sonar-label').textContent).toBe('∞')
+    act(() => lastHandler({ type: 'state', data: { sensors: { sonar: 1.25 } } }))
+    expect(container.querySelector('.sonar-indicator.received')).toBeTruthy()
+    expect(container.querySelector('.sonar-label').textContent).toBe('1.25')
+    act(() => lastHandler({ type: 'state', data: { sensors: { sonar: null } } }))
+    expect(container.querySelector('.sonar-indicator.unknown')).toBeTruthy()
+    expect(container.querySelector('.sonar-label').textContent).toBe('?')
   })
 
-  it('renders per-segment bumper state', () => {
-    render(<App />)
+  it('renders per-segment bumper state in robot diagram', () => {
+    const { container } = render(<App />)
     act(() => lastHandler({ type: 'state', data: { sensors: { bumper: 'PRESSED', bumper_segments: [true, false, true] } } }))
-    expect(document.getElementById('bumper').textContent).toBe('Нажат')
-    expect(document.getElementById('bumper').className).toBe('alert')
-    expect(document.getElementById('bumper-left').textContent).toBe('Нажат')
-    expect(document.getElementById('bumper-left').className).toBe('alert')
-    expect(document.getElementById('bumper-front').textContent).toBe('Свободен')
-    expect(document.getElementById('bumper-right').textContent).toBe('Нажат')
+    expect(document.getElementById('bumper').querySelector('.badge-value').textContent).toBe('Контакт')
+    expect(document.getElementById('bumper').classList.contains('alert')).toBe(true)
+    const arcs = container.querySelectorAll('.bumper-arc')
+    expect(arcs[0].classList.contains('pressed')).toBe(true)
+    expect(arcs[1].classList.contains('free')).toBe(true)
+    expect(arcs[2].classList.contains('pressed')).toBe(true)
     act(() => lastHandler({ type: 'state', data: { sensors: { bumper: 'clear', bumper_segments: [false, false, false] } } }))
-    expect(document.getElementById('bumper-left').textContent).toBe('Свободен')
-    expect(document.getElementById('bumper-left').className).toBe('')
+    const clearedArcs = container.querySelectorAll('.bumper-arc')
+    expect([...clearedArcs].every((a) => a.classList.contains('free'))).toBe(true)
+    expect(document.getElementById('bumper').classList.contains('alert')).toBe(false)
   })
 
   // BUG: vendor yaw was treated as a measured course and could remain visible indefinitely.
@@ -156,7 +174,7 @@ describe('App lifecycle', () => {
       compass: { x: 600, y: 1, z: 2, yaw: 1.25, status: 'received' },
     } } }))
     expect(container.querySelector('[data-compass-needle]')).toBeNull()
-    expect(document.getElementById('compass').textContent).toBe('нет данных')
+    expect(screen.getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
   })
 
   it('expires a raw compass sample even while unrelated state frames keep arriving', () => {
@@ -173,7 +191,7 @@ describe('App lifecycle', () => {
     publish({ ...compass })
     act(() => vi.advanceTimersByTime(600))
     expect(container.querySelector('[data-compass-needle]')).toBeNull()
-    expect(document.getElementById('compass').textContent).toBe('нет данных')
+    expect(screen.getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
     expect(container.querySelector('.orientation-instruments').textContent).toContain('Нет свежих измерений')
     publish({ ...compass, stamp: 43, yaw: 0, x: 100, y: 0 })
     expect(container.querySelector('[data-compass-needle]').getAttribute('transform')).toBe('rotate(0 60 60)')
@@ -183,13 +201,13 @@ describe('App lifecycle', () => {
   it('renders compass yaw and dock state from telemetry', () => {
     render(<App />)
     act(() => lastHandler({ type: 'state', data: { sensors: { dock: true, compass: rawCompass(1.256) } } }))
-    expect(document.getElementById('compass').textContent).toBe('1.256 рад · 72.0°')
-    expect(document.getElementById('dock').textContent).toBe('На доке')
-    expect(document.getElementById('dock').className).toBe('')
+    expect(screen.getByRole('img', { name: 'Компас' }).dataset.known).toBe('true')
+    expect(document.getElementById('dock').querySelector('.badge-value').textContent).toBe('На доке')
+    expect(document.getElementById('dock').classList.contains('docked')).toBe(true)
     act(() => lastHandler({ type: 'state', data: { sensors: { dock: false, compass: { yaw: null } } } }))
-    expect(document.getElementById('compass').textContent).toBe('нет данных')
-    expect(document.getElementById('compass').className).toBe('missing')
-    expect(document.getElementById('dock').textContent).toBe('Вне дока')
+    expect(screen.getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
+    expect(document.querySelector('[data-compass-needle]')).toBeNull()
+    expect(document.getElementById('dock').querySelector('.badge-value').textContent).toBe('Вне дока')
   })
 
   // FEATURE: service telemetry with explicit missing and unsafe-subscription states.
@@ -202,12 +220,12 @@ describe('App lifecycle', () => {
     const sent = () => sockets.flatMap((s) => s.sent)
     const slider = container.querySelector('#speed-slider')
     expect(slider).toBeTruthy()
-    expect(slider.value).toBe('0.1')
+    expect(slider.value).toBe('0.25')
     expect(slider.max).toBe('0.5')
-    expect(document.getElementById('speed-value').textContent).toBe('0.10 м/с')
-    // The default limit keeps the current behavior byte-for-byte.
+    expect(document.getElementById('speed-value').textContent).toBe('0.25 м/с')
+    // The default limit is mid-range for comfortable starts.
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
-    expect(sent().at(-1)).toEqual({ v: 0.1, w: 0 })
+    expect(sent().at(-1)).toEqual({ v: 0.25, w: 0 })
     act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
     const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
     act(() => {
@@ -225,12 +243,12 @@ describe('App lifecycle', () => {
     expect(document.getElementById('speed-value').textContent).toBe('0.50 м/с')
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
     expect(sent().at(-1)).toEqual({ v: 0.5, w: 0 })
-    expect(sent().every((c) => Math.abs(c.v) <= 0.5 && Math.abs(c.w) <= 0.4)).toBe(true)
+    expect(sent().every((c) => Math.abs(c.v) <= 0.5 && Math.abs(c.w) <= 1.57)).toBe(true)
     act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
   })
 
   // FEATURE: separate, labelled turn-speed slider without motion on adjustment.
-  // SPEC: 0.01–3.14 rad/s, default 0.4; changing linear speed does not alter turn speed.
+  // SPEC: 0.01–3.14 rad/s, default 1.57 (mid-range); changing linear speed does not alter turn speed.
   // IMPLEMENTATION: separate turn-speed state and accessible slider in the footer.
   // RESULT: IMPLEMENTED — idle adjustment is inert and focused-slider WASD uses both limits.
   // STATUS: DONE
@@ -241,8 +259,8 @@ describe('App lifecycle', () => {
     expect(slider.min).toBe('0.01')
     expect(slider.max).toBe('3.14')
     expect(slider.step).toBe('0.01')
-    expect(slider.value).toBe('0.4')
-    expect(document.getElementById('turn-speed-value').textContent).toBe('0.40 рад/с')
+    expect(slider.value).toBe('1.57')
+    expect(document.getElementById('turn-speed-value').textContent).toBe('1.57 рад/с')
     const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
     act(() => {
       set.call(slider, '0.15')
@@ -299,7 +317,7 @@ describe('App lifecycle', () => {
     } } }))
     expect(getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
     expect(container.querySelector('[data-compass-needle]')).toBeNull()
-    expect(document.getElementById('compass').textContent).toBe('нет данных')
+    expect(screen.getByRole('img', { name: 'Компас' }).dataset.known).toBe('false')
     expect(getByRole('img', { name: 'Гироскоп' }).dataset.known).toBe('true')
     expect(container.querySelector('[data-gyro-heading]').getAttribute('transform')).toBe('rotate(-90 60 60)')
     expect(container.querySelector('.attitude-horizon')).toBeNull()
@@ -311,7 +329,8 @@ describe('App lifecycle', () => {
 
   it('keeps sensor widgets visible without a collapsed disclosure', () => {
     const { container } = render(<App />)
-    expect(container.querySelector('.sensor-readings')).toBeTruthy()
+    expect(container.querySelector('.robot-diagram')).toBeTruthy()
+    expect(container.querySelector('.status-badges')).toBeTruthy()
     expect(container.querySelector('.orientation-instruments')).toBeTruthy()
     expect(container.querySelector('details:not([open])')).toBeNull()
   })
@@ -320,7 +339,7 @@ describe('App lifecycle', () => {
     const { getByRole } = render(<App />)
     const slider = getByRole('slider', { name: /Поворот/ })
     expect(slider.max).toBe('3.14')
-    expect(slider.value).toBe('0.4')
+    expect(slider.value).toBe('1.57')
     const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
     act(() => {
       set.call(slider, '3.14')

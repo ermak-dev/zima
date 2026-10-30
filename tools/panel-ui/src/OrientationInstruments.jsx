@@ -19,7 +19,7 @@ export default function OrientationInstruments({ compass, gyro }) {
   const yaw = degrees(compassYaw(compass))
   const gyroYaw = degrees(gyro?.pos?.[5])
   const heading = yaw === null ? null : (yaw % 360 + 360) % 360
-  const compassNote = heading !== null ? 'Без калибровки · оси датчика' : compassStatus[compass?.status] || 'Нет измерений ST480'
+  const compassNote = heading !== null ? '' : compassStatus[compass?.status] || 'Нет данных'
   return (
     <div className="orientation-instruments">
       <figure className="instrument">
@@ -40,7 +40,6 @@ export default function OrientationInstruments({ compass, gyro }) {
           </g>}
         </svg>
         <figcaption>
-          <b>{heading === null ? 'нет данных' : angleText(heading)}</b>
           <small>{compassNote}</small>
         </figcaption>
       </figure>
@@ -63,7 +62,6 @@ export default function OrientationInstruments({ compass, gyro }) {
         </svg>
         <figcaption>
           <b id="gyro-yaw">{angleText(gyroYaw)}</b>
-          <small>Относительный курс · вид сверху</small>
           <small>ω {Number.isFinite(gyro?.vel?.[5]) ? `${gyro.vel[5].toFixed(2)} рад/с` : '—'}</small>
         </figcaption>
       </figure>

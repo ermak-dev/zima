@@ -218,7 +218,7 @@ describe('YOLO camera', () => {
     expect(document.querySelector('#cam')).toBeTruthy()
     act(() => next.onopen?.())
     act(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', bubbles: true })))
-    expect(next.sent.at(-1)).toEqual({ v: 0.1, w: 0 })
+    expect(next.sent.at(-1)).toEqual({ v: 0.25, w: 0 })
     act(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', bubbles: true })))
   })
 })

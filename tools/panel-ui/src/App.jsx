@@ -8,34 +8,13 @@ import LidarCanvas from './LidarCanvas.jsx'
 import useSlamState from './useSlamState.js'
 import { MotorsFooter } from './MotorsPanel.jsx'
 import OrientationInstruments from './OrientationInstruments.jsx'
-import useCompass, { compassYaw } from './useCompass.js'
+import useCompass from './useCompass.js'
 import OdometryInstruments from './OdometryInstruments.jsx'
+import RobotDiagram from './RobotDiagram.jsx'
 import SpeechPanel from './SpeechPanel.jsx'
 import zimaLogo from './assets/zima-logo.png?inline'
 
 const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—')
-const SEGMENTS = [
-  ['left', 'Левый'], ['front', 'Передний'], ['right', 'Правый'],
-]
-const pair = (range, voltage) => {
-  const hasR = typeof range === 'number' && Number.isFinite(range)
-  const hasV = typeof voltage === 'number' && Number.isFinite(voltage)
-  if (!hasR && !hasV) return null
-  return `${hasR ? range.toFixed(3) : '—'} м / ${hasV ? voltage.toFixed(2) : '—'} V`
-}
-
-function reading(text, cls) {
-  return { text: text ?? 'нет данных', cls: text === null ? 'missing' : cls || '' }
-}
-
-function SensorRow({ id, name, value }) {
-  return (
-    <tr>
-      <td>{name}</td>
-      <td id={id} className={value.cls}>{value.text}</td>
-    </tr>
-  )
-}
 
 export default function App() {
   const [state, setState] = useState({})
@@ -91,7 +70,6 @@ export default function App() {
   const odom = state.odom || {}
   const sensors = state.sensors || {}
   const compass = useCompass(sensors.compass, connected)
-  const compassAngle = compassYaw(compass)
   const battery = sensors.battery
   const batteryKnown = battery && (Number.isFinite(battery.percent) || Number.isFinite(battery.volts) || typeof battery.charging === 'boolean')
   const batteryText = batteryKnown ? `${Number.isFinite(battery.percent) ? battery.percent : '—'}% / ${Number.isFinite(battery.volts) ? battery.volts : '—'} V${battery.charging === true ? ' · заряд' : ''}` : null
@@ -223,49 +201,36 @@ export default function App() {
             <div className="heading">
               <h2 id="sensor-title">Датчики шасси</h2>
               <div className="heading-end">
-                <span className="meta sensor-meta">Range / V</span>
                 <div className="panel-actions">{panelBtn('sensors', 'Датчики')}</div>
               </div>
             </div>
             {!collapsed.sensors && (
               <div className="sensor-content">
-              <div className="navigation-instruments">
-                <OrientationInstruments compass={compass} gyro={sensors.service_channels?.['position3d:0']} />
-                <OdometryInstruments odom={odom} />
-              </div>
-              <div className="sensor-readings">
-              <table className="sensor-table" aria-label="Все датчики шасси"><tbody>
-                <tr><td>Батарея</td><td id="battery" className={batteryText === null ? 'missing' : ''}>{batteryText ?? 'нет данных'}</td></tr>
-                <tr><td>Док</td><td id="dock" className={typeof sensors.dock === 'boolean' ? '' : 'missing'}>{typeof sensors.dock === 'boolean' ? (sensors.dock ? 'На доке' : 'Вне дока') : 'нет данных'}</td></tr>
-                <tr><td>Бампер</td><td id="bumper" className={sensors.bumper === 'PRESSED' ? 'alert' : sensors.bumper ? '' : 'missing'}>{sensors.bumper ? (sensors.bumper === 'PRESSED' ? 'Нажат' : 'Свободен') : 'нет данных'}</td></tr>
-                {SEGMENTS.map(([id, name], i) => {
-                  const seg = Array.isArray(sensors.bumper_segments) ? sensors.bumper_segments[i] : undefined
-                  const known = typeof seg === 'boolean'
-                  return <SensorRow key={id} id={`bumper-${id}`} name={`Бампер · ${name}`}
-                    value={reading(known ? (seg ? 'Нажат' : 'Свободен') : null, seg ? 'alert' : '')} />
-                })}
-                <tr><td>Стена</td><td id="wall" className={pair(sensors.wall_ir, sensors.wall_voltages?.[0]) ? '' : 'missing'}>{pair(sensors.wall_ir, sensors.wall_voltages?.[0]) ?? 'нет данных'}</td></tr>
-                <tr className="group"><td colSpan="2">Обрыв · расстояние / напряжение</td></tr>
-                {[0, 1, 2, 3].map((i) => {
-                  const v = pair(sensors.cliff_ranges?.[i], sensors.cliff_ir?.[i])
-                  return <SensorRow key={i} id={`cliff-${i}`} name={`ИК ${i + 1}`} value={reading(v, '')} />
-                })}
-                <tr className="group"><td colSpan="2">Отрыв колёс · расстояние / напряжение</td></tr>
-                {[0, 1].map((i) => {
-                  const v = pair(sensors.drop_ranges?.[i], sensors.drop_ir?.[i])
-                  return <SensorRow key={i} id={`drop-${i}`} name={`ИК ${i + 1}`} value={reading(v, '')} />
-                })}
-                <tr><td>Компас</td><td id="compass" className={Number.isFinite(compassAngle) ? '' : 'missing'}>
-                  {Number.isFinite(compassAngle) ? `${fmt(compassAngle, 3)} рад · ${fmt(compassAngle * 180 / Math.PI, 1)}°` : 'нет данных'}
-                </td></tr>
-                <tr><td>Сонар</td><td id="sonar" className={Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? 'alert' : '') : 'missing'}>
-                  {Number.isFinite(sensors.sonar) ? (sensors.sonar > 65 ? '65.534 м · sentinel' : `${fmt(sensors.sonar, 3)} м`) : 'нет данных'}
-                </td></tr>
-              </tbody></table>
-              </div>
+                <div className="robot-panel">
+                  <RobotDiagram sensors={sensors} />
+                  <div className="status-badges">
+                    <span id="battery" className={`status-badge ${batteryText === null ? 'unknown' : battery?.charging ? 'charging' : ''}`} aria-label="Батарея">
+                      <svg className="badge-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="7" width="18" height="10" rx="2" fill="none" stroke="currentColor" strokeWidth="2"/><rect x="20" y="10" width="2" height="4" fill="currentColor"/><rect x="4" y="9" width="7" height="6" fill="currentColor" opacity=".6"/></svg>
+                      <span className="badge-value">{batteryText ?? '—'}</span>
+                    </span>
+                    <span id="dock" className={`status-badge ${typeof sensors.dock !== 'boolean' ? 'unknown' : sensors.dock ? 'docked' : ''}`} aria-label="Док">
+                      <svg className="badge-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v8M8 6l4 4 4-4M5 12v6a2 2 0 002 2h10a2 2 0 002-2v-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                      <span className="badge-value">{typeof sensors.dock === 'boolean' ? (sensors.dock ? 'На доке' : 'Вне дока') : '—'}</span>
+                    </span>
+                    <span id="bumper" className={`status-badge ${!sensors.bumper ? 'unknown' : sensors.bumper === 'PRESSED' ? 'alert' : ''}`} aria-label="Бампер общий">
+                      <svg className="badge-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2"/><path d="M8 12h8M12 8v8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+                      <span className="badge-value">{sensors.bumper ? (sensors.bumper === 'PRESSED' ? 'Контакт' : 'Свободен') : '—'}</span>
+                    </span>
+                  </div>
+                </div>
+                <div className="instruments-panel">
+                  <div className="instruments-grid">
+                    <OrientationInstruments compass={compass} gyro={sensors.service_channels?.['position3d:0']} />
+                    <OdometryInstruments odom={odom} />
+                  </div>
+                </div>
               </div>
             )}
-            {!collapsed.sensors && <p className="sensor-note">Сырые показания, калибровка не подтверждена. Нули ИК не означают безопасность; 65.534 м сонара — sentinel. Последний кадр не гарантирует свежесть.</p>}
           </section>
         </aside>
       </main>

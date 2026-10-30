@@ -8,6 +8,21 @@ import { resolve } from 'node:path'
 import { readFileSync } from 'node:fs'
 import config from '../vite.config.js'
 
+// FEATURE: expanded chassis panel scales its instruments to use available space.
+// SPEC: larger bounded gauges, robot diagram and status badges apply only to the expanded panel.
+it('provides a responsive expanded sensor layout', () => {
+  const css = readFileSync(resolve(import.meta.dirname, '../src/styles.css'), 'utf8')
+  expect(css).toMatch(/\.sensors\.is-expanded\s+\.instruments-grid\s+\.instrument\s+svg\s*\{[^}]*clamp\(/)
+  expect(css).toMatch(/\.sensors\.is-expanded\s+\.robot-diagram\s+svg\s*\{[^}]*max-width:/)
+})
+
+// FEATURE: changing motor or speed values must not move adjacent controls.
+it('reserves space for changing control values', () => {
+  const css = readFileSync(resolve(import.meta.dirname, '../src/styles.css'), 'utf8')
+  expect(css).toMatch(/\.motors-footer\s+\.motor-control\s+b\s*\{[^}]*min-width:/)
+  expect(css).toMatch(/footer\s+\.speed\s+b\s*\{[^}]*min-width:/)
+})
+
 it('does not request a separate favicon asset', () => {
   const html = readFileSync(resolve(import.meta.dirname, '../index.html'), 'utf8')
   expect(html).not.toMatch(/href="\/(?!\/)/)
