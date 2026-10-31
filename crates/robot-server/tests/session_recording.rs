@@ -5,7 +5,7 @@
 // and independent latest-only snapshots/authenticated camera capture.
 // RESULT: IMPLEMENTED — focused tests cover privacy, loss, clocks, limits and cleanup.
 // STATUS: DONE
-use robot_server::session_recording::{Jpegs, Session};
+use robot_server::session_recording::{JpegStream, Session};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -367,9 +367,14 @@ fn independent_empty_sensor_and_camera_status_is_not_success() {
     assert_eq!(report["complete"], false);
     assert_eq!(report["raw_player"]["status"], "unavailable");
 }
+// DEDUP (issue #51): one bounded MJPEG extractor serves both session
+// recording (with an honest oversize drop counter) and vision capture.
+// SPEC: fragmented markers resynchronize, several frames per feed are
+// returned in order, garbage without a start marker never accumulates,
+// oversize frames drop with a count, and the parser recovers afterwards.
 #[test]
 fn fragmented_mjpeg_is_bounded_and_reports_oversize() {
-    let mut p = Jpegs::default();
+    let mut p = JpegStream::default();
     assert!(p.feed(b"--frame\r\n\xff").is_empty());
     assert!(p.feed(b"\xd8one\xff").is_empty());
     assert_eq!(
@@ -383,4 +388,40 @@ fn fragmented_mjpeg_is_bounded_and_reports_oversize() {
     big.resize(2 * 1024 * 1024 + 10, 1);
     assert!(p.feed(&big).is_empty());
     assert_eq!(p.dropped, 1);
+    assert!(p.buffered() <= 2 * 1024 * 1024);
+    // Recovery: a well-formed frame still decodes after the oversize drop.
+    assert_eq!(
+        p.feed(b"\xff\xd8next\xff\xd9"),
+        vec![b"\xff\xd8next\xff\xd9".to_vec()]
+    );
+    assert_eq!(p.dropped, 1);
+}
+
+// SPEC: the memory bound holds for garbage without any start marker too —
+// the residue is trimmed continuously, not only when a frame completes.
+#[test]
+fn markerless_garbage_stays_bounded_and_drops_once() {
+    let mut p = JpegStream::default();
+    let garbage = vec![7u8; 2 * 1024 * 1024 + 100];
+    assert!(p.feed(&garbage).is_empty());
+    assert!(p.buffered() <= 2 * 1024 * 1024);
+    assert!(p.dropped <= 1);
+}
+
+// SPEC: a huge feed splitting one frame is chunk-processed internally and
+// never accumulates more than the limit, whatever chunk size the caller has.
+#[test]
+fn oversized_single_frame_split_across_chunks_drops_and_stays_bounded() {
+    let mut p = JpegStream::default();
+    let mut big = vec![0xff, 0xd8];
+    big.resize(2 * 1024 * 1024 + 10, 1);
+    for piece in big.chunks(65536) {
+        assert!(p.feed(piece).is_empty());
+        assert!(p.buffered() <= 2 * 1024 * 1024);
+    }
+    assert_eq!(p.dropped, 1);
+    assert_eq!(
+        p.feed(b"\xff\xd8ok\xff\xd9"),
+        vec![b"\xff\xd8ok\xff\xd9".to_vec()]
+    );
 }

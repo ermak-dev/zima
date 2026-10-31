@@ -22,11 +22,8 @@ fn unknown(status: &str) -> Value {
     json!({"source":"st480-evdev", "calibrated":false, "frame":"sensor",
         "x":null, "y":null, "z":null, "yaw":null, "stamp":null, "status":status})
 }
-fn publish(states: &watch::Sender<Value>, sample: Value) {
-    states.send_modify(|state| {
-        state["compass"] = sample.clone();
-        state["sensors"]["compass"] = sample;
-    });
+fn publish(states: &watch::Sender<crate::state::State>, sample: Value) {
+    states.send_modify(|state| state.set_compass(sample));
 }
 fn sample(line: &str) -> Option<Value> {
     let mut fields = line.split_whitespace();
@@ -65,7 +62,7 @@ async fn line(reader: &mut BufReader<TcpStream>) -> Result<String, Failure> {
 async fn receive(
     address: &str,
     token: &str,
-    states: &watch::Sender<Value>,
+    states: &watch::Sender<crate::state::State>,
 ) -> Result<&'static str, Failure> {
     let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(address)).await??;
     audio::authenticate(&mut stream, token).await?;
@@ -96,7 +93,7 @@ async fn receive(
         publish(states, sample);
     }
 }
-pub fn start(states: watch::Sender<Value>) -> Option<CompassTask> {
+pub fn start(states: watch::Sender<crate::state::State>) -> Option<CompassTask> {
     let address = std::env::var("ROBOT_SUPERVISOR_ADDR").ok()?;
     let token = std::env::var("ROBOT_SUPERVISOR_TOKEN").unwrap_or_default();
     Some(CompassTask(tokio::spawn(async move {

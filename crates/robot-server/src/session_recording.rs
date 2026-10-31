@@ -401,7 +401,7 @@ where
             }
         };
         let mut bytes = response.bytes_stream();
-        let mut parser = Jpegs::default();
+        let mut parser = JpegStream::default();
         let mut total = 0usize;
         let deadline = tokio::time::Instant::now() + MAX_DURATION;
         loop {
@@ -484,27 +484,51 @@ fn bounded_snapshot(value: &Value, budget: &mut usize, depth: usize) -> Option<V
         _ => value.clone(),
     })
 }
-/// Marker-based extraction, bounded even with fragmented hostile MJPEG bodies.
+/// Marker-based MJPEG extraction, bounded even with fragmented hostile
+/// bodies. Shared by session recording (which reads `dropped` for its
+/// honest loss accounting) and vision capture (issue #51 dedup).
 #[derive(Default)]
-pub struct Jpegs {
+pub struct JpegStream {
     buffer: Vec<u8>,
     pub dropped: u64,
 }
-impl Jpegs {
+impl JpegStream {
+    /// Feed one body chunk (of any size; large inputs are chunked
+    /// internally) and return every complete SOI..EOI frame it closes.
+    /// A frame exceeding `JPEG` bytes is discarded and counted in `dropped`;
+    /// the buffer never grows past `JPEG` plus one chunk.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
-        for &b in bytes {
-            self.buffer.push(b);
-            if self.buffer.len() == 2 && self.buffer != [0xff, 0xd8] {
-                self.buffer.remove(0);
-            }
-            if self.buffer.len() > JPEG {
-                self.buffer.clear();
-                self.dropped += 1;
-            } else if self.buffer.len() >= 4 && self.buffer.ends_with(&[0xff, 0xd9]) {
-                frames.push(std::mem::take(&mut self.buffer));
+        for bytes in bytes.chunks(65536) {
+            self.buffer.extend_from_slice(bytes);
+            loop {
+                let Some(start) = self.buffer.windows(2).position(|p| p == [0xff, 0xd8]) else {
+                    if self.buffer.len() > 1 {
+                        self.buffer.drain(..self.buffer.len() - 1);
+                    }
+                    break;
+                };
+                self.buffer.drain(..start);
+                if let Some(end) = self.buffer[2..].windows(2).position(|p| p == [0xff, 0xd9]) {
+                    let end = end + 4;
+                    if end <= JPEG {
+                        frames.push(self.buffer[..end].to_vec());
+                    }
+                    self.buffer.drain(..end);
+                } else {
+                    if self.buffer.len() > JPEG {
+                        self.buffer.clear();
+                        self.dropped += 1;
+                    }
+                    break;
+                }
             }
         }
         frames
+    }
+    /// Bytes currently held for a not-yet-complete frame (test hook for
+    /// the memory bound; always at most `JPEG`).
+    pub fn buffered(&self) -> usize {
+        self.buffer.len()
     }
 }

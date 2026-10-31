@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
+use robot_server::session_recording::JpegStream;
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
@@ -24,44 +25,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-const JPEG_LIMIT: usize = 2 * 1024 * 1024;
 const REPLY_LIMIT: usize = 65536;
 const MAX_AGE: Duration = Duration::from_secs(3);
-
-#[derive(Default)]
-struct JpegParser {
-    buffer: Vec<u8>,
-}
-impl JpegParser {
-    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut frames = Vec::new();
-        for bytes in bytes.chunks(65536) {
-            self.buffer.extend_from_slice(bytes);
-            loop {
-                let Some(start) = self.buffer.windows(2).position(|p| p == [0xff, 0xd8]) else {
-                    if self.buffer.len() > 1 {
-                        self.buffer.drain(..self.buffer.len() - 1);
-                    }
-                    break;
-                };
-                self.buffer.drain(..start);
-                if let Some(end) = self.buffer[2..].windows(2).position(|p| p == [0xff, 0xd9]) {
-                    let end = end + 4;
-                    if end <= JPEG_LIMIT {
-                        frames.push(self.buffer[..end].to_vec());
-                    }
-                    self.buffer.drain(..end);
-                } else {
-                    if self.buffer.len() > JPEG_LIMIT {
-                        self.buffer.clear();
-                    }
-                    break;
-                }
-            }
-        }
-        frames
-    }
-}
 
 fn validate_reply(frame_id: u64, value: Value) -> Result<Value, Failure> {
     if value["ok"] != true || value["frame_id"].as_u64() != Some(frame_id) {
@@ -185,7 +150,7 @@ async fn capture(
         let stream = camera.stream().await;
         if let Ok(response) = stream {
             let mut bytes = response.bytes_stream();
-            let mut parser = JpegParser::default();
+            let mut parser = JpegStream::default();
             while let Ok(Some(Ok(chunk))) =
                 tokio::time::timeout(Duration::from_secs(5), bytes.next()).await
             {
@@ -346,6 +311,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Same bound the shared parser enforces (session_recording::JPEG).
+    const JPEG_LIMIT: usize = 2 * 1024 * 1024;
+
     // FEATURE: bounded subprocess lifecycle for optional inference.
     // SPEC: hung/oversized replies fail promptly and do not leave a child.
     #[tokio::test]
@@ -463,7 +431,7 @@ for line in sys.stdin:
     // SPEC: fragmented JPEGs round-trip; invalid coordinates, IDs and sizes fail.
     #[test]
     fn fragmented_jpegs_ignore_multipart_and_resynchronize() {
-        let mut parser = JpegParser::default();
+        let mut parser = JpegStream::default();
         assert!(parser.feed(b"--frame\r\nheaders\r\n\xff").is_empty());
         assert!(parser.feed(b"\xd8one\xff").is_empty());
         assert_eq!(
@@ -475,7 +443,7 @@ for line in sys.stdin:
         );
         let garbage = vec![7; JPEG_LIMIT + 100];
         assert!(parser.feed(&garbage).is_empty());
-        assert!(parser.buffer.len() <= JPEG_LIMIT);
+        assert!(parser.buffered() <= JPEG_LIMIT);
     }
 
     fn reply() -> Value {

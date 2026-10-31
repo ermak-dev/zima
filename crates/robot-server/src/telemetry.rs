@@ -3,6 +3,7 @@ use player_bridge::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
 pub struct Telemetry {
     fields: BTreeMap<String, Value>,
 }
@@ -64,19 +65,15 @@ impl Telemetry {
         out["sensors"] = sensors;
         out
     }
-    pub fn update(&mut self, msg: &Message) -> Result<bool, Failure> {
-        let p = &msg.payload;
-        let a = msg.header.addr;
-        if msg.header.msg_type != MSGTYPE_DATA || msg.header.subtype != 1 {
-            return Ok(false);
-        }
-        match (a.interf, a.index) {
-            (POSITION2D_CODE, 0) => {
-                let s = decode_position2d(p)?;
+    /// Apply one already-decoded sensor frame (issue #51: every DATA message
+    /// is decoded once by the caller; telemetry only serializes). Returns
+    /// false for frames that do not map to a published field.
+    pub fn update(&mut self, data: &PlayerData, stamp: f64) -> Result<bool, Failure> {
+        match data {
+            PlayerData::Position2d(s) => {
                 self.fields.insert("odom".into(),json!({"x":rounded(s.x,3),"y":rounded(s.y,3),"yaw":rounded(s.yaw,3),"vx":rounded(s.vx,2),"yaw_rate":rounded(s.vyaw,2)}));
             }
-            (BUMPER_CODE, 0) => {
-                let s = decode_bumper(p)?;
+            PlayerData::Bumper(s) => {
                 // Aggregate keeps the safety/panel contract; the per-segment
                 // flags (vendor: Left/Front/Right) ride along as inventory.
                 self.fields.insert(
@@ -96,9 +93,8 @@ impl Telemetry {
                     },
                 );
             }
-            (IR_CODE, 0..=2) => {
-                let s = decode_ir(p)?;
-                if a.index == 0 {
+            PlayerData::Ir(a, s) => {
+                if *a == 0 {
                     self.fields.insert(
                         "wall_ir".into(),
                         s.ranges
@@ -108,33 +104,37 @@ impl Telemetry {
                     );
                     self.fields
                         .insert("wall_voltages".into(), values(&s.voltages));
-                } else {
-                    let name = if a.index == 1 { "cliff" } else { "drop" };
+                } else if *a == 1 || *a == 2 {
+                    let name = if *a == 1 { "cliff" } else { "drop" };
                     self.fields
                         .insert(format!("{name}_ir"), values(&s.voltages));
                     self.fields
                         .insert(format!("{name}_ranges"), values(&s.ranges));
+                } else if matches!(a, 3 | 4 | 6 | 7 | 8) {
+                    self.fields.insert(
+                        format!("ir:{}", a),
+                        json!({
+                            "voltages": values(&s.voltages),
+                            "ranges": values(&s.ranges),
+                            "stamp": if stamp > 0. { rounded(stamp, 6) } else { Value::Null },
+                        }),
+                    );
+                } else {
+                    return Ok(false);
                 }
             }
-            (IR_CODE, 3 | 4 | 6 | 7 | 8) => {
-                let s = decode_ir(p)?;
-                self.fields.insert(format!("ir:{}", a.index), json!({
-                    "voltages": values(&s.voltages),
-                    "ranges": values(&s.ranges),
-                    "stamp": if msg.header.timestamp > 0. { rounded(msg.header.timestamp, 6) } else { Value::Null },
-                }));
+            PlayerData::Position3d(a, s) => {
+                self.fields.insert(
+                    format!("position3d:{}", a),
+                    json!({
+                        "pos": s.pos.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
+                        "vel": s.vel.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
+                        "stall": s.stall,
+                        "stamp": if stamp > 0. { rounded(stamp, 6) } else { Value::Null },
+                    }),
+                );
             }
-            (POSITION3D_CODE, 0 | 1 | 2 | 4) => {
-                let s = decode_position3d(p)?;
-                self.fields.insert(format!("position3d:{}", a.index), json!({
-                    "pos": s.pos.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
-                    "vel": s.vel.iter().map(|v| rounded(*v, 6)).collect::<Vec<_>>(),
-                    "stall": s.stall,
-                    "stamp": if msg.header.timestamp > 0. { rounded(msg.header.timestamp, 6) } else { Value::Null },
-                }));
-            }
-            (SONAR_CODE, 0) => {
-                let s = decode_sonar(p)?;
+            PlayerData::Sonar(s) => {
                 self.fields.insert(
                     "sonar".into(),
                     s.ranges
@@ -143,8 +143,7 @@ impl Telemetry {
                         .unwrap_or(Value::Null),
                 );
             }
-            (POWER_CODE, 0) => {
-                let s = decode_power(p)?;
+            PlayerData::Power(s) => {
                 // Valid bits are authoritative for each frame: never retain an earlier
                 // reading where the new frame says unknown. No current is synthesized.
                 self.fields.insert("battery".into(),json!({"percent":if s.valid&8!=0 && s.percent.is_finite() && (0.0..=100.0).contains(&s.percent){json!((s.percent as f64).round() as i64)}else{Value::Null},"volts":if s.valid&1!=0 && s.volts>0.0{rounded(s.volts as f64,1)}else{Value::Null},"charging":if s.valid&16!=0 && matches!(s.charging,0|1){json!(s.charging==1)}else{Value::Null}}));
@@ -160,13 +159,12 @@ impl Telemetry {
                     },
                 );
             }
-            _ => return Ok(false),
+            PlayerData::ScanAngle(_) => return Ok(false),
         }
         Ok(true)
     }
 }
-pub fn scan(msg: &Message) -> Result<Option<Value>, Failure> {
-    let s = decode_laser_scanangle(&msg.payload)?;
+pub fn scan_value(s: &LaserScanAngle, stamp: f64) -> Result<Option<Value>, Failure> {
     if s.ranges.len() != s.angles.len() {
         return Err("scan bearing/range count mismatch".into());
     }
@@ -193,8 +191,8 @@ pub fn scan(msg: &Message) -> Result<Option<Value>, Failure> {
         })
         .collect();
     let mut out = json!({"id":s.id,"points":points,"range_max":s.max_range,"frame":"base_link"});
-    if msg.header.timestamp.is_finite() && msg.header.timestamp > 0. {
-        out["stamp"] = json!(msg.header.timestamp);
+    if stamp.is_finite() && stamp > 0. {
+        out["stamp"] = json!(stamp);
     }
     Ok(Some(out))
 }
@@ -244,13 +242,15 @@ mod tests {
         payload.extend(41u32.to_be_bytes());
         let mut message = data(LASER_CODE, payload);
         message.header.subtype = LASER_DATA_SCANANGLE;
-        let rendered = scan(&message).unwrap().unwrap();
+        let decoded = decode_laser_scanangle(&message.payload).unwrap();
+        let rendered = scan_value(&decoded, message.header.timestamp)
+            .unwrap()
+            .unwrap();
         let points = rendered["points"].as_array().unwrap();
         assert!((points[0][0].as_f64().unwrap() - 0.9).abs() < 1e-6);
         assert!(points[0][1].as_f64().unwrap().abs() < 1e-6);
         assert!((points[1][0].as_f64().unwrap() + 0.1).abs() < 1e-6);
         assert!((points[1][1].as_f64().unwrap() - 2.).abs() < 1e-6);
-        let decoded = decode_laser_scanangle(&message.payload).unwrap();
         let observation = crate::slam::Observation::from_scan(&decoded, None);
         assert!(observation.angles[0].abs() < 1e-6);
         assert!((observation.angles[1] - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
@@ -277,14 +277,19 @@ mod tests {
             }
             let mut m = data(IR_CODE, p);
             m.header.addr.index = index;
-            m.header.timestamp = 42.;
-            assert!(t.update(&m).unwrap());
+            let frame = decode_data(&m).unwrap().unwrap();
+            let PlayerData::Ir(a, _) = &frame else {
+                panic!("expected decoded ir frame");
+            };
+            assert_eq!(*a, index);
+            assert!(t.update(&frame, 42.).unwrap());
             assert_eq!(
                 t.json()["sensors"]["service_channels"][&key],
                 json!({"voltages":[0.,2.,null],"ranges":[17.],"stamp":42.})
             );
             m.payload = vec![0; 16];
-            t.update(&m).unwrap();
+            let frame = decode_data(&m).unwrap().unwrap();
+            t.update(&frame, 0.).unwrap();
             assert_eq!(
                 t.json()["sensors"]["service_channels"][&key]["ranges"],
                 json!([])
@@ -292,7 +297,7 @@ mod tests {
         }
         let mut m = data(IR_CODE, vec![0; 16]);
         m.header.addr.index = 5;
-        assert!(!t.update(&m).unwrap());
+        assert!(!t.update(&decode_data(&m).unwrap().unwrap(), 0.).unwrap());
     }
 
     #[test]
@@ -306,7 +311,8 @@ mod tests {
             p.extend(1u32.to_be_bytes());
             let mut m = data(POSITION3D_CODE, p);
             m.header.addr.index = index;
-            assert!(t.update(&m).unwrap());
+            let frame = decode_data(&m).unwrap().unwrap();
+            assert!(t.update(&frame, 0.).unwrap());
             assert_eq!(
                 t.json()["sensors"]["service_channels"][format!("position3d:{index}")],
                 json!({"pos":[1.,2.,3.,0.1,0.2,0.3],"vel":[4.,5.,6.,0.4,0.5,null],"stall":true,"stamp":null})
@@ -328,7 +334,8 @@ mod tests {
             m.payload[..8].copy_from_slice(&f64::to_be_bytes(x));
             m.payload[40..48].copy_from_slice(&yaw.to_be_bytes());
             m.header.timestamp = 50.;
-            t.update(&m).unwrap();
+            let frame = decode_data(&m).unwrap().unwrap();
+            t.update(&frame, m.header.timestamp).unwrap();
             let state = t.json();
             assert!(state["sensors"]["compass"].is_null());
             assert!(state.get("compass").is_none());
@@ -359,7 +366,9 @@ mod tests {
             }
             p.extend(charging.to_be_bytes());
             let mut t = Telemetry::new();
-            t.update(&data(POWER_CODE, p)).unwrap();
+            let m = data(POWER_CODE, p);
+            let frame = decode_data(&m).unwrap().unwrap();
+            t.update(&frame, 0.).unwrap();
             assert_eq!(
                 t.json()["battery"],
                 json!({"percent":null,"volts":null,"charging":null})
@@ -375,7 +384,9 @@ mod tests {
             p.extend(1u32.to_be_bytes());
             p.extend(v.to_be_bytes());
         }
-        t.update(&data(IR_CODE, p)).unwrap();
+        let m = data(IR_CODE, p);
+        let frame = decode_data(&m).unwrap().unwrap();
+        t.update(&frame, 0.).unwrap();
         let v = t.json();
         assert!(
             v.get("wall_voltages").is_none(),
@@ -391,7 +402,8 @@ mod tests {
             m.header.timestamp = stamp;
             m.payload.extend(6f32.to_be_bytes());
             m.payload.extend([0; 28]);
-            let v = scan(&m).unwrap().unwrap();
+            let decoded = decode_laser_scanangle(&m.payload).unwrap();
+            let v = scan_value(&decoded, m.header.timestamp).unwrap().unwrap();
             assert_eq!(v["id"], 0, "decoded scan identity must be preserved");
             assert_eq!(v["points"], json!([]));
             assert!(v.get("stamp").is_none());

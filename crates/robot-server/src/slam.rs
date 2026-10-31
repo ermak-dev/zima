@@ -516,6 +516,7 @@ impl Drop for ObservationSender {
 }
 pub struct SlamThread {
     pub observe: ObservationSender,
+    pub maps: tokio::sync::watch::Receiver<Value>,
 }
 impl SlamThread {
     pub fn start(
@@ -545,10 +546,15 @@ impl SlamThread {
         let observe = ObservationSender {
             shared: shared.clone(),
         };
+        // The grid leaves the frequent state channel: only changed versions
+        // are published here, the state carries just the version counter.
+        let (maps, maps_rx) = tokio::sync::watch::channel(Value::Null);
+        let maps_thread = maps.clone();
         std::thread::spawn(move || {
             let mut core = SlamCore::new(adapter, mapping);
             let mut last: Option<(Observation, Value)> = None;
             let mut last_map: Option<Value> = None;
+            let mut map_version: u64 = 0;
             let mut count = 0;
             loop {
                 let (lock, wake) = &*shared;
@@ -575,15 +581,18 @@ impl SlamThread {
                     count += 1;
                     if count % 10 == 1 && !core.failed {
                         if let Some(map) = core.fetch_map() {
+                            if last_map.as_ref() != Some(&map) {
+                                map_version += 1;
+                                let _ = maps_thread
+                                    .send_replace(json!({"version": map_version, "grid": map}));
+                            }
                             last_map = Some(map);
                         }
                         if core.failed {
                             state = core.state_json(None);
                         }
                     }
-                    if let Some(map) = &last_map {
-                        state["map"] = map.clone();
-                    }
+                    state["map_version"] = json!(map_version);
                     last = Some((obs, state));
                 }
                 if let Some((obs, state)) = &mut last {
@@ -620,7 +629,10 @@ impl SlamThread {
                 }
             }
         });
-        Ok(Self { observe })
+        Ok(Self {
+            observe,
+            maps: maps_rx,
+        })
     }
 }
 
