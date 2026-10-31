@@ -35,6 +35,70 @@ struct Config {
     owner: Mutex<()>,
     clients: AtomicUsize,
     stopping: AtomicBool,
+    // Bounded local drive lease (#55): one active deadline at a time; the
+    // zero is sent by the supervisor thread itself, never by the host.
+    drive: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+}
+
+impl Config {
+    fn drive_lease(&self) -> Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>> {
+        self.drive.clone()
+    }
+}
+
+/// Send a velocity command to the local Player. Best-effort: failures are
+/// logged by the caller; the deadline/stop logic never depends on the
+/// network beyond the robot itself.
+fn send_velocity(r: &Rollback, vx: f64, vyaw: f64) -> Result<(), String> {
+    let mut client = player_bridge::Client::connect(&r.player_host, r.player_port)
+        .map_err(|e| format!("cannot reach Player: {e}"))?;
+    client
+        .send_velocity(0, vx, vyaw, 1)
+        .map_err(|e| format!("velocity write failed: {e}"))
+}
+
+/// Validate a bounded DRIVE request. Returns None for a malformed line.
+fn parse_drive(request: &str) -> Option<(f64, f64, u64)> {
+    let fields: Vec<&str> = request.split_whitespace().collect();
+    if fields.len() != 4 || fields[0] != "DRIVE" {
+        return None;
+    }
+    let vx: f64 = fields[1].parse().ok()?;
+    let vyaw: f64 = fields[2].parse().ok()?;
+    let ms: u64 = fields[3].parse().ok()?;
+    if !vx.is_finite() || !vyaw.is_finite() || ms == 0 || ms > 60_000 {
+        return None;
+    }
+    // Reuse the shared chassis ceilings; they are clamped, not rejected, so
+    // the panel's slider ranges keep working.
+    let (vx, vyaw) = player_bridge::drive::clamp_velocity(vx, vyaw);
+    Some((vx, vyaw, ms))
+}
+
+/// Execute a bounded drive: send the velocity, acknowledge the caller, then
+/// hold the lease until STOP or the local deadline, then send the zero. The
+/// zero is always attempted by this local thread, never by the host.
+fn run_bounded_drive(
+    rollback: &Rollback,
+    drive: &Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    vx: f64,
+    vyaw: f64,
+    ms: u64,
+    ack: std::sync::mpsc::Sender<bool>,
+) -> bool {
+    if send_velocity(rollback, vx, vyaw).is_err() {
+        let _ = ack.send(false);
+        return false;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    *drive.lock().unwrap() = Some(tx);
+    let _ = ack.send(true);
+    // Hold the lease on this thread: STOP wakes the channel, the deadline
+    // bounds the wait. Either way the local zero follows.
+    let _cancelled = rx.recv_timeout(Duration::from_millis(ms)).is_ok();
+    drive.lock().unwrap().take();
+    let _ = send_velocity(rollback, 0.0, 0.0);
+    true
 }
 
 fn main() {
@@ -112,6 +176,7 @@ fn main() {
         owner: Mutex::new(()),
         clients: AtomicUsize::new(0),
         stopping: AtomicBool::new(false),
+        drive: Arc::new(Mutex::new(None)),
     });
     let listener = TcpListener::bind((listen.as_str(), heartbeat_port)).unwrap_or_else(|e| {
         eprintln!("robot-supervisor: cannot listen on {heartbeat_port}: {e}");
@@ -171,10 +236,14 @@ fn line(conn: &mut TcpStream, deadline: Instant) -> std::io::Result<String> {
 }
 
 fn serve(conn: &mut TcpStream, c: &Config) {
+    // One command per connection, except DRIVE/STOP clients which stay to
+    // issue a bounded sequence of drive commands and finally STOP; each
+    // follow-up line gets a fresh bounded deadline.
     let deadline = Instant::now() + Duration::from_millis(c.activate_timeout_ms.max(1));
     let Ok(mut request) = line(conn, deadline) else {
         return;
     };
+    let mut drive_session = false;
     if let Some(token) = &c.token {
         if request.strip_prefix("AUTH ") != Some(token.as_str()) || token.is_empty() {
             let _ = conn.write_all(b"UNAUTHORIZED\n");
@@ -183,60 +252,115 @@ fn serve(conn: &mut TcpStream, c: &Config) {
         if conn.write_all(b"AUTHENTICATED\n").is_err() {
             return;
         }
-        let Ok(next) = line(conn, deadline) else {
+        let follow = Instant::now() + Duration::from_millis(c.activate_timeout_ms.max(1));
+        let Ok(next) = line(conn, follow) else {
             return;
         };
         request = next;
     }
-    // Accept counts each handler before it can observe this gate. A handler
-    // that saw false is therefore included in SHUTDOWN's final client count;
-    // handlers accepted after that count see true and cannot start any work.
-    if c.stopping.load(Ordering::SeqCst) {
-        let _ = conn.write_all(b"BUSY\n");
-        return;
-    }
-    if request == "SHUTDOWN" {
-        // Unlike legacy commands, shutdown is never available without AUTH.
-        if c.token.is_none() {
-            let _ = conn.write_all(b"UNAUTHORIZED\n");
-            return;
-        }
-        // Only the thread that closes the gate may reopen it on refusal.
-        if c.stopping.swap(true, Ordering::SeqCst) {
+    loop {
+        // Accept counts each handler before it can observe this gate. A
+        // handler that saw false is therefore included in SHUTDOWN's final
+        // client count; handlers accepted after that count see true and
+        // cannot start any work.
+        if c.stopping.load(Ordering::SeqCst) {
             let _ = conn.write_all(b"BUSY\n");
             return;
         }
-        if c.clients.load(Ordering::SeqCst) == 1 {
-            if let Ok(_owner) = c.owner.try_lock() {
-                // Keep the gate and owner lock through process exit. No control
-                // restoration is needed (or permitted) for an idle shutdown.
-                let _ = conn.write_all(b"STOPPING\n");
-                std::process::exit(0);
+        if request == "SHUTDOWN" {
+            // Unlike legacy commands, shutdown is never available without AUTH.
+            if c.token.is_none() {
+                let _ = conn.write_all(b"UNAUTHORIZED\n");
+                return;
             }
-        }
-        c.stopping.store(false, Ordering::SeqCst);
-        let _ = conn.write_all(b"BUSY\n");
-    } else if request == "PING" {
-        let reply: &[u8] = if c.owner.try_lock().is_ok() {
-            b"PONG IDLE\n"
-        } else {
-            b"PONG ACTIVE\n"
-        };
-        let _ = conn.write_all(reply);
-    } else if request == "COMPASS" {
-        compass::observe(conn);
-    } else if request == "ACTIVATE" {
-        let Ok(_owner) = c.owner.try_lock() else {
+            // Only the thread that closes the gate may reopen it on refusal.
+            if c.stopping.swap(true, Ordering::SeqCst) {
+                let _ = conn.write_all(b"BUSY\n");
+                return;
+            }
+            if c.clients.load(Ordering::SeqCst) == 1 {
+                if let Ok(_owner) = c.owner.try_lock() {
+                    // Keep the gate and owner lock through process exit. No control
+                    // restoration is needed (or permitted) for an idle shutdown.
+                    let _ = conn.write_all(b"STOPPING\n");
+                    std::process::exit(0);
+                }
+            }
+            c.stopping.store(false, Ordering::SeqCst);
             let _ = conn.write_all(b"BUSY\n");
+        } else if request == "PING" {
+            let reply: &[u8] = if c.owner.try_lock().is_ok() {
+                b"PONG IDLE\n"
+            } else {
+                b"PONG ACTIVE\n"
+            };
+            let _ = conn.write_all(reply);
+        } else if request == "COMPASS" {
+            compass::observe(conn);
+        } else if request == "ACTIVATE" {
+            let Ok(_owner) = c.owner.try_lock() else {
+                let _ = conn.write_all(b"BUSY\n");
+                return;
+            };
+            control(conn, c);
+        } else if request.starts_with("AUDIO ") {
+            audio::play(conn, &request.split_whitespace().collect::<Vec<_>>());
+        } else if let Some(token) = request.strip_prefix("CANCEL ") {
+            audio::cancel(conn, token);
+        } else if request.starts_with("DRIVE") {
+            drive_session = true;
+            match parse_drive(&request) {
+                Some((vx, vyaw, ms)) => {
+                    // One bounded drive at a time: a second lease is refused,
+                    // not queued; the session stays open for STOP.
+                    if c.drive.lock().unwrap().is_some() {
+                        let _ = conn.write_all(b"DRIVE_BUSY\n");
+                    } else {
+                        // The velocity write is confirmed before DRIVING; the deadline
+                        // then runs on its own thread so STOP keeps this connection.
+                        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<bool>();
+                        let rollback = c.rollback.clone();
+                        let drive = c.drive_lease();
+                        let _holder = std::thread::spawn(move || {
+                            run_bounded_drive(&rollback, &drive, vx, vyaw, ms, ack_tx);
+                        });
+                        match ack_rx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(true) => {
+                                let _ = conn.write_all(b"DRIVING\n");
+                            }
+                            _ => {
+                                let _ = conn.write_all(b"DRIVE_FAILED\n");
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let _ = conn.write_all(b"INVALID_DRIVE\n");
+                }
+            }
+        } else if request == "STOP" {
+            drive_session = true;
+            if let Some(tx) = c.drive.lock().unwrap().take() {
+                // Waking the holder is enough: it owns the local zero send.
+                let _ = tx.send(());
+            }
+            let _ = send_velocity(&c.rollback, 0.0, 0.0);
+            let _ = conn.write_all(b"STOPPED\n");
+        } else if request == "QUIT" {
             return;
-        };
-        control(conn, c);
-    } else if request.starts_with("AUDIO ") {
-        audio::play(conn, &request.split_whitespace().collect::<Vec<_>>());
-    } else if let Some(token) = request.strip_prefix("CANCEL ") {
-        audio::cancel(conn, token);
-    } else {
-        let _ = conn.write_all(b"REFUSED\n");
+        } else {
+            let _ = conn.write_all(b"REFUSED\n");
+        }
+        // Only drive sessions keep the command loop; one-shot clients
+        // (ACTIVATE/AUDIO/COMPASS/SHUTDOWN) retain their original semantics.
+        if !drive_session {
+            return;
+        }
+        let follow = Instant::now() + Duration::from_millis(c.activate_timeout_ms.max(1));
+        match line(conn, follow) {
+            Ok(next) => request = next,
+            Err(_) => return,
+        }
     }
 }
 
