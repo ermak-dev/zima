@@ -21,6 +21,11 @@ impl Safety {
         }
     }
 
+    /// The exclusive control owner shared by wheel and cleaning-motor commands.
+    pub fn owner(&self) -> Option<u64> {
+        self.owner
+    }
+
     pub fn is_blocked(&self) -> bool {
         self.blocked
     }

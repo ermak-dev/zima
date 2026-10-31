@@ -603,7 +603,10 @@ async fn frame(w: &mut Ws, kind: &str) -> Value {
             if let Ok(s) = m.to_text() {
                 let v: Value = serde_json::from_str(s).unwrap();
                 assert!(
-                    matches!(v["type"].as_str(), Some("state" | "scan" | "vision")),
+                    matches!(
+                        v["type"].as_str(),
+                        Some("state" | "scan" | "vision" | "map")
+                    ),
                     "unexpected frame {v}"
                 );
                 if v["type"] == "vision" {
@@ -1628,6 +1631,68 @@ fn rand_suffix() -> u64 {
 // IMPLEMENTATION: same harness, real adapter binary, synthetic room scans.
 // RESULT: IMPLEMENTED — pose error stays under 0.5 m along the path.
 // STATUS: DONE
+// FEATURE: the SLAM map travels in its own versioned WS frame, not in state.
+// SPEC: frequent state/age publishes never re-send an unchanged grid; a new
+// map version is delivered once; a freshly connected viewer gets the current
+// map without waiting for the next change.
+// IMPLEMENTATION: the slam thread publishes (version, grid) on change only;
+// the session sends it as {"type":"map","data":{...}} and on connect.
+// RESULT: IMPLEMENTED — offline fake adapter frames and reconnects verified.
+// STATUS: DONE
+#[tokio::test]
+async fn slam_map_is_a_separate_versioned_frame_never_inside_state() {
+    let dir = std::env::temp_dir().join(format!(
+        "robot-slam-mapframe-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = slam_fake(&dir, 1);
+    let mut s = Session::start(&["--slam-adapter", fake.to_str().unwrap()], None, true).await;
+    let mut w = s.ws().await;
+    s.send(scan_packet(1.0)).await;
+    let first = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut w, "map").await;
+            if v["grid"]["cells"] == "50,-1" {
+                return v.clone();
+            }
+        }
+    })
+    .await
+    .expect("the first map version must arrive as its own frame");
+    let version = first["version"].as_u64().expect("map frame is versioned");
+    // Frequent slam publishes (age updates) and sensor telemetry must never
+    // re-embed the grid into state frames.
+    for _ in 0..4 {
+        s.send(scan_packet(2.0)).await;
+        s.send(bumper(false)).await;
+        let state = frame(&mut w, "state").await;
+        assert!(
+            state["slam"].get("map").is_none(),
+            "state must not carry the grid"
+        );
+        assert!(
+            state["slam"]["map_version"].is_u64(),
+            "state references the current map version"
+        );
+    }
+    // A reconnecting viewer receives the current map immediately.
+    let mut reconnect = s.ws().await;
+    let replay = timeout(WAIT, async {
+        loop {
+            let v = frame(&mut reconnect, "map").await;
+            if v["version"].as_u64().is_some() {
+                return v.clone();
+            }
+        }
+    })
+    .await
+    .expect("reconnect must replay the current map");
+    assert_eq!(replay["version"].as_u64(), Some(version));
+    assert_eq!(replay["grid"]["cells"], "50,-1");
+}
+
 #[tokio::test]
 async fn slam_survives_telemetry_updates_and_streams_map() {
     let dir = std::env::temp_dir().join(format!(
@@ -1658,9 +1723,9 @@ async fn slam_survives_telemetry_updates_and_streams_map() {
     }
     power.extend((-1i32).to_be_bytes());
     s.send(packet(2, 0, 1, 1.2, &power)).await;
-    // The battery publish must keep the slam block AND carry the map that
-    // the first update already fetched (states only publish on change, so
-    // this is also the first frame where both are observable together).
+    // The battery publish must keep the slam block; the map travels in its
+    // own versioned frame (see slam_map_is_a_separate_versioned_frame...),
+    // so the state must reference the version instead of carrying the grid.
     let with_map = timeout(WAIT, async {
         loop {
             let v = frame(&mut w, "state").await;
@@ -1668,16 +1733,21 @@ async fn slam_survives_telemetry_updates_and_streams_map() {
                 let slam = v
                     .get("slam")
                     .expect("telemetry publish wiped the slam state");
-                if slam.get("map").is_some() {
+                if slam.get("map_version").is_some() {
                     return slam.clone();
                 }
             }
         }
     })
     .await
-    .expect("battery telemetry must publish with slam+map intact");
-    assert_eq!(with_map["map"]["w"], 2);
-    assert_eq!(with_map["map"]["cells"], "50,-1");
+    .expect("battery telemetry must publish with slam intact");
+    assert_eq!(with_map["map_version"], 1);
+    // The versioned frame already streamed; replay must return the same grid.
+    let mut reconnect = s.ws().await;
+    let map = frame(&mut reconnect, "map").await;
+    assert_eq!(map["version"], 1);
+    assert_eq!(map["grid"]["w"], 2);
+    assert_eq!(map["grid"]["cells"], "50,-1");
 }
 #[tokio::test]
 #[ignore = "requires tools/mrpt-adapter built with MRPT"]
@@ -2367,6 +2437,94 @@ async fn recording_open_failure_precedes_supervisor_activation() {
     assert!(child.try_wait().unwrap().is_some_and(|s| !s.success()));
     assert_eq!(std::fs::read(&path).unwrap(), b"keep");
     std::fs::remove_file(path).unwrap();
+}
+
+// FEATURE: wheel and cleaning-motor ownership comes from one control owner.
+// SPEC: a client that took the wheels keeps the motors too; a viewer that
+// sends the first motors command while another client owns the wheels is
+// rejected, and owner disconnect/shutdown still zeroes all three motors.
+// IMPLEMENTATION: Safety tracks the exclusive owner; Motors keeps only duties.
+// RESULT: IMPLEMENTED — offline two-client fake Player checks pass.
+// STATUS: DONE
+#[tokio::test]
+async fn motors_follow_the_exclusive_wheel_owner_not_a_separate_one() {
+    let mut s = Session::start(&[], None, true).await;
+    let mut owner = s.ws().await;
+    cmd(&mut owner, r#"{"v":0,"w":0}"#).await;
+    frame(&mut owner, "state").await;
+    // A viewer that never owned the wheels sends the first motors command.
+    let mut viewer = s.ws().await;
+    cmd(
+        &mut viewer,
+        r#"{"type":"motors","fan":70,"main":30,"side":50}"#,
+    )
+    .await;
+    // Let the server process the viewer's command before the owner acts.
+    sleep(Duration::from_millis(300)).await;
+    s.send(bumper(false)).await;
+    frame(&mut viewer, "state").await;
+    // The true owner commands the motors successfully.
+    cmd(
+        &mut owner,
+        r#"{"type":"motors","fan":60,"main":40,"side":80}"#,
+    )
+    .await;
+    s.send(bumper(false)).await;
+    timeout(WAIT, async {
+        loop {
+            if frame(&mut owner, "state").await["motors"]
+                == json!({"fan": 60.0, "main": 40.0, "side": 80.0})
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(owner);
+    s.send(bumper(false)).await;
+    timeout(WAIT, async {
+        loop {
+            let v = frame(&mut viewer, "state").await;
+            assert_ne!(
+                v["motors"],
+                json!({"fan": 70.0, "main": 30.0, "side": 50.0}),
+                "viewer must not seize motors without owning the wheels"
+            );
+            if v["motors"] == json!({"fan": 0.0, "main": 0.0, "side": 0.0}) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut motor_log: Vec<(usize, f64)> = Vec::new();
+    while let Ok((_, a, b)) = s.cmds.try_recv() {
+        if a >= 1000. {
+            motor_log.push((a as usize - 1000, b));
+        }
+    }
+    assert!(
+        !motor_log.contains(&(0, 70.0)) && !motor_log.contains(&(1, 30.0)),
+        "viewer PWM must not reach Player: {motor_log:?}"
+    );
+    assert!(
+        motor_log.contains(&(0, 60.0)),
+        "owner fan PWM missing: {motor_log:?}"
+    );
+    assert!(
+        motor_log.contains(&(0, 0.0)),
+        "owner disconnect zero PWM missing: {motor_log:?}"
+    );
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &s.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "failed to stop server"
+    );
+    s.exited_ok().await;
 }
 
 // FEATURE: panel-controlled cleaning motors over the sole Player connection.

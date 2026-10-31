@@ -1,9 +1,13 @@
 mod audio;
 mod camera;
 mod compass;
+mod grants;
+mod mcp;
+mod mcp_drive;
 mod player;
 mod safety;
 mod slam;
+mod state;
 mod telemetry;
 mod vision;
 
@@ -119,33 +123,31 @@ impl Config {
 #[derive(Clone)]
 struct App {
     safety: Arc<Mutex<Safety>>,
-    state: watch::Receiver<Value>,
-    states: watch::Sender<Value>,
+    /// The panel/MCP view of the typed state (JSON is built at the boundary).
+    state: watch::Receiver<state::State>,
+    states: watch::Sender<state::State>,
     scan: watch::Receiver<Option<Value>>,
     camera: camera::Camera,
     vision: Option<watch::Receiver<Value>>,
+    maps: Option<watch::Receiver<Value>>,
     ids: Arc<AtomicU64>,
     recording: Option<Arc<SessionRecording>>,
     motors: Arc<std::sync::Mutex<Motors>>,
     player: player::Writer,
+    /// Operator-granted MCP admission (#56); installed/revoked only from
+    /// operator-side paths, never from an LLM request.
+    grants: Arc<std::sync::Mutex<grants::Grants>>,
+    /// Idempotent registry of bounded MCP drive actions (#60).
+    drive_actions: Arc<std::sync::Mutex<mcp_drive::DriveActions>>,
 }
-/// Cleaning-motor duties shared with the panel state; the write half sends
-/// PWM commands on the sole Player connection.
+/// Whether this session ever commanded the cleaning motors; duties live in
+/// the typed state. The write half sends PWM commands on the sole Player
+/// connection. Ownership lives in Safety: wheels and cleaning motors share
+/// one exclusive control owner. `active` records whether this session ever
+/// commanded the motors, so an owner who never touched them does not emit
+/// teardown PWM frames.
 struct Motors {
-    owner: Option<u64>,
-    fan: f64,
-    main: f64,
-    side: f64,
-}
-impl Default for Motors {
-    fn default() -> Self {
-        Self {
-            owner: None,
-            fan: 0.,
-            main: 0.,
-            side: 0.,
-        }
-    }
+    active: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,32 +238,27 @@ impl Drop for DriverGuard {
         self.safety.lock().unwrap().disconnect(self.id);
     }
 }
-// Dropping the motor owner publishes zeros on the shared Player writer; the
+// Dropping the control owner publishes zeros on the shared Player writer; the
 // vendor queue is not a reliable cancel path.
 struct MotorsGuard {
     id: u64,
     motors: Arc<Mutex<Motors>>,
+    safety: Arc<Mutex<Safety>>,
     writer: player::Writer,
-    states: watch::Sender<Value>,
+    states: watch::Sender<state::State>,
 }
 impl Drop for MotorsGuard {
     fn drop(&mut self) {
         let stop = {
-            let mut motors = self.motors.lock().unwrap();
-            if motors.owner != Some(self.id) {
-                None
+            if self.safety.lock().unwrap().owner() != Some(self.id) {
+                false
             } else {
-                motors.owner = None;
-                motors.fan = 0.;
-                motors.main = 0.;
-                motors.side = 0.;
-                Some(())
+                let mut motors = self.motors.lock().unwrap();
+                std::mem::take(&mut motors.active)
             }
         };
-        if stop.is_some() {
-            self.states.send_modify(|state| {
-                state["motors"] = json!({"fan": 0.0, "main": 0.0, "side": 0.0});
-            });
+        if stop {
+            self.states.send_modify(|state| state.stop_motors());
             let writer = self.writer.clone();
             tokio::spawn(async move {
                 for index in 0..3u8 {
@@ -280,12 +277,14 @@ async fn session(socket: WebSocket, app: App) {
     let _motors_guard = MotorsGuard {
         id,
         motors: app.motors.clone(),
+        safety: app.safety.clone(),
         writer: app.player.clone(),
         states: app.states.clone(),
     };
     let (mut output, mut input) = socket.split();
     let mut state = app.state;
     let mut scan = app.scan;
+    let mut maps = app.maps.clone();
     // Independent send/receive futures: a slow viewer never delays a disconnect
     // or command lease. watch channels retain only the latest state and scan.
     let receive = async {
@@ -310,37 +309,34 @@ async fn session(socket: WebSocket, app: App) {
                             && duties.1.map(|v| v.is_finite()).unwrap_or(true)
                             && duties.2.map(|v| v.is_finite()).unwrap_or(true)
                         {
-                            let updates: [(u8, f64); 3] = [
-                                (0, duties.0.unwrap_or(0.)),
-                                (1, duties.1.unwrap_or(0.)),
-                                (2, duties.2.unwrap_or(0.)),
-                            ];
                             let writer = app.player.clone();
                             let allowed = {
-                                let mut motors = app.motors.lock().unwrap();
-                                if motors.owner.is_none() || motors.owner == Some(id) {
-                                    motors.owner = Some(id);
-                                    motors.fan = updates[0].1;
-                                    motors.main = updates[1].1;
-                                    motors.side = updates[2].1;
-                                    true
-                                } else {
+                                // Same lock order as reset: motors never
+                                // command while blocked or under another owner.
+                                let safety = app.safety.lock().unwrap();
+                                if safety.is_blocked() || safety.owner() != Some(id) {
                                     false
+                                } else {
+                                    app.motors.lock().unwrap().active = true;
+                                    true
                                 }
                             };
                             if allowed {
                                 app.states.send_modify(|state| {
-                                    state["motors"] = json!({
-                                        "fan": player_bridge::motor_pwm_clamp(updates[0].1),
-                                        "main": player_bridge::motor_pwm_clamp(updates[1].1),
-                                        "side": player_bridge::motor_pwm_clamp(updates[2].1),
-                                    });
+                                    state.set_motors(
+                                        player_bridge::motor_pwm_clamp(duties.0.unwrap_or(0.)),
+                                        player_bridge::motor_pwm_clamp(duties.1.unwrap_or(0.)),
+                                        player_bridge::motor_pwm_clamp(duties.2.unwrap_or(0.)),
+                                    );
                                 });
-                                for (index, duty) in updates {
+                                for (index, duty) in
+                                    [duties.0, duties.1, duties.2].into_iter().enumerate()
+                                {
+                                    let index = u8::try_from(index).expect("three motors");
                                     if let Err(e) = player::motor_pwm(
                                         &writer,
                                         index,
-                                        player_bridge::motor_pwm_clamp(duty),
+                                        player_bridge::motor_pwm_clamp(duty.unwrap_or(0.)),
                                     )
                                     .await
                                     {
@@ -355,8 +351,7 @@ async fn session(socket: WebSocket, app: App) {
                         }
                         let mut safety = app.safety.lock().unwrap();
                         if safety.reset_blocked() {
-                            app.states
-                                .send_modify(|state| state["blocked"] = json!(false));
+                            app.states.send_modify(|state| state.clear_blocked());
                         }
                     }
                 }
@@ -366,7 +361,7 @@ async fn session(socket: WebSocket, app: App) {
         }
     };
     let send = async {
-        let initial = state.borrow_and_update().clone();
+        let initial = state.borrow_and_update().to_json();
         send_frame(&mut output, "state", initial).await?;
         send_frame(
             &mut output,
@@ -378,10 +373,25 @@ async fn session(socket: WebSocket, app: App) {
         if let Some(v) = initial {
             send_frame(&mut output, "scan", v).await?;
         }
+        // The current map replays to a fresh viewer without waiting for the
+        // next grid change; only new versions are streamed afterwards.
+        if let Some(maps) = maps.as_mut() {
+            let current = maps.borrow_and_update().clone();
+            if current != Value::Null {
+                send_frame(&mut output, "map", current).await?;
+            }
+        }
         loop {
+            let map_change = async {
+                match maps.as_mut() {
+                    Some(maps) => maps.changed().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
-             r=state.changed()=>{r?;let v=state.borrow_and_update().clone();send_frame(&mut output,"state",v).await?;},
+             r=state.changed()=>{r?;let v=state.borrow_and_update().to_json();send_frame(&mut output,"state",v).await?;},
              r=scan.changed()=>{r?;let v=scan.borrow_and_update().clone();if let Some(v)=v{send_frame(&mut output,"scan",v).await?;}}
+             _=map_change=>{if let Some(maps)=maps.as_mut(){let v=maps.borrow_and_update().clone();send_frame(&mut output,"map",v).await?;}}
             }
         }
         #[allow(unreachable_code)]
@@ -414,6 +424,55 @@ async fn heartbeat(mut stream: TcpStream) -> Result<(), Failure> {
         }
     }
 }
+/// Operator-installed MCP admission from the environment (#56): only the
+/// operator controls this variable, never an LLM request. Format:
+/// subject,max_linear_mps,max_angular_radps,max_action_ms,budget_ms,ttl_s.
+fn mcp_grant_from_env() -> grants::Grants {
+    let mut grants = grants::Grants::default();
+    let Ok(spec) = std::env::var("ROBOT_MCP_GRANT") else {
+        return grants;
+    };
+    let fields: Vec<&str> = spec.split(',').collect();
+    if fields.len() != 6 {
+        eprintln!("robot-server: ROBOT_MCP_GRANT must have 6 comma-separated fields");
+        return grants;
+    }
+    let parsed = (
+        fields[1].parse::<f64>(),
+        fields[2].parse::<f64>(),
+        fields[3].parse::<u64>(),
+        fields[4].parse::<u64>(),
+        fields[5].parse::<u64>(),
+    );
+    if let (Ok(lin), Ok(ang), Ok(action), Ok(budget), Ok(ttl)) = parsed {
+        if lin.is_finite()
+            && ang.is_finite()
+            && lin >= 0.
+            && ang >= 0.
+            && action > 0
+            && budget > 0
+            && ttl > 0
+        {
+            grants.install(grants::ControlGrant {
+                subject: fields[0].to_owned(),
+                max_linear_mps: lin,
+                max_angular_radps: ang,
+                max_action_ms: action,
+                total_budget_ms: budget,
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl),
+                spent_ms: 0,
+            });
+            eprintln!(
+                "robot-server: MCP control grant installed for subject '{}' (operator env)",
+                fields[0]
+            );
+            return grants;
+        }
+    }
+    eprintln!("robot-server: invalid ROBOT_MCP_GRANT; no grant installed");
+    grants
+}
+
 async fn run(c: Config) -> Result<(), Failure> {
     // File preflight must precede ACTIVATE (the CLI's earlier handoff is separate).
     let recording = if c.audio_only {
@@ -479,11 +538,23 @@ async fn run_session(
         None
     };
     let safety = Arc::new(Mutex::new(Safety::new()));
-    let mut initial = telemetry::Telemetry::new().json();
-    initial["blocked"] = json!(false);
-    initial["motors"] = json!({"fan": 0.0, "main": 0.0, "side": 0.0});
-    let (states, state) = watch::channel(initial);
+    let (states, state) = watch::channel(state::State::initial());
     let (scans, scan) = watch::channel(None);
+    // Session recording keeps its JSON snapshot view of the typed state; the
+    // boundary serialization stays out of the frequent producers.
+    let (mirror_tx, mirror_rx) = watch::channel(Value::Null);
+    let _mirror_task = tokio::spawn({
+        let mut state = state.clone();
+        async move {
+            loop {
+                let changed = state.changed().await;
+                if changed.is_err() {
+                    break;
+                }
+                mirror_tx.send_replace(state.borrow_and_update().to_json());
+            }
+        }
+    });
     let _recording_tasks = recording.as_ref().map(|r| {
         let source = camera.clone();
         start_sources(
@@ -495,11 +566,12 @@ async fn run_session(
                 let source = source.clone();
                 async move { source.stream().await }
             },
-            state.clone(),
+            mirror_rx.clone(),
             scan.clone(),
         )
     });
     // SLAM observations come from Player; results are display data, not drive gates.
+    let mut maps_rx = None;
     let slam_tx = if let Some(exe) = c.slam_adapter.clone() {
         // Without a saved map the only meaningful mode is mapping; with one,
         // localize unless mapping is explicitly requested.
@@ -511,19 +583,13 @@ async fn run_session(
             mapping,
             map_path,
             Box::new(move |slam_state| {
-                states_tx.send_if_modified(|old| {
-                    let mut next = old.clone();
-                    next["slam"] = slam_state.clone();
-                    if *old == next {
-                        false
-                    } else {
-                        *old = next;
-                        true
-                    }
-                });
+                states_tx.send_if_modified(|old| old.publish_slam(slam_state));
             }),
         ) {
-            Ok(t) => Some(t.observe),
+            Ok(t) => {
+                maps_rx = Some(t.maps);
+                Some(t.observe)
+            }
             Err(e) => {
                 return Err(format!("SLAM adapter failed to start: {e}").into());
             }
@@ -560,7 +626,7 @@ async fn run_session(
     } else {
         (None, None)
     };
-    let motors = Arc::new(Mutex::new(Motors::default()));
+    let motors = Arc::new(Mutex::new(Motors { active: false }));
     let app = App {
         safety,
         state,
@@ -568,10 +634,13 @@ async fn run_session(
         scan,
         camera,
         vision,
+        maps: maps_rx,
         ids: Arc::new(AtomicU64::new(1)),
         recording,
         motors,
         player: writer.clone(),
+        grants: Arc::new(std::sync::Mutex::new(mcp_grant_from_env())),
+        drive_actions: Arc::new(std::sync::Mutex::new(mcp_drive::DriveActions::default())),
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
         Ok(l) => l,
@@ -595,6 +664,7 @@ async fn run_session(
         .route("/ws", get(upgrade))
         .route("/camera.mjpeg", get(camera::proxy))
         .route("/vision/ws", get(vision::upgrade))
+        .route("/mcp", axum::routing::post(mcp::endpoint))
         .with_state(app)
         .merge(audio::router(audio));
     let mut http = tokio::spawn(async move { axum::serve(listener, router).await });
