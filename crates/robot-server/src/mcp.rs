@@ -65,6 +65,7 @@ fn tools() -> Value {
         mcp_stop_tool(),
         get_action_tool(),
         cleaning_motors_tool(),
+        say_tool(),
     ])
 }
 
@@ -138,6 +139,23 @@ fn release_control_tool() -> Value {
 }
 
 /// Cleaning-motor tool (#61). readOnlyHint is false by design.
+/// Speech tool (#63): the shared Audio pipeline behind the panel's
+/// /api/audio/say. Acceptance only: the final outcome is polled via the
+/// returned task id or a later observe; no secrets in errors.
+fn say_tool() -> Value {
+    json!({
+        "name": "robot_say",
+        "description": "Озвучить текст через динамик робота. Возвращает принятое задание (task_id, state) — принято ≠ завершено; итог узнавайте по task_id. Требует настроенного облачного TTS на сервере.",
+        "inputSchema": {"type":"object","additionalProperties":false,"required":["text"],"properties":{
+            "text": {"type":"string","minLength":1,"maxLength":2000},
+            "volume": {"type":"number","minimum":0,"maximum":1}
+        }},
+        "outputSchema": {"type":"object"},
+        "annotations": {"readOnlyHint": false, "destructiveHint": false,
+                        "idempotentHint": false, "openWorldHint": false}
+    })
+}
+
 fn cleaning_motors_tool() -> Value {
     json!({
         "name": "robot_set_cleaning_motors",
@@ -335,6 +353,10 @@ fn dispatch(app: &App, request: Value) -> Response {
             }
             if name == "robot_release_control" {
                 return release_control(id, app);
+            }
+            if name == "robot_say" {
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                return say(id, app, args);
             }
             if name == "robot_set_cleaning_motors" {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
@@ -1052,6 +1074,42 @@ fn get_action(id: Value, app: &App, args: Value) -> Response {
             StatusCode::OK,
         ),
         None => tool_error(id, format!("unknown command_id {command_id}")),
+    }
+}
+
+/// `robot_say` (#63): shared acceptance path with the panel. Returns the
+/// queued task id; polling the outcome happens through job_state by id in a
+/// later call (the observe-style honest separation accepted/sent/completed).
+fn say(id: Value, app: &App, args: Value) -> Response {
+    let Some(obj) = args.as_object() else {
+        return tool_error(id, "arguments must be an object".into());
+    };
+    let Some(text) = obj.get("text").and_then(Value::as_str) else {
+        return tool_error(id, "text is required".into());
+    };
+    let volume = obj.get("volume").and_then(Value::as_f64);
+    if let Some(extra) = obj
+        .keys()
+        .find(|k| k.as_str() != "text" && k.as_str() != "volume")
+    {
+        return tool_error(id, format!("unknown argument {extra}"));
+    }
+    match app.audio.submit(text, volume) {
+        crate::audio::Submit::Queued(task) => json_response(
+            json!({"jsonrpc":"2.0","id":id,"result":{
+                    "content": [{"type":"text","text": format!("speech job {task} queued")}],
+                    "structuredContent": {
+                        "task_id": task,
+                        "state": "queued",
+                        "volume": volume.unwrap_or_else(|| app.audio.default_volume()),
+                        "note": "принято ≠ завершено; итог неизвестен до подтверждения состояния"
+                    },
+                    "isError": false}}),
+            StatusCode::OK,
+        ),
+        crate::audio::Submit::Invalid(what) => tool_error(id, what.into()),
+        crate::audio::Submit::Disabled(what) => tool_error(id, format!("tts unavailable: {what}")),
+        crate::audio::Submit::Busy => tool_error(id, "audio_busy: one speech job at a time".into()),
     }
 }
 

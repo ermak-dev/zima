@@ -139,6 +139,8 @@ struct App {
     grants: Arc<std::sync::Mutex<grants::Grants>>,
     /// Idempotent registry of bounded MCP drive actions (#60).
     drive_actions: Arc<std::sync::Mutex<mcp_drive::DriveActions>>,
+    /// Shared TTS pipeline (panel HTTP and the MCP robot_say tool, #63).
+    audio: audio::Audio,
 }
 /// Whether this session ever commanded the cleaning motors; duties live in
 /// the typed state. The write half sends PWM commands on the sole Player
@@ -641,6 +643,7 @@ async fn run_session(
         player: writer.clone(),
         grants: Arc::new(std::sync::Mutex::new(mcp_grant_from_env())),
         drive_actions: Arc::new(std::sync::Mutex::new(mcp_drive::DriveActions::default())),
+        audio: audio.clone(),
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
         Ok(l) => l,

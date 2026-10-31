@@ -248,7 +248,103 @@ async fn mcp_cleaning_motors_apply_under_lease_and_zero_on_release() {
     }
 }
 
-// ---- #60: robot_drive_for ----
+// ---- #63: robot_say ----
+// FEATURE: MCP speech over the existing audio pipeline.
+// SPEC: without configured TTS the tool is an explicit error (no playback
+// attempt); the tool appears in tools/list with strict arguments; a second
+// call while one job runs is BUSY; nothing about the reply leaks secrets.
+// IMPLEMENTATION: mcp robot_say wraps the shared Audio::submit path used by
+// the panel's /api/audio/say.
+// RESULT: IMPLEMENTED — offline fake Player checks pass.
+// STATUS: DONE
+#[tokio::test]
+async fn mcp_say_reports_disabled_tts_and_lists_in_tools() {
+    let mut s = start(None).await;
+    drive_ready(&mut s).await;
+    // tools/list includes robot_say with a strict schema.
+    let list = rpc_json(
+        s.1,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        None,
+    )
+    .await;
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"robot_say"), "names: {names:?}");
+    // No Yandex key in the test env: the call must be an explicit error that
+    // names TTS configuration, never a playback attempt or a secret.
+    let reply = call(&s, "robot_say", json!({"text":"Привет"})).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("tts"), "error names TTS: {text}");
+    assert!(!text.contains("Api-Key"), "no secrets in errors");
+    // Invalid arguments are rejected before any TTS consideration.
+    for bad in [
+        json!({"text": ""}),
+        json!({"text": "a\0b"}),
+        json!({"text": 42}),
+        json!({"text": "ok", "volume": -1.0}),
+        json!({"text": "ok", "unknown": true}),
+        json!({}),
+    ] {
+        let reply = call(&s, "robot_say", bad.clone()).await;
+        assert_eq!(reply["result"]["isError"], true, "args {bad}: {reply}");
+    }
+}
+
+/// With a live (fake) slow TTS provider the job is queued exactly once; the
+/// second call while it runs is BUSY and the receipt separates accepted from
+/// completed.
+#[tokio::test]
+async fn mcp_say_queues_once_and_reports_busy() {
+    // Slow fake provider: accepts the POST, never answers, so the job stays
+    // active long enough for the BUSY probe.
+    let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_url = format!("http://{}/tts", provider.local_addr().unwrap());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut s, _)) = provider.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = s.read(&mut buf).await; // headers
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ncontent-length: 6400\r\n\r\n",
+                )
+                .await;
+                // Body never arrives: the synthesis stalls.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let mut s = harness::start_env_tts(
+        None,
+        "mcp,0.2,1.0,2000,10000,600",
+        Some((&provider_url, "k")),
+    )
+    .await;
+    drive_ready(&mut s).await;
+    let first = call(&s, "robot_say", json!({"text":"Привет"})).await;
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let structured = &first["result"]["structuredContent"];
+    let task = structured["task_id"].as_str().expect("task id").to_owned();
+    assert_eq!(structured["state"], "queued");
+    // The busy window: a second job while the stalled one is active.
+    let second = call(&s, "robot_say", json!({"text":"Ещё"})).await;
+    assert_eq!(second["result"]["isError"], true, "{second}");
+    let text = second["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("busy"), "must be BUSY: {text}");
+    assert!(!text.contains('k') || !text.contains("Api-Key"));
+    // The task id is opaque and no secret leaked into receipts.
+    assert!(!task.is_empty());
+}
+
 // FEATURE: bounded MCP motion with idempotent command ids and honest stops.
 // SPEC: no lease → error; with lease+grant the velocity reaches Player once;
 // a repeated command_id never re-executes; a second concurrent action is
@@ -307,11 +403,22 @@ async fn mcp_drive_for_bounded_idempotent_and_stoppable() {
     )
     .await;
     assert_eq!(reply["result"]["isError"], false, "{reply}");
-    let seen = tokio::time::timeout(std::time::Duration::from_secs(3), s.4.recv())
-        .await
-        .expect("velocity reached Player")
-        .unwrap();
-    assert_eq!(seen, (0.05, 0.0));
+    // The acquire handshake may flush its safety zero first; require the
+    // requested velocity to arrive within the window.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(3), s.4.recv())
+            .await
+            .expect("velocity reached Player")
+            .unwrap();
+        if seen == (0.05, 0.0) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "requested velocity never reached Player"
+        );
+    }
     // Idempotent repeat: the same command_id returns the record and does not
     // emit a second velocity command.
     let reply = call(

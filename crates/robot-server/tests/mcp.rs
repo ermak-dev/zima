@@ -183,6 +183,17 @@ pub async fn start(camera_url: Option<&str>) -> Server {
 /// Variant with an operator MCP grant spec (#56/#60): ROBOT_MCP_GRANT is set
 /// for the child only, exactly as an operator would.
 pub async fn start_env(camera_url: Option<&str>, grant: &str) -> Server {
+    start_env_tts(camera_url, grant, None).await
+}
+
+/// Variant with a fake slow TTS provider and supervisor (#63): when `tts`
+/// is Some(url) the child sees enabled cloud TTS against that URL; the
+/// provider deliberately stalls so the job stays active for BUSY checks.
+pub async fn start_env_tts(
+    camera_url: Option<&str>,
+    grant: &str,
+    tts: Option<(&str, &str)>,
+) -> Server {
     let (pp, input, motors, velocity) = fake_player().await.expect("fake player");
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = http.local_addr().unwrap().port();
@@ -207,9 +218,14 @@ pub async fn start_env(camera_url: Option<&str>, grant: &str) -> Server {
         .env_remove("ROBOT_SUPERVISOR_TOKEN")
         .env("ROBOT_MCP_GRANT", grant)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    if let Some((url, token)) = tts {
+        child
+            .env("ROBOT_YANDEX_ENABLED", "true")
+            .env("ROBOT_YANDEX_API_KEY", token)
+            .env("ROBOT_YANDEX_URL", url);
+    }
+    let child = child.spawn().unwrap();
     let mut server = Server(child, port, input, motors, velocity);
     for _ in 0..100 {
         match server.0.try_wait().unwrap() {
@@ -346,6 +362,7 @@ async fn mcp_endpoint_initializes_lists_and_calls_read_only_tools() {
             "robot_drive_for",
             "robot_stop",
             "robot_set_cleaning_motors",
+            "robot_say",
         ];
         if !control.contains(&tool["name"].as_str().unwrap_or("")) {
             assert_eq!(tool["annotations"]["readOnlyHint"], true);

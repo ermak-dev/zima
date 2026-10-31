@@ -24,6 +24,79 @@ use tokio::{
 
 #[derive(Clone)]
 pub struct Audio(Arc<Settings>, Arc<Mutex<Jobs>>);
+
+/// Submission outcome shared by the HTTP handler and the MCP tool.
+pub enum Submit {
+    Queued(String),
+    Invalid(&'static str),
+    Disabled(&'static str),
+    Busy,
+}
+
+impl Audio {
+    /// Validate and enqueue one speech job (the single acceptance path for
+    /// the panel HTTP API and the MCP tool). Never blocks: execution is
+    /// spawned on the shared runtime.
+    pub fn submit(&self, text: &str, volume: Option<f64>) -> Submit {
+        let volume = volume.unwrap_or(self.0.volume);
+        if text.trim().is_empty()
+            || text.chars().count() > 2000
+            || text.contains('\0')
+            || !volume.is_finite()
+            || !(0.0..=self.0.max_volume).contains(&volume)
+        {
+            return Submit::Invalid("invalid_text_or_volume");
+        }
+        if !self.0.enabled {
+            return Submit::Disabled("cloud_tts_disabled");
+        }
+        if self.0.key.is_empty() {
+            return Submit::Disabled("tts_api_key_not_configured");
+        }
+        let id = next_id();
+        let (cancel, receiver) = watch::channel(false);
+        {
+            let mut jobs = self.1.lock().unwrap();
+            if jobs.active.is_some() {
+                return Submit::Busy;
+            }
+            while jobs.order.len() >= 64 {
+                if let Some(old) = jobs.order.pop_front() {
+                    jobs.entries.remove(&old);
+                }
+            }
+            jobs.entries.insert(
+                id.clone(),
+                Job {
+                    state: "queued",
+                    error: None,
+                    cancel,
+                },
+            );
+            jobs.order.push_back(id.clone());
+            jobs.active = Some(id.clone());
+        }
+        let audio = self.clone();
+        let text = text.to_owned();
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            audio.execute(&task_id, text, volume, receiver).await;
+        });
+        Submit::Queued(id)
+    }
+
+    /// Current job state for polling (shared by HTTP and MCP surfaces).
+    pub fn job_state(&self, id: &str) -> Option<(&'static str, Option<&'static str>)> {
+        let jobs = self.1.lock().unwrap();
+        jobs.entries.get(id).map(|job| (job.state, job.error))
+    }
+
+    /// The configured default volume for surface-facing job receipts.
+    pub fn default_volume(&self) -> f64 {
+        self.0.volume
+    }
+}
+
 struct Settings {
     enabled: bool,
     key: String,
@@ -337,58 +410,18 @@ async fn say(State(audio): State<Audio>, headers: HeaderMap, Json(request): Json
     if !crate::allowed_origin(&headers) {
         return error(StatusCode::FORBIDDEN, "foreign_origin");
     }
-    let volume = request.volume.unwrap_or(audio.0.volume);
-    if request.text.trim().is_empty()
-        || request.text.chars().count() > 2000
-        || request.text.contains('\0')
-        || !volume.is_finite()
-        || !(0.0..=audio.0.max_volume).contains(&volume)
-    {
-        return error(StatusCode::BAD_REQUEST, "invalid_text_or_volume");
+    // Single acceptance path shared with the MCP robot_say tool.
+    match audio.submit(&request.text, request.volume) {
+        Submit::Queued(id) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"id":id,"state":"queued"})),
+        )
+            .into_response(),
+        Submit::Invalid(what) => error(StatusCode::BAD_REQUEST, what),
+        Submit::Disabled(what) => error(StatusCode::SERVICE_UNAVAILABLE, what),
+        Submit::Busy => error(StatusCode::CONFLICT, "audio_busy"),
     }
-    if !audio.0.enabled {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "cloud_tts_disabled");
-    }
-    if audio.0.key.is_empty() {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "yandex_api_key_not_configured",
-        );
-    }
-    let id = next_id();
-    let (cancel, receiver) = watch::channel(false);
-    {
-        let mut jobs = audio.1.lock().unwrap();
-        if jobs.active.is_some() {
-            return error(StatusCode::CONFLICT, "audio_busy");
-        }
-        while jobs.order.len() >= 64 {
-            if let Some(old) = jobs.order.pop_front() {
-                jobs.entries.remove(&old);
-            }
-        }
-        jobs.entries.insert(
-            id.clone(),
-            Job {
-                state: "queued",
-                error: None,
-                cancel,
-            },
-        );
-        jobs.order.push_back(id.clone());
-        jobs.active = Some(id.clone());
-    }
-    let task_id = id.clone();
-    tokio::spawn(async move {
-        audio
-            .execute(&task_id, request.text, volume, receiver)
-            .await;
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"id":id,"state":"queued"})),
-    )
-        .into_response()
+    .into_response()
 }
 async fn task(State(audio): State<Audio>, Path(id): Path<String>) -> Response {
     let jobs = audio.1.lock().unwrap();
