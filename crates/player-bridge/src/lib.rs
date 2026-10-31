@@ -44,6 +44,10 @@ pub const LASER_CODE: u16 = 6;
 pub const REQ_DEV: u8 = 3; // PLAYER_PLAYER_REQ_DEV
 pub const OPEN_MODE: u8 = 1;
 
+pub const MSGTYPE_CMD: u8 = 2; // PLAYER_MSGTYPE_CMD
+/// PLAYER_POSITION2D_CMD_VEL (`player_position2d_cmd_vel_t`).
+pub const POSITION2D_CMD_VEL: u8 = 1;
+
 pub const LASER_DATA_SCAN: u8 = 1; // PLAYER_LASER_DATA_SCAN
 pub const LASER_DATA_SCANANGLE: u8 = 3; // PLAYER_LASER_DATA_SCANANGLE (vendor form)
 pub const POSITION2D_DATA_STATE: u8 = 1;
@@ -435,27 +439,36 @@ impl Client {
         vyaw: f64,
         state: u8,
     ) -> Result<(), Error> {
-        // pose: 3 f64; state u8 padded to 4
-        let mut cmd = [0u8; 28];
-        putf64(&mut cmd, 0, vx);
-        putf64(&mut cmd, 8, 0.0);
-        putf64(&mut cmd, 16, vyaw);
-        cmd[24] = state;
-        let header = MsgHeader {
-            addr: DevAddr {
-                host: 0,
-                robot: 0,
-                interf: POSITION2D_CODE,
-                index,
-            },
-            msg_type: 2, // PLAYER_MSGTYPE_CMD
-            subtype: 1,  // PLAYER_POSITION2D_CMD_VEL
-            timestamp: 0.0,
-            seq: 0,
-            size: cmd.len() as u32,
-        };
+        let (header, cmd) = velocity_packet(index, vx, vyaw, state);
         self.send(&header, &cmd)
     }
+}
+
+/// Encode a player_position2d_cmd_vel_t message: 40-byte XDR header plus a
+/// 28-byte payload (pose: 3 f64 with vy=0; state u8 in a padded slot).
+/// Byte-exact home of the velocity wire form; the sync `Client` and every
+/// async writer must share it so both transports stay identical.
+pub fn velocity_packet(index: u16, vx: f64, vyaw: f64, state: u8) -> (MsgHeader, [u8; 28]) {
+    // pose: 3 f64; state u8 padded to 4
+    let mut cmd = [0u8; 28];
+    putf64(&mut cmd, 0, vx);
+    putf64(&mut cmd, 8, 0.0);
+    putf64(&mut cmd, 16, vyaw);
+    cmd[24] = state;
+    let header = MsgHeader {
+        addr: DevAddr {
+            host: 0,
+            robot: 0,
+            interf: POSITION2D_CODE,
+            index,
+        },
+        msg_type: MSGTYPE_CMD,
+        subtype: POSITION2D_CMD_VEL,
+        timestamp: 0.0,
+        seq: 0,
+        size: cmd.len() as u32,
+    };
+    (header, cmd)
 }
 
 #[cfg(test)]
@@ -580,6 +593,39 @@ mod tests {
         assert_eq!(&req[8..12], &[0, 0, 0, 6]);
         assert_eq!(&req[16..20], &[0, 0, 0, 1]);
     }
+
+    // DEDUP (issue #51): the velocity wire form had two encoders (sync
+    // Client::send_velocity and robot-server's async writer). Byte-exact
+    // acceptance test for the single shared encoder both transports use.
+    #[test]
+    fn velocity_packet_is_byte_exact_xdr_with_padded_state_and_index() {
+        let (header, cmd) = velocity_packet(7, -0.06, 2.5, 1);
+        let wire = [encode_header(&header).as_slice(), &cmd].concat();
+        // Header: position2d (4) @8, index (7) @12, CMD (2) @16, VEL (1) @20,
+        // zero timestamp/seq, size 28.
+        assert_eq!(&wire[8..12], &4u32.to_be_bytes());
+        assert_eq!(&wire[12..16], &7u32.to_be_bytes());
+        assert_eq!(&wire[16..20], &2u32.to_be_bytes());
+        assert_eq!(&wire[20..24], &1u32.to_be_bytes());
+        assert_eq!(&wire[24..32], &0f64.to_be_bytes());
+        assert_eq!(&wire[32..36], &0u32.to_be_bytes());
+        assert_eq!(&wire[36..40], &28u32.to_be_bytes());
+        // Payload: vx @0, vy=0 @8, vyaw @16, state in the LOW byte @24 with
+        // XDR zero padding after it.
+        assert_eq!(&wire[40..48], &(-0.06f64).to_be_bytes());
+        assert_eq!(&wire[48..56], &0f64.to_be_bytes());
+        assert_eq!(&wire[56..64], &2.5f64.to_be_bytes());
+        assert_eq!(&wire[64..68], &[1, 0, 0, 0]);
+        assert_eq!(wire.len(), 68);
+        // An old live session (start-stop against the real Player server)
+        // produced exactly this zero-command frame for index 0.
+        let (_, stop) = velocity_packet(0, 0.0, 0.0, 1);
+        assert_eq!(stop, {
+            let mut zeroed = [0u8; 28];
+            zeroed[24] = 1;
+            zeroed
+        });
+    }
 }
 
 /// A decoded laser scan in per-beam angle form (player_laser_data_scanangle_t,
@@ -628,6 +674,13 @@ pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
             return Err(Error::CorruptChannel);
         }
         *off += 4;
+        // Guard the allocation: a hostile count must fail before reserving.
+        if count > payload.len().saturating_sub(*off) / 4 {
+            return Err(Error::ShortPayload {
+                need: *off + count * 4,
+                got: payload.len(),
+            });
+        }
         let mut v = Vec::with_capacity(count);
         for _ in 0..count {
             v.push(rd_f32(*off)?);
@@ -659,6 +712,52 @@ pub fn decode_laser_scanangle(payload: &[u8]) -> Result<LaserScanAngle, Error> {
         intensities,
         id,
     })
+}
+
+/// One decoded Player DATA message: each subscribed sensor frame is decoded
+/// exactly once into its typed state (issue #51 dedup) so telemetry, odometry
+/// history, safety and SLAM all consume the same decode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlayerData {
+    /// `laser:0` SCANANGLE (vendor per-beam bearings).
+    ScanAngle(LaserScanAngle),
+    /// `position2d:0` STATE.
+    Position2d(Position2dState),
+    /// `bumper:0` STATE.
+    Bumper(BumperState),
+    /// `ir:N` RANGES for index N.
+    Ir(u16, IrState),
+    /// `sonar:0` RANGES.
+    Sonar(SonarState),
+    /// `power:0` STATE.
+    Power(PowerState),
+    /// `position3d:N` STATE for index N.
+    Position3d(u16, Position3dState),
+}
+
+/// Decode one DATA message into its typed payload state. Non-DATA messages
+/// and unconsumed addresses return `None`; malformed frames return an error
+/// after the codecs' size checks have rejected any hostile count words.
+pub fn decode_data(msg: &Message) -> Result<Option<PlayerData>, Error> {
+    if msg.header.msg_type != MSGTYPE_DATA {
+        return Ok(None);
+    }
+    let a = msg.header.addr;
+    let p = &msg.payload;
+    Ok(Some(match (a.interf, a.index, msg.header.subtype) {
+        (LASER_CODE, 0, LASER_DATA_SCANANGLE) => PlayerData::ScanAngle(decode_laser_scanangle(p)?),
+        (POSITION2D_CODE, 0, POSITION2D_DATA_STATE) => {
+            PlayerData::Position2d(decode_position2d(p)?)
+        }
+        (BUMPER_CODE, 0, BUMPER_DATA_STATE) => PlayerData::Bumper(decode_bumper(p)?),
+        (IR_CODE, index, IR_DATA_RANGES) => PlayerData::Ir(index, decode_ir(p)?),
+        (SONAR_CODE, _, SONAR_DATA_RANGES) => PlayerData::Sonar(decode_sonar(p)?),
+        (POWER_CODE, _, POWER_DATA_STATE) => PlayerData::Power(decode_power(p)?),
+        (POSITION3D_CODE, index, POSITION3D_DATA_STATE) => {
+            PlayerData::Position3d(index, decode_position3d(p)?)
+        }
+        _ => return Ok(None),
+    }))
 }
 
 // --- vendor motor command (interface 170) ---

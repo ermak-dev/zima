@@ -35,6 +35,14 @@ pub fn decode_bumper(payload: &[u8]) -> Result<BumperState, Error> {
     if dup != count {
         return Err(Error::CorruptChannel);
     }
+    // Guard the allocation before the byte reserve below: a hostile count
+    // must fail here, not inside the slice/pad arithmetic.
+    if count > payload.len().saturating_sub(8) {
+        return Err(Error::ShortPayload {
+            need: 8 + count,
+            got: payload.len(),
+        });
+    }
     // Flags are packed bytes (xdr_bytes), not one-per-slot: the live
     // released frame is 12 bytes for three flags, not 20.
     let padded = count.div_ceil(4) * 4;

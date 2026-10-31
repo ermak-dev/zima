@@ -108,12 +108,25 @@ pub fn decode_ir(payload: &[u8]) -> Result<IrState, Error> {
         Ok(count)
     };
     let vcount = rd_count(payload, &mut off)?;
+    // Guard the allocation: a hostile count must fail before reserving.
+    if vcount > payload.len().saturating_sub(off) / 4 {
+        return Err(Error::ShortPayload {
+            need: off + vcount * 4,
+            got: payload.len(),
+        });
+    }
     let mut voltages = Vec::with_capacity(vcount);
     for _ in 0..vcount {
         voltages.push(rd_f32(payload, off)?);
         off += 4;
     }
     let rcount = rd_count(payload, &mut off)?;
+    if rcount > payload.len().saturating_sub(off) / 4 {
+        return Err(Error::ShortPayload {
+            need: off + rcount * 4,
+            got: payload.len(),
+        });
+    }
     let mut ranges = Vec::with_capacity(rcount);
     for _ in 0..rcount {
         ranges.push(rd_f32(payload, off)?);
@@ -138,6 +151,13 @@ pub fn decode_sonar(payload: &[u8]) -> Result<SonarState, Error> {
         return Err(Error::CorruptChannel);
     }
     let mut off = 8;
+    // Guard the allocation: a hostile count must fail before reserving.
+    if count > payload.len().saturating_sub(off) / 4 {
+        return Err(Error::ShortPayload {
+            need: off + count * 4,
+            got: payload.len(),
+        });
+    }
     let mut ranges = Vec::with_capacity(count);
     for _ in 0..count {
         ranges.push(rd_f32(payload, off)?);

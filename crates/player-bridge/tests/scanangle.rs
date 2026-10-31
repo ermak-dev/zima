@@ -51,3 +51,46 @@ fn scanangle_rejects_truncated_intensity_or_missing_id() {
 fn scanangle_rejects_out_of_range_xdr_ushort() {
     assert!(decode_laser_scanangle(&payload(&[65536], 1234)).is_err());
 }
+
+// DEDUP (issue #51): single-decode moves array validation into the codec;
+// a hostile count word must be rejected before any large allocation.
+#[test]
+fn scanangle_rejects_hostile_count_words_before_allocating() {
+    // ranges_count far beyond the payload: duplicated word agrees.
+    let mut bytes = 6.0f32.to_be_bytes().to_vec();
+    bytes.extend(0x7fff_ffffu32.to_be_bytes());
+    bytes.extend(0x7fff_ffffu32.to_be_bytes());
+    assert!(decode_laser_scanangle(&bytes).is_err());
+    // Same for the angles array: one valid range then a hostile angle count.
+    let mut bytes = 6.0f32.to_be_bytes().to_vec();
+    bytes.extend(1u32.to_be_bytes());
+    bytes.extend(1u32.to_be_bytes());
+    bytes.extend(1.0f32.to_be_bytes());
+    bytes.extend(0xffff_ffffu32.to_be_bytes());
+    bytes.extend(0xffff_ffffu32.to_be_bytes());
+    assert!(decode_laser_scanangle(&bytes).is_err());
+    // Mismatched duplicate counts stay a framing error.
+    let mut bytes = 6.0f32.to_be_bytes().to_vec();
+    bytes.extend(2u32.to_be_bytes());
+    bytes.extend(3u32.to_be_bytes());
+    assert!(matches!(
+        decode_laser_scanangle(&bytes),
+        Err(player_bridge::Error::CorruptChannel)
+    ));
+}
+
+// DEDUP (issue #51): the same hostile-count guarantee for the array codecs
+// that once relied on robot-server's pre-decode validation.
+#[test]
+fn array_codecs_reject_hostile_counts_before_allocating() {
+    use player_bridge::{decode_bumper, decode_ir, decode_sonar};
+    // bumper: three flags claimed, none present, count agrees.
+    assert!(decode_bumper(&0x3fff_ffffu32.to_be_bytes().repeat(2)).is_err());
+    // sonar: hostile range count.
+    assert!(decode_sonar(&0xffff_ffffu32.to_be_bytes().repeat(2)).is_err());
+    // ir: hostile voltage count.
+    let mut ir = Vec::new();
+    ir.extend(0x1000_0000u32.to_be_bytes());
+    ir.extend(0x1000_0000u32.to_be_bytes());
+    assert!(decode_ir(&ir).is_err());
+}
