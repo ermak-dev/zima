@@ -241,6 +241,50 @@ pub async fn start_env_tts(
     server
 }
 
+/// Variant with a reachable supervisor for the local drive lease (#64).
+pub async fn start_env_supervisor(
+    camera_url: Option<&str>,
+    grant: &str,
+    supervisor: (&str, &str),
+) -> Server {
+    let (pp, input, motors, velocity) = fake_player().await.expect("fake player");
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = http.local_addr().unwrap().port();
+    drop(http);
+    let child = Command::new(env!("CARGO_BIN_EXE_robot-server"))
+        .args([
+            "--player-host",
+            "127.0.0.1",
+            "--player-port",
+            &pp.to_string(),
+            "--listen",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .env_remove("ROBOT_SERVER_HEARTBEAT")
+        .env("ROBOT_SUPERVISOR_ADDR", supervisor.0)
+        .env("ROBOT_SUPERVISOR_TOKEN", supervisor.1)
+        .env("ROBOT_MCP_GRANT", grant)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = Server(child, port, input, motors, velocity);
+    for _ in 0..100 {
+        match server.0.try_wait().unwrap() {
+            Some(status) => {
+                use std::io::Read;
+                let mut log = String::new();
+                let _ = server.0.stderr.as_mut().unwrap().read_to_string(&mut log);
+                panic!("robot-server exited {status}:\n{log}");
+            }
+            None => break,
+        }
+    }
+    server
+}
+
 pub async fn start_with(
     camera_url: Option<&str>,
     slam_adapter: Option<&std::path::Path>,

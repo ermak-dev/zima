@@ -20,6 +20,10 @@ pub struct ActionRecord {
     pub requested: (f64, f64, u64),
     pub outcome: Outcome,
     pub created: Instant,
+    /// True only for the submission that created this record; a replayed
+    /// identical request returns the stored record with replay=false so the
+    /// caller never repeats the physical side effect.
+    pub fresh: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,7 +81,9 @@ impl DriveActions {
             let same =
                 existing.requested == (linear, angular, duration_ms) && existing.epoch == epoch;
             if same {
-                return Ok(existing.clone());
+                let mut replay = existing.clone();
+                replay.fresh = false;
+                return Ok(replay);
             }
             return Err("command_id already used with a different payload".into());
         }
@@ -98,6 +104,7 @@ impl DriveActions {
                     requested: (linear, angular, duration_ms),
                     outcome: Outcome::Refused(reason.into()),
                     created: now,
+                    fresh: true,
                 });
                 return Err(reason.into());
             }
@@ -112,6 +119,7 @@ impl DriveActions {
             requested: (linear, angular, duration_ms),
             outcome: Outcome::Sent,
             created: now,
+            fresh: true,
         };
         self.active = Some(command_id.into());
         self.remember(record.clone());
@@ -149,7 +157,10 @@ impl DriveActions {
             }
         }
         self.order.push(record.command_id.clone());
-        self.entries.insert(record.command_id.clone(), record);
+        let mut stored = record;
+        // Stored records are never fresh: only the live submission result is.
+        stored.fresh = false;
+        self.entries.insert(stored.command_id.clone(), stored);
     }
 }
 
@@ -228,6 +239,22 @@ mod tests {
         assert!(err.contains("BUSY"), "{err}");
         // Budget spent conservatively: 500 of 10000 gone.
         assert_eq!(grants.remaining_budget_ms("mcp", now), Some(9_500));
+    }
+
+    #[test]
+    fn replay_after_store_is_not_fresh() {
+        let now = Instant::now();
+        let mut grants = Grants::default();
+        grants.install(grant());
+        let mut actions = DriveActions::default();
+        let first = actions
+            .submit(&mut grants, "mcp", 1, "r1", 0.1, 0., 500, now)
+            .unwrap();
+        assert!(first.fresh, "initial submission is fresh");
+        let replay = actions
+            .submit(&mut grants, "mcp", 1, "r1", 0.1, 0., 500, now)
+            .unwrap();
+        assert!(!replay.fresh, "stored records are not fresh on replay");
     }
 
     #[test]

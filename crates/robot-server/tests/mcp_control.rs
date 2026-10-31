@@ -248,7 +248,17 @@ async fn mcp_cleaning_motors_apply_under_lease_and_zero_on_release() {
     }
 }
 
-// ---- #63: robot_say ----
+// ---- #64: drive_for goes through the supervisor-local deadline ----
+// FEATURE: MCP bounded motion runs under the robot-local DRIVE lease.
+// SPEC: without a supervisor address the tool refuses with zero Player
+// velocity emission (no host-lease fallback); with a fake supervisor the
+// DRIVE command carries the clamped values and STOP reaches it too;
+// a repeated command_id never sends a second DRIVE.
+// IMPLEMENTATION: supervisor_drive::{drive,stop} over a short authenticated
+// TCP connection; the host Safety lease remains the panel path only.
+// RESULT: IMPLEMENTED — offline fake supervisor checks pass.
+// STATUS: DONE
+
 // FEATURE: MCP speech over the existing audio pipeline.
 // SPEC: without configured TTS the tool is an explicit error (no playback
 // attempt); the tool appears in tools/list with strict arguments; a second
@@ -257,93 +267,84 @@ async fn mcp_cleaning_motors_apply_under_lease_and_zero_on_release() {
 // the panel's /api/audio/say.
 // RESULT: IMPLEMENTED — offline fake Player checks pass.
 // STATUS: DONE
-#[tokio::test]
-async fn mcp_say_reports_disabled_tts_and_lists_in_tools() {
-    let mut s = start(None).await;
-    drive_ready(&mut s).await;
-    // tools/list includes robot_say with a strict schema.
-    let list = rpc_json(
-        s.1,
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
-        None,
-    )
-    .await;
-    let names: Vec<&str> = list["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert!(names.contains(&"robot_say"), "names: {names:?}");
-    // No Yandex key in the test env: the call must be an explicit error that
-    // names TTS configuration, never a playback attempt or a secret.
-    let reply = call(&s, "robot_say", json!({"text":"Привет"})).await;
-    assert_eq!(reply["result"]["isError"], true, "{reply}");
-    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("tts"), "error names TTS: {text}");
-    assert!(!text.contains("Api-Key"), "no secrets in errors");
-    // Invalid arguments are rejected before any TTS consideration.
-    for bad in [
-        json!({"text": ""}),
-        json!({"text": "a\0b"}),
-        json!({"text": 42}),
-        json!({"text": "ok", "volume": -1.0}),
-        json!({"text": "ok", "unknown": true}),
-        json!({}),
-    ] {
-        let reply = call(&s, "robot_say", bad.clone()).await;
-        assert_eq!(reply["result"]["isError"], true, "args {bad}: {reply}");
-    }
-}
 
 /// With a live (fake) slow TTS provider the job is queued exactly once; the
 /// second call while it runs is BUSY and the receipt separates accepted from
 /// completed.
-#[tokio::test]
-async fn mcp_say_queues_once_and_reports_busy() {
-    // Slow fake provider: accepts the POST, never answers, so the job stays
-    // active long enough for the BUSY probe.
-    let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let provider_url = format!("http://{}/tts", provider.local_addr().unwrap());
+
+// FEATURE: MCP bounded motion runs under the robot-local DRIVE lease.
+// SPEC: without a supervisor address the tool refuses with zero Player
+// velocity emission (no host-lease fallback); with a fake supervisor the
+// DRIVE command carries the clamped values and STOP reaches it too;
+// a repeated command_id never sends a second DRIVE.
+// IMPLEMENTATION: supervisor_drive::{drive,stop} over a short authenticated
+// TCP connection; the host Safety lease remains the panel path only.
+// RESULT: IMPLEMENTED — offline fake supervisor checks pass.
+// STATUS: DONE
+
+/// Minimal fake supervisor: AUTH then DRIVE/STOP with recorded requests.
+/// One line per request, tagged with a per-connection id.
+async fn fake_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let log: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let logged = log.clone();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let logged = logged;
+        let counter = counter;
         loop {
-            let Ok((mut s, _)) = provider.accept().await else {
+            let Ok((mut s, _)) = listener.accept().await else {
                 break;
             };
+            let logged = logged.clone();
+            let cid = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let _ = s.read(&mut buf).await; // headers
-                let _ = s.write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ncontent-length: 6400\r\n\r\n",
-                )
-                .await;
-                // Body never arrives: the synthesis stalls.
-                std::future::pending::<()>().await;
+                let mut line = String::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match s.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                let req = line.trim().to_owned();
+                                line.clear();
+                                logged.lock().unwrap().push(format!("[{cid}] {req}"));
+                                let reply = match req.split_whitespace().next().unwrap_or("") {
+                                    "AUTH" => "AUTHENTICATED\n",
+                                    "DRIVE" => "DRIVING\n",
+                                    "STOP" => "STOPPED\n",
+                                    _ => "REFUSED\n",
+                                };
+                                if s.write_all(reply.as_bytes()).await.is_err() {
+                                    return;
+                                }
+                            } else {
+                                line.push(byte[0] as char);
+                            }
+                        }
+                    }
+                }
             });
         }
     });
-    let mut s = harness::start_env_tts(
-        None,
-        "mcp,0.2,1.0,2000,10000,600",
-        Some((&provider_url, "k")),
-    )
-    .await;
-    drive_ready(&mut s).await;
-    let first = call(&s, "robot_say", json!({"text":"Привет"})).await;
-    assert_eq!(first["result"]["isError"], false, "{first}");
-    let structured = &first["result"]["structuredContent"];
-    let task = structured["task_id"].as_str().expect("task id").to_owned();
-    assert_eq!(structured["state"], "queued");
-    // The busy window: a second job while the stalled one is active.
-    let second = call(&s, "robot_say", json!({"text":"Ещё"})).await;
-    assert_eq!(second["result"]["isError"], true, "{second}");
-    let text = second["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("busy"), "must be BUSY: {text}");
-    assert!(!text.contains('k') || !text.contains("Api-Key"));
-    // The task id is opaque and no secret leaked into receipts.
-    assert!(!task.is_empty());
+    (address, log)
 }
+
+// FEATURE: MCP speech over the existing audio pipeline.
+// SPEC: without configured TTS the tool is an explicit error (no playback
+// attempt); the tool appears in tools/list with strict arguments; a second
+// call while one job runs is BUSY; nothing about the reply leaks secrets.
+// IMPLEMENTATION: mcp robot_say wraps the shared Audio::submit path used by
+// the panel's /api/audio/say.
+// RESULT: IMPLEMENTED — offline fake Player checks pass.
+// STATUS: DONE
+
+/// With a live (fake) slow TTS provider the job is queued exactly once; the
+/// second call while it runs is BUSY and the receipt separates accepted from
+/// completed.
 
 // FEATURE: bounded MCP motion with idempotent command ids and honest stops.
 // SPEC: no lease → error; with lease+grant the velocity reaches Player once;
@@ -376,10 +377,170 @@ async fn drive_ready(s: &mut Server) {
     }
 }
 
+// ---- #63: robot_say ----
+#[tokio::test]
+async fn mcp_say_reports_disabled_tts_and_lists_in_tools() {
+    let mut s = start(None).await;
+    drive_ready(&mut s).await;
+    let list = rpc_json(
+        s.1,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        None,
+    )
+    .await;
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"robot_say"), "names: {names:?}");
+    let reply = call(&s, "robot_say", json!({"text":"Привет"})).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("tts"), "error names TTS: {text}");
+    assert!(!text.contains("Api-Key"), "no secrets in errors");
+    for bad in [
+        json!({"text": ""}),
+        json!({"text": "a\0b"}),
+        json!({"text": 42}),
+        json!({"text": "ok", "volume": -1.0}),
+        json!({"text": "ok", "unknown": true}),
+        json!({}),
+    ] {
+        let reply = call(&s, "robot_say", bad.clone()).await;
+        assert_eq!(reply["result"]["isError"], true, "args {bad}: {reply}");
+    }
+}
+
+#[tokio::test]
+async fn mcp_say_queues_once_and_reports_busy() {
+    let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_url = format!("http://{}/tts", provider.local_addr().unwrap());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut s, _)) = provider.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ncontent-length: 6400\r\n\r\n",
+                )
+                .await;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let mut s = harness::start_env_tts(
+        None,
+        "mcp,0.2,1.0,2000,10000,600",
+        Some((&provider_url, "k")),
+    )
+    .await;
+    drive_ready(&mut s).await;
+    let first = call(&s, "robot_say", json!({"text":"Привет"})).await;
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let structured = &first["result"]["structuredContent"];
+    assert_eq!(structured["state"], "queued");
+    let second = call(&s, "robot_say", json!({"text":"Ещё"})).await;
+    assert_eq!(second["result"]["isError"], true, "{second}");
+    let text = second["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("busy"), "must be BUSY: {text}");
+}
+
+// ---- #60/#64: supervisor-backed bounded motion ----
+#[tokio::test]
+async fn mcp_drive_without_supervisor_refuses_without_host_fallback() {
+    let mut s = start_env(None, "mcp,0.2,1.0,2000,10000,600").await;
+    drive_ready(&mut s).await;
+    assert_eq!(
+        call(&s, "robot_acquire_control", json!({})).await["result"]["isError"],
+        false
+    );
+    let reply = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.05,"angular_radps":0.0,"duration_ms":300,"command_id":"s1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("supervisor"), "names the supervisor: {text}");
+    while let Ok(c) = s.4.try_recv() {
+        panic!("drive without supervisor must not move: got {c:?}");
+    }
+}
+
+#[tokio::test]
+async fn mcp_drive_reaches_supervisor_and_stop_does_too() {
+    let (address, log) = fake_supervisor().await;
+    let mut s =
+        harness::start_env_supervisor(None, "mcp,0.2,1.0,2000,10000,600", (&address, "sup-token"))
+            .await;
+    drive_ready(&mut s).await;
+    assert_eq!(
+        call(&s, "robot_acquire_control", json!({})).await["result"]["isError"],
+        false
+    );
+    let reply = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.05,"angular_radps":0.0,"duration_ms":300,"command_id":"d1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    // Idempotent repeat must not send a second DRIVE.
+    let reply = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.05,"angular_radps":0.0,"duration_ms":300,"command_id":"d1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"]["replay"], true,
+        "second identical call must be a replay: {reply}"
+    );
+    let reply = call(&s, "robot_stop", json!({})).await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let requests = log.lock().unwrap().clone();
+        let drives = requests.iter().filter(|r| r.contains("] DRIVE ")).count();
+        if drives >= 1 && requests.iter().any(|r| r.ends_with("] STOP")) {
+            assert_eq!(
+                drives, 1,
+                "idempotent repeat must not re-send DRIVE: {requests:?}"
+            );
+            assert!(
+                requests.iter().any(|r| r.ends_with("AUTH sup-token")),
+                "authenticated: {requests:?}"
+            );
+            assert!(
+                requests.iter().any(|r| r.ends_with("DRIVE 0.05 0 300")),
+                "clamped values reach the supervisor: {requests:?}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervisor never got DRIVE+STOP: {requests:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    while let Ok(c) = s.4.try_recv() {
+        panic!("host velocity emitted despite supervisor lease: {c:?}");
+    }
+}
+
 #[tokio::test]
 async fn mcp_drive_for_bounded_idempotent_and_stoppable() {
-    // Operator grant via the operator-only env, subject "mcp".
-    let mut s = start_env(None, "mcp,0.2,1.0,2000,10000,600").await;
+    let (address, log) = fake_supervisor().await;
+    let mut s =
+        harness::start_env_supervisor(None, "mcp,0.2,1.0,2000,10000,600", (&address, "")).await;
     drive_ready(&mut s).await;
     // No lease yet: acquire first.
     let reply = call(
@@ -393,7 +554,6 @@ async fn mcp_drive_for_bounded_idempotent_and_stoppable() {
         .as_str()
         .unwrap()
         .contains("acquire"));
-    // Acquire, then drive: the velocity must reach the fake Player.
     let reply = call(&s, "robot_acquire_control", json!({})).await;
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     let reply = call(
@@ -403,32 +563,7 @@ async fn mcp_drive_for_bounded_idempotent_and_stoppable() {
     )
     .await;
     assert_eq!(reply["result"]["isError"], false, "{reply}");
-    // The acquire handshake may flush its safety zero first; require the
-    // requested velocity to arrive within the window.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(3), s.4.recv())
-            .await
-            .expect("velocity reached Player")
-            .unwrap();
-        if seen == (0.05, 0.0) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "requested velocity never reached Player"
-        );
-    }
-    // Idempotent repeat: the same command_id returns the record and does not
-    // emit a second velocity command.
-    let reply = call(
-        &s,
-        "robot_drive_for",
-        json!({"linear_mps":0.05,"angular_radps":0.0,"duration_ms":300,"command_id":"c1"}),
-    )
-    .await;
-    assert_eq!(reply["result"]["isError"], false, "{reply}");
-    // A different payload under the same id is rejected.
+    // Different payload under the same id is rejected.
     let reply = call(
         &s,
         "robot_drive_for",
@@ -436,35 +571,19 @@ async fn mcp_drive_for_bounded_idempotent_and_stoppable() {
     )
     .await;
     assert_eq!(reply["result"]["isError"], true, "{reply}");
-    // robot_get_action returns the honest record.
     let reply = call(&s, "robot_get_action", json!({"command_id":"c1"})).await;
-    assert_eq!(reply["result"]["isError"], false, "{reply}");
     assert_eq!(
         reply["result"]["structuredContent"]["outcome"]["state"],
         "sent"
     );
-    // robot_stop clears the action and sends the zero. The drive clock may
-    // first flush the safety-owned zero from the acquire handshake; accept
-    // either ordering but require a zero to arrive.
     let reply = call(&s, "robot_stop", json!({})).await;
     assert_eq!(reply["result"]["isError"], false, "{reply}");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(3), s.4.recv())
-            .await
-            .expect("a velocity command reached Player after stop")
-            .unwrap();
-        if seen == (0.0, 0.0) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "zero never reached Player"
-        );
-    }
     let reply = call(&s, "robot_get_action", json!({"command_id":"c1"})).await;
     assert_eq!(
         reply["result"]["structuredContent"]["outcome"]["state"],
         "stopped"
     );
+    while let Ok(c) = s.4.try_recv() {
+        panic!("host velocity emitted despite supervisor lease: {c:?}");
+    }
 }

@@ -362,13 +362,6 @@ fn dispatch(app: &App, request: Value) -> Response {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 return set_cleaning_motors(id, app, args);
             }
-            if name == "robot_drive_for" {
-                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                return drive_for(id, app, args);
-            }
-            if name == "robot_stop" {
-                return mcp_stop(id, app);
-            }
             if name == "robot_get_action" {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 return get_action(id, app, args);
@@ -924,14 +917,27 @@ pub async fn endpoint(State(app): State<App>, headers: HeaderMap, body: String) 
         Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    // The camera tool performs bounded network I/O: run it before the sync
-    // dispatcher so its 30s wall clock bound is a real timeout, not a guess.
+    // Tools with bounded network I/O run before the sync dispatcher so their
+    // wall clock bounds are real timeouts, not guesses: the camera snapshot
+    // and the supervisor drive lease round trip.
     if request.get("method").and_then(Value::as_str) == Some("tools/call") {
         let params = request.get("params").cloned().unwrap_or(Value::Null);
-        if params.get("name").and_then(Value::as_str) == Some("robot_get_camera_frame") {
-            let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            return camera_frame(id, &app, args).await;
+        match params.get("name").and_then(Value::as_str) {
+            Some("robot_get_camera_frame") => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                return camera_frame(id, &app, args).await;
+            }
+            Some("robot_drive_for") => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                return drive_for_async(id, &app, args).await;
+            }
+            Some("robot_stop") => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                return mcp_stop_async(id, &app).await;
+            }
+            _ => {}
         }
     }
     // Bound dispatch work per call so a heavy caller cannot stall the panel.
@@ -951,9 +957,63 @@ fn _unused(_: Failure) {}
 /// operator grant, recorded idempotently and sent to the sole Player writer.
 /// The physical deadline is enforced by the supervisor's DRIVE lease (#55);
 /// this host-side path only starts bounded motions and tracks outcomes.
-fn drive_for(id: Value, app: &App, args: Value) -> Response {
+/// Async entry (#64): the supervisor round trip needs a real timeout
+/// context; validation and grant checks run inline first.
+async fn drive_for_async(id: Value, app: &App, args: Value) -> Response {
+    match prepare_drive(id, app, args) {
+        Ok((id, record, address, token)) => {
+            // A replayed record must never repeat the physical side effect:
+            // skip the network round trip entirely.
+            if !record.fresh {
+                let mut payload = mcp_drive::record_json(&record);
+                payload["replay"] = json!(true);
+                return json_response(
+                    json!({"jsonrpc":"2.0","id":id,"result":{
+                        "content": [{"type":"text","text": payload.to_string()}],
+                        "structuredContent": payload,
+                        "isError": false}}),
+                    StatusCode::OK,
+                );
+            }
+            let (vx, vyaw, ms) = record.requested;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(12),
+                crate::supervisor_drive::drive(&address, &token, vx, vyaw, ms),
+            )
+            .await;
+            finish_drive(
+                id,
+                app,
+                record,
+                outcome.map_err(|_| "timeout".into()).and_then(|r| r),
+            )
+        }
+        Err(response) => response,
+    }
+}
+async fn mcp_stop_async(id: Value, app: &App) -> Response {
+    let supervisor_stop = match app.supervisor.clone() {
+        Some((address, token)) => tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::supervisor_drive::stop(&address, &token),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|reply| reply == "STOPPED")
+        .unwrap_or(false),
+        None => false,
+    };
+    stop_common(id, app, supervisor_stop)
+}
+
+fn prepare_drive(
+    id: Value,
+    app: &App,
+    args: Value,
+) -> Result<(Value, mcp_drive::ActionRecord, String, String), Response> {
     let Some(obj) = args.as_object() else {
-        return tool_error(id, "arguments must be an object".into());
+        return Err(tool_error(id, "arguments must be an object".into()));
     };
     let get_num = |key: &str| obj.get(key).and_then(Value::as_f64);
     let get_str = |key: &str| obj.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -963,30 +1023,38 @@ fn drive_for(id: Value, app: &App, args: Value) -> Response {
         obj.get("duration_ms").and_then(Value::as_u64),
         get_str("command_id"),
     ) else {
-        return tool_error(
+        return Err(tool_error(
             id,
             "linear_mps, angular_radps, duration_ms and command_id are required".into(),
-        );
+        ));
     };
     if !linear.is_finite() || !angular.is_finite() {
-        return tool_error(id, "speeds must be finite".into());
+        return Err(tool_error(id, "speeds must be finite".into()));
     }
     if duration == 0 || duration > 60_000 {
-        return tool_error(id, "duration_ms must be 1..60000".into());
+        return Err(tool_error(id, "duration_ms must be 1..60000".into()));
     }
     // MCP control lease must be held (the shared Safety owner from #56).
     let owner = app.safety.lock().unwrap().owner();
     if !owner.is_some_and(|o| o >= 1_000_000) {
-        return tool_error(
+        return Err(tool_error(
             id,
             "control not acquired; call robot_acquire_control first".into(),
-        );
+        ));
     }
+    // The bounded motion runs under the robot-local deadline (#64): no
+    // supervisor means an explicit error, never a host-lease fallback.
+    let Some((address, token)) = app.supervisor.clone() else {
+        return Err(tool_error(
+            id,
+            "no supervisor: robot-local drive deadline unavailable; motion refused".into(),
+        ));
+    };
     // Grant check + idempotent record + conservative budget spend.
     let epoch = app.grants.lock().unwrap().epoch();
     let mut grants = app.grants.lock().unwrap();
     let mut actions = app.drive_actions.lock().unwrap();
-    let record = match actions.submit(
+    match actions.submit(
         &mut grants,
         "mcp",
         epoch,
@@ -996,44 +1064,78 @@ fn drive_for(id: Value, app: &App, args: Value) -> Response {
         duration,
         std::time::Instant::now(),
     ) {
-        Ok(record) => record,
-        Err(reason) => return tool_error(id, reason),
-    };
-    drop(grants);
-    // Send on the sole Player writer with the same 20 ms drive-clock framing;
-    // the Safety lease keeps the expiry, the supervisor DRIVE lease is the
-    // physical backstop when this host path dies.
-    let mut writer = app.player.clone();
-    let sent = futures_util::FutureExt::now_or_never(async {
-        crate::player::velocity(&mut writer, record.requested.0, record.requested.1).await
-    })
-    .unwrap_or_else(|| Ok(()));
-    match sent {
-        Ok(()) => json_response(
+        Ok(record) => {
+            drop(grants);
+            Ok((id, record, address, token))
+        }
+        Err(reason) => Err(tool_error(id, reason)),
+    }
+}
+
+/// Turn the supervisor round-trip result into the tool response. A replayed
+/// non-Sent record short-circuits before any network I/O.
+fn finish_drive(
+    id: Value,
+    app: &App,
+    record: mcp_drive::ActionRecord,
+    outcome: Result<String, crate::Failure>,
+) -> Response {
+    if !record.fresh {
+        let mut payload = mcp_drive::record_json(&record);
+        payload["replay"] = json!(true);
+        return json_response(
+            json!({"jsonrpc":"2.0","id":id,"result":{
+                "content": [{"type":"text","text": payload.to_string()}],
+                "structuredContent": payload,
+                "isError": false}}),
+            StatusCode::OK,
+        );
+    }
+    if !matches!(record.outcome, mcp_drive::Outcome::Sent) {
+        return json_response(
+            json!({"jsonrpc":"2.0","id":id,"result":{
+                "content": [{"type":"text","text": mcp_drive::record_json(&record).to_string()}],
+                "structuredContent": mcp_drive::record_json(&record),
+                "isError": false}}),
+            StatusCode::OK,
+        );
+    }
+    match outcome {
+        Ok(reply) if reply == "DRIVING" => json_response(
             json!({"jsonrpc":"2.0","id":id,"result":{
                 "content": [{"type":"text","text": mcp_drive::record_json(&record).to_string()}],
                 "structuredContent": mcp_drive::record_json(&record),
                 "isError": false}}),
             StatusCode::OK,
         ),
+        Ok(reply) => {
+            let reason = format!("supervisor refused drive: {reply}");
+            app.drive_actions
+                .lock()
+                .unwrap()
+                .stop_active(mcp_drive::Outcome::Refused(reason.clone()));
+            tool_error(id, reason)
+        }
         Err(e) => {
-            actions.stop_active(mcp_drive::Outcome::Refused(format!(
-                "velocity write failed: {e}"
-            )));
-            tool_error(id, format!("velocity write failed: {e}"))
+            let reason = format!("supervisor drive failed: {e}");
+            app.drive_actions
+                .lock()
+                .unwrap()
+                .stop_active(mcp_drive::Outcome::Refused(reason.clone()));
+            tool_error(id, reason)
         }
     }
 }
 
-/// `robot_stop`: priority stop. Clears the active action record, clears the
-/// Safety pending command and sends the zero on the shared writer.
-fn mcp_stop(id: Value, app: &App) -> Response {
+/// Common stop tail (#64): the supervisor owns the local deadline; the host
+/// Safety zero stays as a belt-and-braces flush of the shared lease.
+#[allow(clippy::too_many_lines)]
+fn stop_common(id: Value, app: &App, supervisor_stop: bool) -> Response {
     let stopped = app
         .drive_actions
         .lock()
         .unwrap()
         .stop_active(mcp_drive::Outcome::Stopped);
-    // Safety priority stop path: a zero command from the MCP lease owner.
     let owner = app.safety.lock().unwrap().owner();
     if let Some(owner) = owner.filter(|o| *o >= 1_000_000) {
         app.safety
@@ -1041,16 +1143,23 @@ fn mcp_stop(id: Value, app: &App) -> Response {
             .unwrap()
             .command(owner, 0., 0., std::time::Instant::now());
     }
-    let mut writer = app.player.clone();
-    let zero_sent = futures_util::FutureExt::now_or_never(async {
-        crate::player::velocity(&mut writer, 0., 0.).await
-    })
-    .unwrap_or_else(|| Ok(()))
-    .is_ok();
+    // When the supervisor confirmed the stop, the motion lease lives there:
+    // no host Player write is needed (and none may be emitted, #64).
+    let zero_sent = if supervisor_stop {
+        true
+    } else {
+        let mut writer = app.player.clone();
+        futures_util::FutureExt::now_or_never(async {
+            crate::player::velocity(&mut writer, 0., 0.).await
+        })
+        .unwrap_or_else(|| Ok(()))
+        .is_ok()
+    };
     json_response(
         json!({"jsonrpc":"2.0","id":id,"result":{
             "content": [{"type":"text","text": if zero_sent { "stop requested" } else { "stop record cleared; zero send unconfirmed" }}],
             "structuredContent": {
+                "supervisor_stopped": supervisor_stop,
                 "zero_sent": zero_sent,
                 "had_active": stopped.is_some(),
                 "note": "отправленный ноль не доказывает физическую остановку; локальный дедлайн — супервизор"

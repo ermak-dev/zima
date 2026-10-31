@@ -8,6 +8,7 @@ mod player;
 mod safety;
 mod slam;
 mod state;
+mod supervisor_drive;
 mod telemetry;
 mod vision;
 
@@ -141,6 +142,9 @@ struct App {
     drive_actions: Arc<std::sync::Mutex<mcp_drive::DriveActions>>,
     /// Shared TTS pipeline (panel HTTP and the MCP robot_say tool, #63).
     audio: audio::Audio,
+    /// Supervisor address/token for the robot-local drive lease (#64);
+    /// None when the session runs without a supervisor (audio-only, tests).
+    supervisor: Option<(String, String)>,
 }
 /// Whether this session ever commanded the cleaning motors; duties live in
 /// the typed state. The write half sends PWM commands on the sole Player
@@ -644,6 +648,12 @@ async fn run_session(
         grants: Arc::new(std::sync::Mutex::new(mcp_grant_from_env())),
         drive_actions: Arc::new(std::sync::Mutex::new(mcp_drive::DriveActions::default())),
         audio: audio.clone(),
+        supervisor: std::env::var("ROBOT_SUPERVISOR_ADDR").ok().map(|addr| {
+            (
+                addr,
+                std::env::var("ROBOT_SUPERVISOR_TOKEN").unwrap_or_default(),
+            )
+        }),
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
         Ok(l) => l,
