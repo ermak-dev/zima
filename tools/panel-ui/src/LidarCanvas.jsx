@@ -83,7 +83,7 @@ function gridImage(cache, m) {
 // The canvas is an imperative island: React never renders into it. The
 // backing buffer is sized only when the element resizes (not on every
 // frame), and redraws happen on data/interaction, not on a fixed timer.
-export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
+export default function LidarCanvas({ scan, view, onView, slam, mapFrame, slamState }) {
   const localState = useSlamState(slamState ? null : slam, scan)
   const freshness = slamState || localState
   const canvasRef = useRef(null)
@@ -95,9 +95,9 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
     const previous = pairRef.current
     const same = previous && previous.scan.sequence === scan.sequence && previous.scan.id === scan.id &&
       previous.scan.stamp === scan.stamp && previous.slam.scan_stamp === slam.scan_stamp
-    pairRef.current = { scan, slam, receivedAt: same ? previous.receivedAt : performance.now() - (freshness.ageMs ?? 0) }
+    pairRef.current = { scan, slam, map: mapFrame, receivedAt: same ? previous.receivedAt : performance.now() - (freshness.ageMs ?? 0) }
   }
-  stateRef.current = { scan, view, onView, slam, freshness }
+  stateRef.current = { scan, view, onView, slam, map: mapFrame, freshness }
 
   useEffect(() => {
     scheduleRef.current?.()
@@ -155,15 +155,15 @@ export default function LidarCanvas({ scan, view, onView, slam, slamState }) {
       ctx.font = '11px system-ui'
       ctx.fillText(`${step} м`, W - 44, H - 12)
 
-      // A fixed map is useful even with a bad pose; a robot-frame map is an
-      // overlay and must not pretend to align with another scan or stale pose.
+      // The versioned grid comes from `map` frames; the world view may use
+      // the latest one, a robot-frame overlay only with a matched fresh pair.
       const world = v.frame === 'map'
       const pair = pairRef.current
       const pairFresh = pair && !s.freshness.stale && !s.freshness.failed &&
         performance.now() - pair.receivedAt <= s.freshness.maxAgeMs
       const matchedSlam = pairFresh ? pair.slam : null
       const matchedScan = pairFresh ? pair.scan : null
-      const map = world ? s.slam?.map : matchedSlam?.map
+      const map = world ? s.map?.grid : matchedSlam ? s.map?.grid : null
       const pose = matchedSlam?.pose
       if (v.showMap !== false && map?.cells && (world || matchedSlam)) {
         const image = gridImage(gridCacheRef.current, map)

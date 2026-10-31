@@ -20,12 +20,12 @@ const scan = { id: 8, frame: 'base_link', points: [[1, 0], [0, -2]] }
 const slam = {
   scan_id: 8, scan_stamp: 9, age_ms: 0, max_age_ms: 500, stale: false,
   mode: 'mapping', tracking: 'tracking', pose: { x: 2, y: -1, yaw: Math.PI / 2 },
-  map: { x_min: 0, y_min: 0, w: 2, h: 1, res: 1, cells: '100,-1' },
 }
+const mapFrame = { version: 1, grid: { x_min: 0, y_min: 0, w: 2, h: 1, res: 1, cells: '100,-1' } }
 const view = { radius: 3, center: null }
 function draw() { act(() => vi.advanceTimersByTime(20)) }
-function mount(s = slam, frame = 'robot', sc = scan) {
-  return render(<LidarCanvas scan={sc} slam={s} view={{ ...view, frame }} onView={() => {}} />)
+function mount(s = slam, frame = 'robot', sc = scan, m = mapFrame) {
+  return render(<LidarCanvas scan={sc} slam={s} mapFrame={m} view={{ ...view, frame }} onView={() => {}} />)
 }
 
 beforeEach(() => {
@@ -62,11 +62,11 @@ describe('SLAM overlay rendering', () => {
     const { rerender } = mount(); draw()
     expect(ctx.drawImage).toHaveBeenCalledTimes(1)
     act(() => vi.advanceTimersByTime(300))
-    rerender(<LidarCanvas scan={scan} slam={{ ...slam }} view={view} onView={() => {}} />)
+    rerender(<LidarCanvas scan={scan} slam={{ ...slam }} mapFrame={mapFrame} view={view} onView={() => {}} />)
     draw()
     ctx.drawImage.mockClear()
     act(() => vi.advanceTimersByTime(350))
-    rerender(<LidarCanvas scan={scan} slam={{ ...slam }} view={{ ...view, radius: 3.1 }} onView={() => {}} />)
+    rerender(<LidarCanvas scan={scan} slam={{ ...slam }} mapFrame={mapFrame} view={{ ...view, radius: 3.1 }} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).not.toHaveBeenCalled()
   })
@@ -77,13 +77,13 @@ describe('SLAM overlay rendering', () => {
     const { rerender } = mount(first, 'robot', firstScan); draw()
     expect(ctx.drawImage).toHaveBeenCalled()
     ctx.drawImage.mockClear(); ctx.arc.mockClear()
-    rerender(<LidarCanvas scan={{ ...scan, sequence: 102, points: [[2, 0]] }} slam={first} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    rerender(<LidarCanvas scan={{ ...scan, sequence: 102, points: [[2, 0]] }} slam={first} mapFrame={mapFrame} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).toHaveBeenCalled()
     expect(ctx.arc).toHaveBeenCalledWith(127 + 100 / 3, 127, 2, 0, 2 * Math.PI)
     expect(ctx.arc).not.toHaveBeenCalledWith(127 + 200 / 3, 127, 2, 0, 2 * Math.PI)
     ctx.drawImage.mockClear(); ctx.arc.mockClear()
-    rerender(<LidarCanvas scan={{ ...scan, sequence: 102, points: [[2, 0]] }} slam={{ ...first, scan_sequence: 102 }} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    rerender(<LidarCanvas scan={{ ...scan, sequence: 102, points: [[2, 0]] }} slam={{ ...first, scan_sequence: 102 }} mapFrame={mapFrame} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).toHaveBeenCalled()
     expect(ctx.arc).toHaveBeenCalledWith(127 + 200 / 3, 127, 2, 0, 2 * Math.PI)
@@ -97,12 +97,12 @@ describe('SLAM overlay rendering', () => {
     const { rerender } = mount(first, 'robot', firstScan); draw()
     ctx.drawImage.mockClear(); ctx.arc.mockClear()
     const next = { ...first, scan_sequence: 102 }
-    rerender(<LidarCanvas scan={firstScan} slam={next} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    rerender(<LidarCanvas scan={firstScan} slam={next} mapFrame={mapFrame} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).toHaveBeenCalled()
     expect(ctx.arc).toHaveBeenCalledWith(127 + 100 / 3, 127, 2, 0, 2 * Math.PI)
     ctx.drawImage.mockClear()
-    rerender(<LidarCanvas scan={firstScan} slam={{ ...next, tracking: 'error', error: 'adapter timeout' }} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
+    rerender(<LidarCanvas scan={firstScan} slam={{ ...next, tracking: 'error', error: 'adapter timeout' }} mapFrame={mapFrame} view={{ ...view, frame: 'robot' }} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).not.toHaveBeenCalled()
   })
@@ -114,11 +114,11 @@ describe('SLAM overlay rendering', () => {
     act(() => vi.advanceTimersByTime(650))
     ctx.drawImage.mockClear()
     const next = { ...slam, scan_sequence: 102 }
-    rerender(<LidarCanvas scan={{ ...scan, sequence: 102 }} slam={next} view={view} onView={() => {}} />)
+    rerender(<LidarCanvas scan={{ ...scan, sequence: 102 }} slam={next} mapFrame={mapFrame} view={view} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).toHaveBeenCalled()
     ctx.drawImage.mockClear()
-    rerender(<LidarCanvas scan={{ ...scan, sequence: 103 }} slam={next} view={view} onView={() => {}} />)
+    rerender(<LidarCanvas scan={{ ...scan, sequence: 103 }} slam={next} mapFrame={mapFrame} view={view} onView={() => {}} />)
     draw()
     expect(ctx.drawImage).toHaveBeenCalled()
     act(() => vi.advanceTimersByTime(650)); ctx.drawImage.mockClear(); draw()
@@ -158,6 +158,7 @@ describe('SLAM overlay rendering', () => {
   it('does not rejuvenate a pose when the lidar panel remounts', () => {
     const { getByRole } = render(<App />)
     act(() => {
+      onMessage({ type: 'map', data: mapFrame })
       onMessage({ type: 'state', data: { slam } })
       onMessage({ type: 'scan', data: scan })
     })

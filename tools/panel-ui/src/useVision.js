@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import wsChannel from './wsChannel.js'
 
 const empty = (status, error) => ({ status, error, frame: null })
 const validObject = (object) => {
@@ -17,8 +18,6 @@ export default function useVision(active) {
   useEffect(() => {
     if (!active) { setValue(empty('off')); return }
     let alive = true
-    let socket = null
-    let retry = null
     let stale = null
     let pending = null
     let generation = 0
@@ -42,16 +41,10 @@ export default function useVision(active) {
       clearTimeout(stale)
       stale = setTimeout(() => clear('stale'), 3000)
     }
-    const connect = () => {
-      if (!alive) return
-      lastId = -1
-      clear('connecting')
-      watchStale()
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      const ws = new WebSocket(`${proto}://${location.host}/vision/ws`)
-      socket = ws
-      ws.onmessage = (event) => {
-        if (!alive || socket !== ws) return
+    const channel = wsChannel('/vision/ws', {
+      onAttempt: () => { lastId = -1 },
+      onMessage: (ws, event) => {
+        if (!alive) return
         let message
         try { message = JSON.parse(event.data) } catch { return }
         const data = message?.data
@@ -72,7 +65,7 @@ export default function useVision(active) {
         const img = new Image()
         pending = img
         img.onload = () => {
-          if (!alive || socket !== ws || token !== generation) return
+          if (!alive || channel.socket !== ws || token !== generation) return
           img.onload = null
           img.onerror = null
           pending = null
@@ -80,35 +73,23 @@ export default function useVision(active) {
           setValue({ status: 'live', frame: { ...data, src, objects: data.objects.filter(validObject) } })
         }
         img.onerror = () => {
-          if (alive && socket === ws && token === generation) clear('error', 'Не удалось декодировать кадр')
+          if (alive && channel.socket === ws && token === generation) clear('error', 'Не удалось декодировать кадр')
         }
         img.src = src
-      }
-      ws.onclose = () => {
-        if (!alive || socket !== ws) return
-        ws.onmessage = null
-        ws.onclose = null
-        ws.onerror = null
-        socket = null
-        clear('disconnected')
-        retry = setTimeout(connect, Math.min(500 * 2 ** attempts++, 5000))
-      }
+      },
       // Browsers follow a socket error with close; close also covers test/fake
       // transports that do not synthesize that event themselves.
-      ws.onerror = () => ws.close()
-    }
-    connect()
+      onError: (ws) => ws.close(),
+      onClosed: () => {
+        clear('disconnected')
+        return Math.min(500 * 2 ** attempts++, 5000)
+      },
+    })
     return () => {
       alive = false
-      clearTimeout(retry)
       clearTimeout(stale)
       cancelImage()
-      if (socket) {
-        socket.onmessage = null
-        socket.onclose = null
-        socket.onerror = null
-        socket.close()
-      }
+      channel.stop()
     }
   }, [active])
   return active ? value : empty('off')

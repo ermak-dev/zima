@@ -19,6 +19,9 @@ const fmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFix
 export default function App() {
   const [state, setState] = useState({})
   const [scan, setScan] = useState({})
+  // The versioned SLAM grid arrives in its own `map` frames; the frequent
+  // state carries only `slam.map_version`.
+  const [mapFrame, setMapFrame] = useState(null)
   // Keep result age above collapsible panels: reopening a canvas is not a new result.
   const slamState = useSlamState(state.slam, scan)
   const [view, setView] = useState({ radius: 3, center: null, frame: 'robot', showScan: true, showMap: true })
@@ -45,6 +48,7 @@ export default function App() {
   const onMessage = useCallback((msg) => {
     if (msg.type === 'state') setState(msg.data)
     else if (msg.type === 'scan') setScan(msg.data)
+    else if (msg.type === 'map' && msg.data && Number.isInteger(msg.data.version)) setMapFrame(msg.data)
     else if (msg.type === 'vision' && typeof msg.data?.enabled === 'boolean') setVisionEnabled(msg.data.enabled)
   }, [])
   const { connected, send } = usePanelSocket(onMessage)
@@ -166,7 +170,7 @@ export default function App() {
           </div>
           {!collapsed.lidar && (
             <div className="lidar-stage">
-              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} slamState={slamState} />
+              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} mapFrame={mapFrame} slamState={slamState} />
               <div className="legend">
                 <span><i className="dot" />Скан лидара</span>
                 <span><i className="robot-dot" />{view.frame === 'map' ? 'Робот · поза SLAM' : 'Робот · начало координат'}</span>

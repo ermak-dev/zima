@@ -1,60 +1,42 @@
 import { useEffect, useRef, useState } from 'react'
+import wsChannel from './wsChannel.js'
 
-// One push channel for everything the server streams. Reconnects with a
-// capped backoff; every timer and listener is released on unmount or on
-// server change, so no leaked socket survives a hot reload.
+// One push channel for everything the server streams. Reconnects with the
+// panel's own capped backoff; every timer and listener is released on unmount
+// or on server change, so no leaked socket survives a hot reload.
 export default function usePanelSocket(onMessage) {
   const [connected, setConnected] = useState(false)
   const handler = useRef(onMessage)
   handler.current = onMessage
-  const socketRef = useRef(null)
+  const channelRef = useRef(null)
 
   useEffect(() => {
-    let closed = false
-    let retry = null
     let attempts = 0
-
-    const connect = () => {
-      if (closed) return
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      const ws = new WebSocket(`${proto}://${location.host}/ws`)
-      socketRef.current = ws
-      ws.onopen = () => {
+    const channel = wsChannel('/ws', {
+      onOpen: () => {
         attempts = 0
         setConnected(true)
-      }
-      ws.onmessage = (event) => {
+      },
+      onMessage: (ws, event) => {
         try {
           handler.current(JSON.parse(event.data))
         } catch {
           // malformed frame: ignore, the connection stays usable
         }
-      }
-      ws.onclose = () => {
+      },
+      onClosed: () => {
         setConnected(false)
-        socketRef.current = null
-        if (!closed) {
-          attempts += 1
-          const delay = Math.min(500 * 2 ** attempts, 5000)
-          retry = setTimeout(connect, delay)
-        }
-      }
-    }
-    connect()
+        attempts += 1
+        return Math.min(500 * 2 ** attempts, 5000)
+      },
+    })
+    channelRef.current = channel
     return () => {
-      closed = true
-      clearTimeout(retry)
-      const ws = socketRef.current
-      if (ws) {
-        ws.onclose = null
-        ws.close()
-      }
+      channelRef.current = null
+      channel.stop()
     }
   }, [])
 
-  const send = (msg) => {
-    const ws = socketRef.current
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
-  }
+  const send = (msg) => channelRef.current?.send(msg)
   return { connected, send }
 }
