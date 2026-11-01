@@ -219,6 +219,14 @@ async fn mcp_observe_reports_vision_detections() {
 
 /// #68 live path: with a camera and a fake YOLO adapter, observe carries the
 /// actual detections (status live, objects with normalized boxes).
+// BUG: observe copied the panel's cached base64 JPEG into both structured
+// content and its text mirror, making a small observation hundreds of KB.
+// HYPOTHESIS: MCP clones the entire shared vision value instead of selecting
+// metadata; stripping it must not mutate the panel cache or the camera tool.
+// SOLUTION: project vision metadata at the MCP boundary, leaving the shared cache intact.
+// RESULT: FIXED — live local HTTP response shrank from 402166 to 2126 bytes;
+// the panel vision socket and separate camera tool retain the original JPEG.
+// STATUS: FIXED
 #[tokio::test]
 async fn mcp_observe_carries_live_yolo_detections() {
     use std::os::unix::fs::PermissionsExt;
@@ -228,28 +236,32 @@ async fn mcp_observe_carries_live_yolo_detections() {
     std::thread::spawn(move || {
         for conn in camera.incoming() {
             let Ok(mut conn) = conn else { continue };
-            use std::io::{Read, Write};
-            let mut buf = [0u8; 4096];
-            let _ = conn.read(&mut buf); // request headers
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-            let _ = conn.write_all(head.as_bytes());
-            let frame = [0xffu8, 0xd8, 0x00, 0xff, 0xd9];
-            loop {
-                let part = format!(
-                    "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                    frame.len()
-                );
-                if conn.write_all(part.as_bytes()).is_err() {
-                    break;
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf); // request headers
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+                let _ = conn.write_all(head.as_bytes());
+                let mut frame = vec![0xffu8, 0xd8];
+                frame.extend(std::iter::repeat_n(0x55, 150_000));
+                frame.extend_from_slice(&[0xff, 0xd9]);
+                loop {
+                    let part = format!(
+                        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                        frame.len()
+                    );
+                    if conn.write_all(part.as_bytes()).is_err() {
+                        break;
+                    }
+                    if conn.write_all(&frame).is_err() {
+                        break;
+                    }
+                    if conn.write_all(b"\r\n").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                if conn.write_all(&frame).is_err() {
-                    break;
-                }
-                if conn.write_all(b"\r\n").is_err() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            });
         }
     });
     let dir = std::env::temp_dir().join(format!("robot-mcp-yolo-{}", std::process::id()));
@@ -347,4 +359,64 @@ for line in sys.stdin:
     assert_eq!(obj["confidence"], 0.9, "{o}");
     assert_eq!(obj["box"], json!([0.1, 0.2, 0.5, 0.8]), "{o}");
     assert!(vision["inference_ms"].is_f64(), "{o}");
+    let response_bytes = o.to_string().len();
+    eprintln!("MCP_OBSERVE_RESPONSE_BYTES={response_bytes}");
+    assert!(
+        vision.get("jpeg").is_none(),
+        "JPEG leaked into robot_observe: {response_bytes} bytes"
+    );
+    assert!(
+        response_bytes < 16_384,
+        "observation must stay compact, got {response_bytes} bytes"
+    );
+    let text: Value =
+        serde_json::from_str(o["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text, o["result"]["structuredContent"]);
+
+    // The separate panel channel must still carry its frame: changing the
+    // MCP boundary must not delete jpeg from the shared vision cache.
+    use base64::Engine;
+    use futures_util::StreamExt;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/vision/ws", server.1))
+            .await
+            .unwrap();
+    let panel = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = ws.next().await.unwrap().unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let data: Value = serde_json::from_str(&text).unwrap();
+                if data["data"]["status"] == "live" {
+                    break data["data"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("panel still receives vision JPEG");
+    let jpeg = base64::engine::general_purpose::STANDARD
+        .decode(panel["jpeg"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(jpeg.len(), 150_004);
+    assert_eq!(panel["objects"], vision["objects"]);
+    let frame = call(
+        &server,
+        "robot_get_camera_frame",
+        json!({"max_bytes":300_000,"max_age_ms":1000}),
+    )
+    .await;
+    assert_eq!(frame["result"]["isError"], false);
+    let image = frame["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["type"] == "image")
+        .expect("camera ImageContent");
+    let camera_jpeg = base64::engine::general_purpose::STANDARD
+        .decode(image["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        camera_jpeg, jpeg,
+        "separate camera tool must keep returning the original bytes"
+    );
 }

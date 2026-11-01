@@ -328,6 +328,13 @@ fn observe(state: &crate::state::State, scan: Option<&Value>, vision: Option<&Va
     let vision = match vision {
         None => json!({"status": "unavailable",
             "note": "YOLO-адаптер не настроен; задайте --yolo-adapter"}),
+        Some(Value::Object(fields)) => Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "jpeg")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
         Some(v) => v.clone(),
     };
     json!({
@@ -420,14 +427,11 @@ fn dispatch(app: &App, request: Value) -> Response {
             }
             let mut state = app.state.clone();
             let mut scan = app.scan.clone();
-            let vision = app
-                .vision
-                .clone()
-                .map(|mut v| v.borrow_and_update().clone());
+            let vision = app.vision.as_ref().map(|v| v.borrow());
             let snapshot = observe(
                 &state.borrow_and_update(),
                 scan.borrow_and_update().as_ref(),
-                vision.as_ref(),
+                vision.as_deref(),
             );
             json_response(
                 json!({"jsonrpc":"2.0","id":id,"result":{
