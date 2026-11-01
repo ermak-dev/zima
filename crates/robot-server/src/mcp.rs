@@ -62,6 +62,7 @@ fn tools() -> Value {
         acquire_control_tool(),
         release_control_tool(),
         reset_hazards_tool(),
+        recover_bumper_tool(),
         drive_for_tool(),
         mcp_stop_tool(),
         get_action_tool(),
@@ -139,14 +140,25 @@ fn release_control_tool() -> Value {
     })
 }
 
-/// Hazard-latch reset (#67): the MCP-side escape from a latched bumper,
-/// mirroring the panel's reset. Refused while the contact persists — the
-/// firmware also blocks all motion under a pressed bumper, so the operator
-/// (or a human hand) must clear the robot first.
+fn recover_bumper_tool() -> Value {
+    json!({
+        "name": "robot_recover_bumper",
+        "description": "Операторский откат после бампера: только прямо назад −0.1 м/с, по умолчанию 300 мс, максимум 500 мс за запрос и 1000 мс на защёлку. Требует живого операторского допуска, но не acquire; не забирает управление у панели. Бампер может оставаться нажатым. Защёлка не снимается; обычное движение и щётки запрещены. Обрыв/отрыв (включая их защёлку), отсутствующие или устаревшие более секунды датчики запрещают откат. Убедитесь, что позади безопасно; это ограниченный импульс, не автономное избегание обрыва. Повтор command_id не повторяет движение. После освобождения датчиков вызовите robot_reset_hazards.",
+        "inputSchema": {"type":"object","additionalProperties":false,"required":["command_id"],"properties":{
+            "command_id":{"type":"string","minLength":1,"maxLength":64},
+            "duration_ms":{"type":"integer","minimum":1,"maximum":500,"default":300}
+        }},
+        "outputSchema":{"type":"object"},
+        "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+    })
+}
+
+/// Reset never starts motion and never requires claiming a blocked drive.
+/// A live operator grant and an unowned or MCP-owned session are required.
 fn reset_hazards_tool() -> Value {
     json!({
         "name": "robot_reset_hazards",
-        "description": "Сбросить защёлку датчиков (бампер/обрыв/отрыв), чтобы вернуть возможность движения. Отказывается, пока контакт физически присутствует — сначала освободите робота (при физически нажатом бампере прошивка всё равно блокирует движение).",
+        "description": "Сбросить защёлку бампера/обрыва/отрыва после освобождения датчиков. Требует действующего операторского допуска, но НЕ предварительного acquire. Не захватывает управление; при владельце-панели или выполняющемся откате — BUSY. При живой опасности сброс отказан. Для бампера используйте robot_recover_bumper; откат при обрыве/отрыве запрещён до принятия геометрии датчиков. Сам сброс не двигает робота.",
         "inputSchema": {"type":"object","additionalProperties":false},
         "outputSchema": {"type":"object"},
         "annotations": {"readOnlyHint": false, "destructiveHint": false,
@@ -971,6 +983,15 @@ pub async fn endpoint(State(app): State<App>, headers: HeaderMap, body: String) 
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 return camera_frame(id, &app, args).await;
             }
+            Some("robot_recover_bumper") => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                let result = crate::recovery::start(&app, crate::recovery::Actor::Mcp, args).await;
+                return json_response(
+                    json!({"jsonrpc":"2.0","id":id,"result":result}),
+                    StatusCode::OK,
+                );
+            }
             Some("robot_drive_for") => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
@@ -1275,14 +1296,24 @@ fn reset_hazards(id: Value, app: &App, args: Value) -> Response {
     if !args.is_object() && !args.is_null() {
         return tool_error(id, "arguments must be an object".into());
     }
-    let owner = app.safety.lock().unwrap().owner();
-    if !owner.is_some_and(|o| o >= 1_000_000) {
-        return tool_error(
-            id,
-            "control not acquired; call robot_acquire_control first".into(),
-        );
+    if args.as_object().is_some_and(|o| !o.is_empty()) {
+        return tool_error(id, "unknown arguments".into());
+    }
+    if let crate::grants::Admission::Denied(reason) =
+        app.grants
+            .lock()
+            .unwrap()
+            .admit("mcp", 0.0, 0.0, 0, std::time::Instant::now())
+    {
+        return tool_error(id, format!("no operator grant: {reason}"));
     }
     let mut safety = app.safety.lock().unwrap();
+    if safety.owner().is_some_and(|owner| owner < 1_000_000) {
+        return tool_error(id, "panel client owns control; BUSY".into());
+    }
+    if safety.is_recovering() {
+        return tool_error(id, "recovery active; BUSY".into());
+    }
     match safety.reset_blocked() {
         Ok(()) => {
             app.states.send_modify(|state| state.clear_blocked());
@@ -1298,8 +1329,8 @@ fn reset_hazards(id: Value, app: &App, args: Value) -> Response {
         Err(reason) => tool_error(
             id,
             format!(
-                "reset refused: {reason:?} contact still present; clear the robot first \
-                 (the firmware blocks all motion while the bumper is pressed)"
+                "reset refused: {reason:?} contact still present; use bounded bumper recovery \
+                 for a bumper-only latch, or physically clear the hazard"
             ),
         ),
     }

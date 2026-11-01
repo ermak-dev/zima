@@ -10,9 +10,9 @@
 //!   condition is still physically present (bumper pressed, cliff or drop
 //!   active): resetting under contact would allow driving further into the
 //!   hazard. The panel gets an explicit "still_pressed" answer instead.
-//! * After a successful reset, a present-but-not-rising bumper does not
-//!   re-latch (edge semantics preserved), but cliff/drop levels re-latch
-//!   every frame while present (level semantics).
+//! * Only explicit bounded bumper recovery can move under the latch; floor
+//!   hazards and missing/stale channels forbid it. Recovery never clears the
+//!   latch, and another bumper edge cancels the pulse.
 use player_bridge::drive::DriveCommand;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,17 @@ pub enum BlockReason {
     Bumper,
     Cliff,
     Drop,
+}
+
+pub const RECOVERY_SPEED: f64 = -0.1;
+pub const RECOVERY_MAX_MS: u64 = 500;
+const RECOVERY_BUDGET_MS: u64 = 1000;
+const SENSOR_MAX_AGE: Duration = Duration::from_secs(1);
+
+struct Recovery {
+    command_id: String,
+    owner: u64,
+    cancelled: bool,
 }
 
 pub struct Safety {
@@ -33,6 +44,10 @@ pub struct Safety {
     /// Level-sensitive hazards from the latest sensor frame.
     cliff_active: bool,
     drop_active: bool,
+    sensor_times: [Option<Instant>; 3],
+    floor_latched: bool,
+    recovery_spent_ms: u64,
+    recovery: Option<Recovery>,
 }
 
 impl Safety {
@@ -46,6 +61,10 @@ impl Safety {
             stop_pending: false,
             cliff_active: false,
             drop_active: false,
+            sensor_times: [None; 3],
+            floor_latched: false,
+            recovery_spent_ms: 0,
+            recovery: None,
         }
     }
 
@@ -68,10 +87,15 @@ impl Safety {
         if !self.blocked {
             return Ok(());
         }
+        if self.recovery.is_some() {
+            return Err(self.block_reason.unwrap_or(BlockReason::Bumper));
+        }
         if let Some(reason) = self.hazard_present() {
             // Keep the latch; the operator sees why the reset is refused.
             return Err(reason);
         }
+        self.floor_latched = false;
+        self.recovery_spent_ms = 0;
         self.blocked = false;
         self.block_reason = None;
         self.drive = DriveCommand::new(Duration::from_secs(1));
@@ -93,6 +117,11 @@ impl Safety {
     }
 
     pub fn command(&mut self, id: u64, v: f64, w: f64, now: Instant) {
+        if self.owner == Some(id) && v == 0.0 && w == 0.0 {
+            if let Some(recovery) = &mut self.recovery {
+                recovery.cancelled = true;
+            }
+        }
         if self.blocked || self.owner.is_some_and(|owner| owner != id) {
             return;
         }
@@ -110,8 +139,12 @@ impl Safety {
     }
 
     /// Bumper frame: rising edge latches with the bumper reason.
-    pub fn bumper(&mut self, pressed: bool, _now: Instant) {
+    pub fn bumper(&mut self, pressed: bool, now: Instant) {
+        self.sensor_times[0] = Some(now);
         if pressed && !self.pressed {
+            if let Some(recovery) = &mut self.recovery {
+                recovery.cancelled = true;
+            }
             self.blocked = true;
             self.block_reason = Some(BlockReason::Bumper);
             self.drive = DriveCommand::new(Duration::from_secs(1));
@@ -123,25 +156,120 @@ impl Safety {
     /// Cliff frame (level-sensitive): any active channel latches every frame
     /// while present; it also heals only via a manual reset when clear.
     pub fn cliff(&mut self, active: bool, now: Instant) {
+        self.sensor_times[1] = Some(now);
         self.cliff_active = active;
         if active {
+            self.floor_latched = true;
+            if let Some(recovery) = &mut self.recovery {
+                recovery.cancelled = true;
+            }
             self.blocked = true;
             self.block_reason = Some(BlockReason::Cliff);
             self.drive = DriveCommand::new(Duration::from_secs(1));
             self.stop_pending = true;
-            let _ = now;
         }
     }
 
     /// Drop frame (level-sensitive), same contract as cliff.
     pub fn drop_sensor(&mut self, active: bool, now: Instant) {
+        self.sensor_times[2] = Some(now);
         self.drop_active = active;
         if active {
+            self.floor_latched = true;
+            if let Some(recovery) = &mut self.recovery {
+                recovery.cancelled = true;
+            }
             self.blocked = true;
             self.block_reason = Some(BlockReason::Drop);
             self.drive = DriveCommand::new(Duration::from_secs(1));
             self.stop_pending = true;
-            let _ = now;
+        }
+    }
+
+    pub fn invalidate_sensor(&mut self, index: usize) {
+        self.sensor_times[index] = None;
+        if let Some(recovery) = &mut self.recovery {
+            recovery.cancelled = true;
+            self.stop_pending = true;
+        }
+    }
+
+    pub fn is_recovering(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    pub fn recovery_ready(&self, now: Instant) -> Result<(), &'static str> {
+        if self.drop_active {
+            return Err("drop hazard: restore wheel support before recovery");
+        }
+        if self.cliff_active {
+            return Err("cliff hazard: bumper recovery refused");
+        }
+        if self.floor_latched {
+            return Err("floor hazard latch: bumper recovery refused until reset");
+        }
+        if !self.blocked || self.block_reason != Some(BlockReason::Bumper) {
+            return Err("bumper latch required for recovery");
+        }
+        for time in self.sensor_times {
+            let Some(time) = time else {
+                return Err("hazard sensor data missing; recovery refused");
+            };
+            if now.saturating_duration_since(time) >= SENSOR_MAX_AGE {
+                return Err("hazard sensor data stale; recovery refused");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn begin_recovery(
+        &mut self,
+        owner: u64,
+        command_id: &str,
+        ms: u64,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        if self.owner.is_some_and(|id| id != owner) {
+            return Err("another client owns control; BUSY");
+        }
+        if self.recovery.is_some() {
+            return Err("recovery active; BUSY");
+        }
+        self.recovery_ready(now)?;
+        if ms == 0 || ms > RECOVERY_MAX_MS {
+            return Err("recovery duration_ms must be 1..500");
+        }
+        if self.recovery_spent_ms + ms > RECOVERY_BUDGET_MS {
+            return Err("recovery latch budget exhausted; inspect robot before reset");
+        }
+        self.recovery_spent_ms += ms;
+        self.owner = Some(owner);
+        self.drive = DriveCommand::new(Duration::from_secs(1));
+        // The recovery executor explicitly flushes a zero before DRIVE. Do
+        // not let the queued collision zero race that later bounded pulse.
+        self.stop_pending = false;
+        self.recovery = Some(Recovery {
+            command_id: command_id.into(),
+            owner,
+            cancelled: false,
+        });
+        Ok(())
+    }
+
+    pub fn recovery_valid(&self, command_id: &str, now: Instant) -> bool {
+        self.recovery.as_ref().is_some_and(|r| {
+            r.command_id == command_id && !r.cancelled && self.owner == Some(r.owner)
+        }) && self.recovery_ready(now).is_ok()
+    }
+
+    pub fn end_recovery(&mut self, command_id: &str) {
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|r| r.command_id == command_id)
+        {
+            self.recovery = None;
+            self.stop_pending = true;
         }
     }
 

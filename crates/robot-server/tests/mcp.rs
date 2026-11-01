@@ -404,6 +404,7 @@ async fn mcp_endpoint_initializes_lists_and_calls_read_only_tools() {
             "robot_acquire_control",
             "robot_release_control",
             "robot_reset_hazards",
+            "robot_recover_bumper",
             "robot_drive_for",
             "robot_stop",
             "robot_set_cleaning_motors",

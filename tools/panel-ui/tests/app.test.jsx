@@ -97,6 +97,37 @@ describe('App lifecycle', () => {
     expect(sockets.flatMap((s) => s.sent)).toEqual([])
   })
 
+  // FEATURE: explicit bounded bumper recovery, separate from ordinary teleop.
+  // SPEC: one click sends one 300ms pulse; blocked state stays authoritative,
+  // no automatic repeat; server errors are visible and no link means no pulse.
+  // IMPLEMENTATION: separate typed recovery request, unique command id and server reply.
+  // RESULT: IMPLEMENTED — pulse, refusal display and disconnected control verified.
+  // STATUS: DONE
+  it('sends one recovery pulse and displays the server refusal', () => {
+    vi.useFakeTimers()
+    const { getByRole } = render(<App />)
+    act(() => lastHandler({ type: 'state', data: { blocked: true } }))
+    const sent = () => sockets.flatMap((s) => s.sent)
+    act(() => getByRole('button', { name: 'Отъехать назад' }).click())
+    expect(sent().at(-1)).toMatchObject({ type: 'recover_bumper', duration_ms: 300 })
+    expect(sent().at(-1).command_id).toEqual(expect.any(String))
+    const count = sent().length
+    act(() => vi.advanceTimersByTime(1000))
+    expect(sent()).toHaveLength(count)
+    expect(getByRole('alert')).toBeTruthy()
+    act(() => lastHandler({ type: 'recovery', data: { isError: true, error: 'cliff hazard' } }))
+    expect(getByRole('alert').textContent).toContain('cliff hazard')
+  })
+
+  it('does not send a recovery pulse without a server connection', () => {
+    connected = false
+    const { getByRole } = render(<App />)
+    act(() => lastHandler({ type: 'state', data: { blocked: true } }))
+    expect(getByRole('button', { name: 'Отъехать назад' }).disabled).toBe(true)
+    act(() => getByRole('button', { name: 'Отъехать назад' }).click())
+    expect(sockets.flatMap((s) => s.sent)).toEqual([])
+  })
+
   it('mounts sensor display with explicit missing values', () => {
     const { container } = render(<App />)
     expect(document.getElementById('battery').querySelector('.badge-value').textContent).toBe('—')

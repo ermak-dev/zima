@@ -5,6 +5,7 @@ mod grants;
 mod mcp;
 mod mcp_drive;
 mod player;
+mod recovery;
 mod safety;
 mod slam;
 mod state;
@@ -288,9 +289,10 @@ async fn session(socket: WebSocket, app: App) {
         states: app.states.clone(),
     };
     let (mut output, mut input) = socket.split();
-    let mut state = app.state;
-    let mut scan = app.scan;
+    let mut state = app.state.clone();
+    let mut scan = app.scan.clone();
     let mut maps = app.maps.clone();
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::channel(4);
     // Independent send/receive futures: a slow viewer never delays a disconnect
     // or command lease. watch channels retain only the latest state and scan.
     let receive = async {
@@ -351,11 +353,29 @@ async fn session(socket: WebSocket, app: App) {
                                 }
                             }
                         }
+                    } else if let Ok(mut request) =
+                        serde_json::from_str::<Value>(&text).and_then(|v| {
+                            if v.get("type").and_then(Value::as_str) == Some("recover_bumper") {
+                                Ok(v)
+                            } else {
+                                Err(serde::de::Error::custom("not a recovery request"))
+                            }
+                        })
+                    {
+                        request.as_object_mut().unwrap().remove("type");
+                        let reply =
+                            recovery::start(&app, recovery::Actor::Panel(id), request).await;
+                        let _ = recovery_tx.try_send(reply);
                     } else if serde_json::from_str::<ResetCommand>(&text).is_ok() {
                         if let Some(r) = &app.recording {
                             r.command(id, None, std::time::Instant::now());
                         }
                         let mut safety = app.safety.lock().unwrap();
+                        if safety.is_recovering() {
+                            let _ = recovery_tx
+                                .try_send(recovery::failure("active recovery; reset BUSY"));
+                            continue;
+                        }
                         // A reset under a still-present hazard is refused with
                         // the reason; the latch stays on (#65).
                         let outcome = safety.reset_blocked();
@@ -401,6 +421,7 @@ async fn session(socket: WebSocket, app: App) {
                 }
             };
             tokio::select! {
+             Some(v)=recovery_rx.recv()=>{send_frame(&mut output,"recovery",v).await?;},
              r=state.changed()=>{r?;let v=state.borrow_and_update().to_json();send_frame(&mut output,"state",v).await?;},
              r=scan.changed()=>{r?;let v=scan.borrow_and_update().clone();if let Some(v)=v{send_frame(&mut output,"scan",v).await?;}}
              _=map_change=>{if let Some(maps)=maps.as_mut(){let v=maps.borrow_and_update().clone();send_frame(&mut output,"map",v).await?;}}

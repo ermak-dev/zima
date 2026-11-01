@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import usePanelSocket from './usePanelSocket.js'
 import useMjpeg from './useMjpeg.js'
 import useVision from './useVision.js'
@@ -29,6 +29,8 @@ export default function App() {
   const [expanded, setExpanded] = useState(null)
   const [visionEnabled, setVisionEnabled] = useState(false)
   const [audioSettings, setAudioSettings] = useState(null)
+  const [recoveryMessage, setRecoveryMessage] = useState('')
+  const recoverySequence = useRef(0)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -50,6 +52,11 @@ export default function App() {
     else if (msg.type === 'scan') setScan(msg.data)
     else if (msg.type === 'map' && msg.data && Number.isInteger(msg.data.version)) setMapFrame(msg.data)
     else if (msg.type === 'vision' && typeof msg.data?.enabled === 'boolean') setVisionEnabled(msg.data.enabled)
+    else if (msg.type === 'recovery') {
+      setRecoveryMessage(msg.data?.isError
+        ? (msg.data.error || 'Откат отказан')
+        : 'Откат принят. После освобождения датчиков нажмите «Сброс».')
+    }
   }, [])
   const { connected, send } = usePanelSocket(onMessage)
   const [speed, setSpeed] = useState(DEFAULT_LINEAR_SPEED)
@@ -134,10 +141,19 @@ export default function App() {
       {blocked && <div className="blocked-balloon" role="alert" aria-label="Наезд на препятствие">
         <div>
           <strong>Наезд на препятствие</strong>
-          <p>Колёса остановлены. Нажмите «Сброс», чтобы снова разрешить управление.</p>
-          {!connected && <p>Нет связи с сервером. Сброс недоступен.</p>}
+          <p>Обычное движение заблокировано. После бампера можно отъехать назад коротким импульсом, если позади безопасно. Обрыв/отрыв и устаревшие датчики запрещают откат.</p>
+          <p>Один импульс: −0,1 м/с на 300 мс. Затем проверьте положение; после освобождения датчиков нажмите «Сброс».</p>
+          {recoveryMessage && <p role="status">{recoveryMessage}</p>}
+          {!connected && <p>Нет связи с сервером. Сброс и откат недоступны.</p>}
         </div>
-        <button type="button" disabled={!connected} onClick={() => send({ type: 'reset_blocked' })}>Сброс</button>
+        <div>
+          <button type="button" disabled={!connected} onClick={() => {
+            const command_id = `recover-${Date.now()}-${++recoverySequence.current}`
+            setRecoveryMessage('Запрос отката…')
+            send({ type: 'recover_bumper', command_id, duration_ms: 300 })
+          }}>Отъехать назад</button>
+          <button type="button" disabled={!connected} onClick={() => send({ type: 'reset_blocked' })}>Сброс</button>
+        </div>
       </div>}
       <main id="workspace" data-expanded={expanded || ''}
         data-lidar-collapsed={collapsed.lidar} data-camera-collapsed={collapsed.camera} data-sensors-collapsed={collapsed.sensors}>

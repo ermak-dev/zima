@@ -13,8 +13,15 @@ use std::time::{Duration, Instant};
 /// Maximum remembered actions (bounded registry for get_action/retries).
 const HISTORY: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ActionKind {
+    Drive,
+    BumperRecovery,
+}
+
 #[derive(Clone, Debug)]
 pub struct ActionRecord {
+    pub kind: ActionKind,
     pub command_id: String,
     pub epoch: u64,
     pub requested: (f64, f64, u64),
@@ -74,12 +81,38 @@ impl DriveActions {
         duration_ms: u64,
         now: Instant,
     ) -> Result<ActionRecord, String> {
+        self.submit_kind(
+            grants,
+            subject,
+            epoch,
+            command_id,
+            linear,
+            angular,
+            duration_ms,
+            now,
+            ActionKind::Drive,
+        )
+    }
+
+    pub fn submit_kind(
+        &mut self,
+        grants: &mut Grants,
+        subject: &str,
+        epoch: u64,
+        command_id: &str,
+        linear: f64,
+        angular: f64,
+        duration_ms: u64,
+        now: Instant,
+        kind: ActionKind,
+    ) -> Result<ActionRecord, String> {
         if command_id.is_empty() || command_id.len() > 64 {
             return Err("command_id must be 1..64 chars".into());
         }
         if let Some(existing) = self.entries.get(command_id) {
-            let same =
-                existing.requested == (linear, angular, duration_ms) && existing.epoch == epoch;
+            let same = existing.requested == (linear, angular, duration_ms)
+                && existing.epoch == epoch
+                && existing.kind == kind;
             if same {
                 let mut replay = existing.clone();
                 replay.fresh = false;
@@ -99,6 +132,7 @@ impl DriveActions {
         match grants.admit(subject, linear, angular, duration_ms, now) {
             Admission::Denied(reason) => {
                 self.remember(ActionRecord {
+                    kind,
                     command_id: command_id.into(),
                     epoch,
                     requested: (linear, angular, duration_ms),
@@ -114,6 +148,7 @@ impl DriveActions {
         // the physical outcome.
         grants.spend(subject, duration_ms, now);
         let record = ActionRecord {
+            kind,
             command_id: command_id.into(),
             epoch,
             requested: (linear, angular, duration_ms),

@@ -244,10 +244,12 @@ impl DataProcessor {
                     }
                 }
                 PlayerData::Bumper(v) => {
-                    self.safety
-                        .lock()
-                        .unwrap()
-                        .bumper(v.pressed.iter().any(|v| *v), received);
+                    let mut safety = self.safety.lock().unwrap();
+                    if v.pressed.is_empty() {
+                        safety.invalidate_sensor(0);
+                    } else {
+                        safety.bumper(v.pressed.iter().any(|v| *v), received);
+                    }
                 }
                 PlayerData::Ir(index, v) if *index == 1 || *index == 2 => {
                     // Cliff (ir:1) and drop (ir:2) are level-sensitive hazards:
@@ -257,10 +259,18 @@ impl DataProcessor {
                     // safety; only a fully zero-range frame clears the level.
                     let active = v.ranges.iter().any(|r| r.is_finite() && *r > 0.0);
                     let mut safety = self.safety.lock().unwrap();
-                    if *index == 1 {
-                        safety.cliff(active, received);
-                    } else {
-                        safety.drop_sensor(active, received);
+                    let valid =
+                        !v.ranges.is_empty() && v.ranges.iter().all(|r| r.is_finite() && *r >= 0.0);
+                    // Partial data can assert a hazard, never clear a known one.
+                    if valid || active {
+                        if *index == 1 {
+                            safety.cliff(active, received);
+                        } else {
+                            safety.drop_sensor(active, received);
+                        }
+                    }
+                    if !valid {
+                        safety.invalidate_sensor(*index as usize);
                     }
                 }
                 PlayerData::Position2d(v) => {
