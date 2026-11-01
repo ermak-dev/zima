@@ -49,9 +49,22 @@ impl Config {
 /// Send a velocity command to the local Player. Best-effort: failures are
 /// logged by the caller; the deadline/stop logic never depends on the
 /// network beyond the robot itself.
-fn send_velocity(r: &Rollback, vx: f64, vyaw: f64) -> Result<(), String> {
+/// Send a velocity command to the local Player over a subscribed connection.
+/// The connection is returned OPEN: the vendor server enqueues a zero when a
+/// subscribed client hangs up (see player.rs), so the caller must keep it
+/// alive for as long as the velocity should hold.
+fn open_velocity_writer(r: &Rollback) -> Result<player_bridge::Client, String> {
     let mut client = player_bridge::Client::connect(&r.player_host, r.player_port)
         .map_err(|e| format!("cannot reach Player: {e}"))?;
+    // The live server honours CMD_VEL only from a connection that holds a
+    // subscription on the device; a bare connect silently drops the command.
+    client
+        .subscribe(player_bridge::POSITION2D_CODE, 0)
+        .map_err(|e| format!("position2d subscription failed: {e}"))?;
+    Ok(client)
+}
+
+fn send_velocity_on(client: &mut player_bridge::Client, vx: f64, vyaw: f64) -> Result<(), String> {
     client
         .send_velocity(0, vx, vyaw, 1)
         .map_err(|e| format!("velocity write failed: {e}"))
@@ -86,7 +99,15 @@ fn run_bounded_drive(
     ms: u64,
     ack: std::sync::mpsc::Sender<bool>,
 ) -> bool {
-    if let Err(e) = send_velocity(rollback, vx, vyaw) {
+    let mut writer = match open_velocity_writer(rollback) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[supervisor] DRIVE {vx} {vyaw} {ms} velocity write FAILED: {e}");
+            let _ = ack.send(false);
+            return false;
+        }
+    };
+    if let Err(e) = send_velocity_on(&mut writer, vx, vyaw) {
         eprintln!("[supervisor] DRIVE {vx} {vyaw} {ms} velocity write FAILED: {e}");
         let _ = ack.send(false);
         return false;
@@ -107,7 +128,10 @@ fn run_bounded_drive(
             "deadline"
         }
     );
-    if let Err(e) = send_velocity(rollback, 0.0, 0.0) {
+    // The zero goes through the SAME still-open connection: closing it right
+    // after a fresh CMD is what enqueued the vendor shadow zero mid-motion
+    // in the 2026-11-01 live run (#65).
+    if let Err(e) = send_velocity_on(&mut writer, 0.0, 0.0) {
         eprintln!("[supervisor] local zero write FAILED: {e}");
     }
     true
@@ -353,10 +377,16 @@ fn serve(conn: &mut TcpStream, c: &Config) {
         } else if request == "STOP" {
             drive_session = true;
             if let Some(tx) = c.drive.lock().unwrap().take() {
-                // Waking the holder is enough: it owns the local zero send.
+                // Waking the holder is enough: it owns the local zero send
+                // on its still-open subscribed connection.
                 let _ = tx.send(());
             }
-            let _ = send_velocity(&c.rollback, 0.0, 0.0);
+            // Belt-and-braces zero through a fresh short-lived writer too;
+            // its immediate close only enqueues another zero, never motion.
+            let _ = (|| -> Result<(), String> {
+                let mut w = open_velocity_writer(&c.rollback)?;
+                send_velocity_on(&mut w, 0.0, 0.0)
+            })();
             let _ = conn.write_all(b"STOPPED\n");
         } else if request == "QUIT" {
             return;
