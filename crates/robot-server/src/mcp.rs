@@ -61,6 +61,7 @@ fn tools() -> Value {
         map_tool(),
         acquire_control_tool(),
         release_control_tool(),
+        reset_hazards_tool(),
         drive_for_tool(),
         mcp_stop_tool(),
         get_action_tool(),
@@ -131,6 +132,21 @@ fn release_control_tool() -> Value {
     json!({
         "name": "robot_release_control",
         "description": "Освободить управление, если им владеет этот MCP-субъект; остановка активного действия выполняется приоритетно.",
+        "inputSchema": {"type":"object","additionalProperties":false},
+        "outputSchema": {"type":"object"},
+        "annotations": {"readOnlyHint": false, "destructiveHint": false,
+                        "idempotentHint": true, "openWorldHint": false}
+    })
+}
+
+/// Hazard-latch reset (#67): the MCP-side escape from a latched bumper,
+/// mirroring the panel's reset. Refused while the contact persists — the
+/// firmware also blocks all motion under a pressed bumper, so the operator
+/// (or a human hand) must clear the robot first.
+fn reset_hazards_tool() -> Value {
+    json!({
+        "name": "robot_reset_hazards",
+        "description": "Сбросить защёлку датчиков (бампер/обрыв/отрыв), чтобы вернуть возможность движения. Отказывается, пока контакт физически присутствует — сначала освободите робота (при физически нажатом бампере прошивка всё равно блокирует движение).",
         "inputSchema": {"type":"object","additionalProperties":false},
         "outputSchema": {"type":"object"},
         "annotations": {"readOnlyHint": false, "destructiveHint": false,
@@ -284,7 +300,7 @@ fn scan_sectors(scan: Option<&Value>) -> Value {
     })
 }
 
-fn observe(state: &crate::state::State, scan: Option<&Value>) -> Value {
+fn observe(state: &crate::state::State, scan: Option<&Value>, vision: Option<&Value>) -> Value {
     // Age of the latest data is derived server-side at call time from the
     // monotonic receive instants; the snapshot is not a simultaneous physical
     // measurement of all sensors (#57).
@@ -294,6 +310,14 @@ fn observe(state: &crate::state::State, scan: Option<&Value>) -> Value {
     let slam_age = state
         .last_slam
         .map(|t| now.duration_since(t).as_millis() as u64);
+    // The latest cached YOLO detections (#68); observe reports what the
+    // independent vision loop already produced — it never triggers an
+    // inference and never blocks on the camera.
+    let vision = match vision {
+        None => json!({"status": "unavailable",
+            "note": "YOLO-адаптер не настроен; задайте --yolo-adapter"}),
+        Some(v) => v.clone(),
+    };
     json!({
         "schema_version": 1,
         "observation_id": OBSERVE_ID.fetch_add(1, Ordering::Relaxed),
@@ -310,6 +334,7 @@ fn observe(state: &crate::state::State, scan: Option<&Value>) -> Value {
         "odom": frame.get("odom").cloned().unwrap_or(Value::Null),
         "sensors": frame.get("sensors").cloned().unwrap_or(Value::Null),
         "lidar": scan_sectors(scan),
+        "vision": vision,
         "slam": {
             "mode": frame["slam"].get("mode").cloned().unwrap_or(Value::Null),
             "pose": frame["slam"].get("pose").cloned().unwrap_or(Value::Null),
@@ -362,6 +387,10 @@ fn dispatch(app: &App, request: Value) -> Response {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 return set_cleaning_motors(id, app, args);
             }
+            if name == "robot_reset_hazards" {
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                return reset_hazards(id, app, args);
+            }
             if name == "robot_get_action" {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 return get_action(id, app, args);
@@ -379,9 +408,14 @@ fn dispatch(app: &App, request: Value) -> Response {
             }
             let mut state = app.state.clone();
             let mut scan = app.scan.clone();
+            let vision = app
+                .vision
+                .clone()
+                .map(|mut v| v.borrow_and_update().clone());
             let snapshot = observe(
                 &state.borrow_and_update(),
                 scan.borrow_and_update().as_ref(),
+                vision.as_ref(),
             );
             json_response(
                 json!({"jsonrpc":"2.0","id":id,"result":{
@@ -1057,6 +1091,17 @@ fn prepare_drive(
             "control not acquired; call robot_acquire_control first".into(),
         ));
     }
+    // A latched hazard (bumper/cliff/drop) forbids motion just like it
+    // forbids acquisition and cleaning motors (#66); a drive under a latch
+    // must never reach the supervisor.
+    let safety = app.safety.lock().unwrap();
+    if safety.is_blocked() {
+        return Err(tool_error(
+            id,
+            "control is blocked (bumper latch); reset required before motion".into(),
+        ));
+    }
+    drop(safety);
     // The bounded motion runs under the robot-local deadline (#64): no
     // supervisor means an explicit error, never a host-lease fallback.
     let Some((address, token)) = app.supervisor.clone() else {
@@ -1220,6 +1265,43 @@ fn get_action(id: Value, app: &App, args: Value) -> Response {
             StatusCode::OK,
         ),
         None => tool_error(id, format!("unknown command_id {command_id}")),
+    }
+}
+
+/// `robot_reset_hazards` (#67): MCP-side mirror of the panel's reset. The
+/// refused path keeps the latch and names the persisting hazard; the panel
+/// contract (#65) is unchanged — only the entry point is new.
+fn reset_hazards(id: Value, app: &App, args: Value) -> Response {
+    if !args.is_object() && !args.is_null() {
+        return tool_error(id, "arguments must be an object".into());
+    }
+    let owner = app.safety.lock().unwrap().owner();
+    if !owner.is_some_and(|o| o >= 1_000_000) {
+        return tool_error(
+            id,
+            "control not acquired; call robot_acquire_control first".into(),
+        );
+    }
+    let mut safety = app.safety.lock().unwrap();
+    match safety.reset_blocked() {
+        Ok(()) => {
+            app.states.send_modify(|state| state.clear_blocked());
+            json_response(
+                json!({"jsonrpc":"2.0","id":id,"result":{
+                    "content": [{"type":"text","text":
+                        "{\"state\": \"cleared\", \"note\": \"защёлка снята; движение снова доступно\"}"}],
+                    "structuredContent": {"state": "cleared"},
+                    "isError": false}}),
+                StatusCode::OK,
+            )
+        }
+        Err(reason) => tool_error(
+            id,
+            format!(
+                "reset refused: {reason:?} contact still present; clear the robot first \
+                 (the firmware blocks all motion while the bumper is pressed)"
+            ),
+        ),
     }
 }
 

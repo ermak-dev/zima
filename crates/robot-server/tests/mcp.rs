@@ -73,7 +73,7 @@ async fn fake_camera() -> String {
 /// injected `inbound` packets (SLAM scans for #58) are forwarded to the server
 /// concurrently with the endless subscription drain, like the fuller fake in
 /// tests/server.rs.
-async fn fake_player() -> Result<
+pub async fn fake_player() -> Result<
     (
         u16,
         mpsc::Sender<Vec<u8>>,
@@ -403,6 +403,7 @@ async fn mcp_endpoint_initializes_lists_and_calls_read_only_tools() {
         let control = [
             "robot_acquire_control",
             "robot_release_control",
+            "robot_reset_hazards",
             "robot_drive_for",
             "robot_stop",
             "robot_set_cleaning_motors",

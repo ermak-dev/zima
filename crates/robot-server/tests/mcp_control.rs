@@ -669,3 +669,111 @@ async fn mcp_drive_completes_after_deadline_without_stop() {
         "record must be completed by the deadline timer"
     );
 }
+
+/// #66: robot_drive_for must refuse while a hazard latch is on — the gate
+/// exists for acquire and motors; a drive under a latched bumper must never
+/// reach the supervisor (#65 live run leaked exactly this: blk1 was "sent").
+#[tokio::test]
+async fn mcp_drive_for_refused_under_hazard_latch() {
+    let (address, log) = fake_supervisor().await;
+    let mut s =
+        harness::start_env_supervisor(None, "mcp,0.2,1.0,2000,10000,600", (&address, "")).await;
+    drive_ready(&mut s).await;
+    assert_eq!(
+        call(&s, "robot_acquire_control", json!({})).await["result"]["isError"],
+        false
+    );
+    // Latch the bumper while control is already held: only drive_for must
+    // start refusing; the latch does not revoke the existing owner.
+    s.2.send(bumper_packet(true)).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let o = call(&s, "robot_observe", json!({})).await;
+        if o["result"]["structuredContent"]["blocked"] == true {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bumper block never latched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let reply = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.1,"angular_radps":0.0,"duration_ms":300,"command_id":"u1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("blocked"),
+        "must name the hazard latch: {text}"
+    );
+    // Nothing may reach the supervisor while latched.
+    let supervisor_log = log.lock().unwrap().clone();
+    assert!(
+        !supervisor_log.iter().any(|l| l.contains("DRIVE u1")),
+        "latched drive leaked to the supervisor: {supervisor_log:?}"
+    );
+}
+
+/// #67: robot_reset_hazards — the MCP-side escape from a latched bumper.
+/// Refused while contact persists; clears when released, after which motion
+/// works again without a panel.
+#[tokio::test]
+async fn mcp_reset_hazards_clears_latch_and_refuses_under_contact() {
+    let (address, _log) = fake_supervisor().await;
+    let mut s =
+        harness::start_env_supervisor(None, "mcp,0.2,1.0,2000,10000,600", (&address, "")).await;
+    drive_ready(&mut s).await;
+    assert_eq!(
+        call(&s, "robot_acquire_control", json!({})).await["result"]["isError"],
+        false
+    );
+    // Latch while pressed (bumper frame stays true = contact persists).
+    s.2.send(bumper_packet(true)).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let o = call(&s, "robot_observe", json!({})).await;
+        if o["result"]["structuredContent"]["blocked"] == true {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "latch never engaged");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Reset under contact: explicit refusal naming the bumper.
+    let reply = call(&s, "robot_reset_hazards", json!({})).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.to_lowercase().contains("bumper"),
+        "must name the persisting hazard: {text}"
+    );
+    assert!(
+        call(&s, "robot_observe", json!({})).await["result"]["structuredContent"]["blocked"]
+            == true,
+        "latch must survive a refused reset"
+    );
+    // Release the bumper, reset again: clears, and motion is possible.
+    s.2.send(bumper_packet(false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let reply = call(&s, "robot_reset_hazards", json!({})).await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"]["state"], "cleared",
+        "{reply}"
+    );
+    assert!(
+        call(&s, "robot_observe", json!({})).await["result"]["structuredContent"]["blocked"]
+            == false,
+        "blocked must be false after a successful reset"
+    );
+    let drive = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.1,"angular_radps":0.0,"duration_ms":200,"command_id":"after-reset"}),
+    )
+    .await;
+    assert_eq!(drive["result"]["isError"], false, "{drive}");
+}
