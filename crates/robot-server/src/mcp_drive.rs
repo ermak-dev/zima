@@ -149,6 +149,11 @@ impl DriveActions {
         self.entries.get(command_id)
     }
 
+    /// The currently active command id, if any (#65).
+    pub fn active_id(&self) -> Option<String> {
+        self.active.clone()
+    }
+
     fn remember(&mut self, record: ActionRecord) {
         if self.order.len() >= HISTORY {
             if let Some(old) = self.order.first().cloned() {

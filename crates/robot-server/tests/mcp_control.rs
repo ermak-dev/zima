@@ -587,3 +587,85 @@ async fn mcp_drive_for_bounded_idempotent_and_stoppable() {
         panic!("host velocity emitted despite supervisor lease: {c:?}");
     }
 }
+
+// ---- #65: live-run fixes ----
+// FEATURE: honest acquire under bumper block and self-completing actions.
+// SPEC: acquire while blocked is an explicit error (never a fake success);
+// a fresh drive action completes itself after its deadline so the next
+// drive with a new command id is accepted without an explicit stop.
+// IMPLEMENTATION: blocked check in acquire_control; deadline timer that
+// completes the active record.
+// RESULT: IMPLEMENTED — offline fake Player checks pass.
+// STATUS: DONE
+
+/// Bumper press packet through the harness fake Player (server.rs layout).
+fn bumper_packet(pressed: bool) -> Vec<u8> {
+    let mut p = vec![0, 0, 0, 3, 0, 0, 0, 3, pressed as u8, 0, 0, 0];
+    p.shrink_to_fit();
+    harness::packet(player_bridge::BUMPER_CODE, 0, 1, 10., &p)
+}
+
+#[tokio::test]
+async fn mcp_acquire_while_blocked_is_explicit_error() {
+    let (address, log) = fake_supervisor().await;
+    let mut s =
+        harness::start_env_supervisor(None, "mcp,0.2,1.0,2000,10000,600", (&address, "")).await;
+    drive_ready(&mut s).await;
+    // Press the bumper through the fake Player: blocked latches.
+    s.2.send(bumper_packet(true)).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let o = call(&s, "robot_observe", json!({})).await;
+        if o["result"]["structuredContent"]["blocked"] == true {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bumper block never latched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Acquire must now be an explicit error naming the block, never a fake
+    // success that strands later calls with "control not acquired".
+    let reply = call(&s, "robot_acquire_control", json!({})).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("blocked"), "must name the block: {text}");
+}
+
+#[tokio::test]
+async fn mcp_drive_completes_after_deadline_without_stop() {
+    let (address, _log) = fake_supervisor().await;
+    let mut s =
+        harness::start_env_supervisor(None, "mcp,0.2,1.0,2000,10000,600", (&address, "")).await;
+    drive_ready(&mut s).await;
+    assert_eq!(
+        call(&s, "robot_acquire_control", json!({})).await["result"]["isError"],
+        false
+    );
+    let reply = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.1,"angular_radps":0.0,"duration_ms":300,"command_id":"a1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    // Wait past the deadline: the record must complete itself, and a new
+    // command id must be accepted WITHOUT an explicit robot_stop.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    let reply = call(
+        &s,
+        "robot_drive_for",
+        json!({"linear_mps":0.1,"angular_radps":0.0,"duration_ms":300,"command_id":"a2"}),
+    )
+    .await;
+    assert_eq!(
+        reply["result"]["isError"], false,
+        "action must self-complete after its deadline: {reply}"
+    );
+    let first = call(&s, "robot_get_action", json!({"command_id":"a1"})).await;
+    assert_eq!(
+        first["result"]["structuredContent"]["outcome"]["state"], "completed",
+        "record must be completed by the deadline timer"
+    );
+}

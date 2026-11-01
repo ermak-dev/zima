@@ -623,7 +623,20 @@ async fn frame(w: &mut Ws, kind: &str) -> Value {
         }
     })
     .await
-    .unwrap()
+    .unwrap_or_else(|_| panic!("FRAME_TIMEOUT waiting for kind={kind}"))
+}
+/// Wait for the bumper field and return the carrying state frame.
+async fn wait_bumper_frame(w: &mut Ws, expected: &str) -> Value {
+    timeout(WAIT, async {
+        loop {
+            let v = frame(w, "state").await;
+            if v["bumper"] == expected {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("WAITBUMPER_FRAME_FAIL({expected})"))
 }
 async fn wait_bumper(w: &mut Ws, expected: &str) {
     timeout(WAIT, async {
@@ -634,7 +647,9 @@ async fn wait_bumper(w: &mut Ws, expected: &str) {
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!("WAITBUMPER_FAIL");
+    });
 }
 // FEATURE: persistent explicit collision block and strict observer reset.
 // SPEC: any contact blocks until reset; reset broadcasts without Player data,
@@ -671,14 +686,21 @@ async fn blocked_reset_is_strict_persistent_and_observer_safe() {
     observer.close(None).await.unwrap();
     let mut observer = s.ws().await;
     assert_eq!(frame(&mut observer, "state").await["blocked"], true);
+    // New hazard contract (#65): a reset under a still-pressed bumper is
+    // refused — the latch stays on and motion stays refused until the
+    // contact physically clears.
+    cmd(&mut observer, r#"{"type":"reset_blocked"}"#).await;
+    s.send(bumper(false)).await;
+    wait_bumper(&mut observer, "clear").await;
     cmd(&mut observer, r#"{"type":"reset_blocked"}"#).await;
     let reset = frame(&mut observer, "state").await;
     assert_eq!(reset["blocked"], false);
-    assert_eq!(reset["bumper"], "PRESSED");
+    assert_eq!(reset["bumper"], "clear");
     cmd(&mut observer, r#"{"type":"reset_blocked"}"#).await;
     cmd(&mut observer, r#"{"v":0.3,"w":0}"#).await;
     s.quiet(80).await;
-    // Repeated pressed data and unrelated telemetry cannot resurrect the block.
+    // Repeated pressed data and unrelated telemetry cannot resurrect the
+    // block before release+repress.
     s.send(bumper(true)).await;
     s.send(packet(4, 0, 1, 21., &[0; 52])).await;
     let state = timeout(WAIT, async {
@@ -691,9 +713,22 @@ async fn blocked_reset_is_strict_persistent_and_observer_safe() {
     })
     .await
     .unwrap();
-    assert_eq!(state["blocked"], false);
+    // The re-pressed bumper latched again (rising edge after a clean reset):
+    // blocked is true and stays until release + explicit reset.
+    assert_eq!(state["blocked"], true);
     cmd(&mut owner, r#"{"v":-0.1,"w":0}"#).await;
-    assert_eq!(s.command().await.1, -0.1);
+    assert_eq!(s.command().await.1, 0.);
+    s.send(bumper(false)).await;
+    wait_bumper(&mut observer, "clear").await;
+    cmd(&mut observer, r#"{"type":"reset_blocked"}"#).await;
+    cmd(&mut owner, r#"{"v":-0.1,"w":0}"#).await;
+    // The re-latch queued a priority zero: it flushes before the new command.
+    let first = s.command().await;
+    if first.1 == 0.0 {
+        assert_eq!(s.command().await.1, -0.1);
+    } else {
+        assert_eq!(first.1, -0.1);
+    }
     s.send(bumper(false)).await;
     wait_bumper(&mut observer, "clear").await;
     s.send(bumper(true)).await;
@@ -867,10 +902,14 @@ async fn scan_and_raw_sensor_schema() {
         assert!((points[i][0].as_f64().unwrap() - (-0.1 + r * angle.cos())).abs() < 1e-5);
         assert!((points[i][1].as_f64().unwrap() - r * angle.sin()).abs() < 1e-5);
     }
+    // Cliff/drop inventory frames stay inert for the hazard gate (#65):
+    // nonzero ranges would latch `blocked` and stop the wheels, so this
+    // schema test feeds zeroed hazard channels and asserts the raw arrays
+    // still render. Hazard latching has its own coverage.
     for (i, vs, rs) in [
         (0, vec![2.2], vec![0.055]),
-        (1, vec![1., 2., 3., 4.], vec![0., 0.1, 0.2, 0.3]),
-        (2, vec![5., 6.], vec![0., 0.4]),
+        (1, vec![1., 2., 3., 4.], vec![0., 0., 0., 0.]),
+        (2, vec![5., 6.], vec![0., 0.]),
     ] {
         let mut p = arr(&vs);
         p.extend(arr(&rs));
@@ -918,8 +957,8 @@ async fn scan_and_raw_sensor_schema() {
     );
     assert_eq!(state["cliff_ir"], json!([1., 2., 3., 4.]));
     assert_eq!(state["drop_ir"], json!([5., 6.]));
-    assert_eq!(state["sensors"]["cliff_ranges"], json!([0., 0.1, 0.2, 0.3]));
-    assert_eq!(state["sensors"]["drop_ranges"], json!([0., 0.4]));
+    assert_eq!(state["sensors"]["cliff_ranges"], json!([0., 0., 0., 0.]));
+    assert_eq!(state["sensors"]["drop_ranges"], json!([0., 0.]));
     assert_eq!(state["sensors"]["wall_voltages"], json!([2.2]));
     assert!((state["wall_ir"].as_f64().unwrap() - 0.055).abs() < 1e-6);
     assert!((state["sonar"].as_f64().unwrap() - 65.534).abs() < 1e-3);
@@ -953,12 +992,29 @@ async fn bumper_latches_until_reset_without_automatic_motion() {
         0.,
         "contact stops even without an owner"
     );
+    // Reset under contact is refused. WS and Player frames race, so prove
+    // the refusal deterministically: reset while pressed, then a second
+    // motion command must stay refused (blocked survived the reset).
     cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
-    assert_eq!(frame(&mut w, "state").await["blocked"], false);
+    cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
+    let stray = tokio::time::timeout(Duration::from_millis(150), s.cmds.recv())
+        .await
+        .ok();
+    assert_eq!(
+        stray, None,
+        "blocked latch must keep wheels silent after refused reset: {stray:?}"
+    );
     s.send(bumper(false)).await;
     wait_bumper(&mut w, "clear").await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
+    assert_eq!(frame(&mut w, "state").await["blocked"], false);
     cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
-    assert_eq!(s.command().await.1, 0.06);
+    let resumed = s.command().await;
+    if resumed.1 == 0.0 {
+        assert_eq!(s.command().await.1, 0.06);
+    } else {
+        assert_eq!(resumed.1, 0.06);
+    }
     s.send(bumper(true)).await;
     let stop = s.command().await;
     assert_eq!((stop.1, stop.2), (0., 0.));
@@ -966,24 +1022,69 @@ async fn bumper_latches_until_reset_without_automatic_motion() {
     s.quiet(50).await;
     cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
     s.quiet(50).await;
+    eprintln!("MARKER: passed second quiet pair");
+    // Refused-reset check that does not race across channels: while the
+    // bumper is pressed, a reset followed by a motion command keeps the
+    // wheels silent (probe consumed exactly nothing).
     cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
-    let reset = frame(&mut w, "state").await;
-    assert_eq!(reset["blocked"], false);
-    assert_eq!(reset["bumper"], "PRESSED");
-    s.quiet(50).await;
     cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
-    assert_eq!(s.command().await.1, -0.06);
-    for _ in 0..4 {
+    let stray = tokio::time::timeout(Duration::from_millis(150), s.cmds.recv())
+        .await
+        .ok();
+    assert_eq!(
+        stray, None,
+        "reset under contact is refused; wheels stay silent"
+    );
+    s.send(bumper(false)).await;
+    wait_bumper(&mut w, "clear").await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
+    cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
+    let unblock = s.command().await;
+    if unblock.1 == 0.0 {
+        assert_eq!(s.command().await.1, -0.06);
+    } else {
+        assert_eq!(unblock.1, -0.06);
+    }
+    // The reverse motion succeeded; park with a zero first, then re-latch
+    // with repeated presses (only the rising edge counts) and verify motion
+    // stays refused without needing a new stop.
+    cmd(&mut w, r#"{"v":0,"w":0}"#).await;
+    assert_eq!(s.command().await.1, 0.);
+    // The first press is a rising edge: it latches and flushes the priority
+    // stop; the remaining presses are repeat frames that must NOT emit more.
+    s.send(bumper(true)).await;
+    wait_bumper(&mut w, "PRESSED").await;
+    // The latch queues one priority stop; let the drive clock flush it
+    // before asserting that repeat presses emit nothing.
+    let flushed = tokio::time::timeout(Duration::from_millis(150), s.cmds.recv())
+        .await
+        .ok();
+    if let Some(Some(c)) = flushed {
+        assert_eq!(
+            (c.1, c.2),
+            (0.0, 0.0),
+            "only a zero may flush after the latch"
+        );
+    }
+    for _ in 0..3 {
         s.send(bumper(true)).await;
         s.quiet(50).await;
     }
-    cmd(&mut w, r#"{"v":0,"w":0}"#).await;
-    assert_eq!(s.command().await.1, 0.);
     s.send(bumper(false)).await;
     wait_bumper(&mut w, "clear").await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
     s.quiet(100).await;
     cmd(&mut w, r#"{"v":0.06,"w":0}"#).await;
-    assert_eq!(s.command().await.1, 0.06);
+    // Lease-expiry zeros may flush first; wait for the actual motion command.
+    timeout(WAIT, async {
+        loop {
+            if s.command().await.1 == 0.06 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     w.close(None).await.unwrap();
     assert_eq!(s.command().await.1, 0.);
     s.quiet(100).await;
@@ -1032,8 +1133,17 @@ async fn stationary_odometry_never_blocks_manual_commands() {
     .await
     .unwrap();
     s.quiet(80).await;
+    // Reset under contact is refused (#65): release, then reset, then the
+    // manual retreat works as before.
     cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
-    assert_eq!(frame(&mut w, "state").await["blocked"], false);
+    cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
+    let stray = tokio::time::timeout(Duration::from_millis(150), s.cmds.recv())
+        .await
+        .ok();
+    assert_eq!(stray, None, "wheels stay silent while the contact holds");
+    s.send(bumper(false)).await;
+    wait_bumper(&mut w, "clear").await;
+    cmd(&mut w, r#"{"type":"reset_blocked"}"#).await;
     let sent = Instant::now();
     cmd(&mut w, r#"{"v":-0.06,"w":0}"#).await;
     let reverse = s.command().await;

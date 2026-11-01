@@ -431,8 +431,17 @@ fn acquire_control(id: Value, app: &App, args: Value) -> Response {
     drop(grants);
     // Take the shared ownership through the same Safety gate as the panel:
     // the MCP subject uses a dedicated high id range above panel clients.
+    // A latched bumper block makes acquisition honestly impossible — without
+    // this check Safety::command silently no-ops and later calls strand with
+    // a misleading "control not acquired" (#65).
     let id_value = MCP_OWNER_ID.fetch_add(1, Ordering::Relaxed) + 1_000_000;
     let mut safety = app.safety.lock().unwrap();
+    if safety.is_blocked() {
+        return tool_error(
+            id,
+            "control is blocked (bumper latch); reset required before acquiring".into(),
+        );
+    }
     if let Some(owner) = safety.owner() {
         if owner >= 1_000_000 {
             // Another MCP lease: refresh is idempotent for the same subject.
@@ -981,12 +990,18 @@ async fn drive_for_async(id: Value, app: &App, args: Value) -> Response {
                 crate::supervisor_drive::drive(&address, &token, vx, vyaw, ms),
             )
             .await;
-            finish_drive(
+            let command_id = record.command_id.clone();
+            let result = finish_drive(
                 id,
                 app,
                 record,
                 outcome.map_err(|_| "timeout".into()).and_then(|r| r),
-            )
+            );
+            // The ledger must not strand: complete the record once its
+            // deadline has passed even if the client never returns (#65).
+            // The physical stop stays with the supervisor's local deadline.
+            schedule_completion(app, command_id, ms);
+            result
         }
         Err(response) => response,
     }
@@ -1167,6 +1182,28 @@ fn stop_common(id: Value, app: &App, supervisor_stop: bool) -> Response {
             "isError": false}}),
         StatusCode::OK,
     )
+}
+
+/// Complete the active action record after its deadline (#65): only the
+/// still-active record with the same id flips to Completed; a stop or a
+/// superseding outcome wins if it happened first.
+fn schedule_completion(app: &App, command_id: String, ms: u64) {
+    let actions = app.drive_actions.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(ms + 250)).await;
+        let mut ledger = actions.lock().unwrap();
+        // Only complete the record if it is still the active one and still
+        // Sent: stopped/refused records keep their honest outcome.
+        let should_complete = ledger
+            .active_id()
+            .is_some_and(|active| active == command_id)
+            && ledger
+                .get(&command_id)
+                .is_some_and(|r| r.outcome == mcp_drive::Outcome::Sent);
+        if should_complete {
+            ledger.complete_active(false);
+        }
+    });
 }
 
 /// `robot_get_action`: return the honest recorded outcome of a command id.

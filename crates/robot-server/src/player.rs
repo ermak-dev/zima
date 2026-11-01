@@ -249,6 +249,20 @@ impl DataProcessor {
                         .unwrap()
                         .bumper(v.pressed.iter().any(|v| *v), received);
                 }
+                PlayerData::Ir(index, v) if *index == 1 || *index == 2 => {
+                    // Cliff (ir:1) and drop (ir:2) are level-sensitive hazards:
+                    // a nonzero RANGE channel counts as present (#65). Raw
+                    // voltages are uncalibrated noise floors (HARDWARE.md)
+                    // and do not participate. Zero readings are not proof of
+                    // safety; only a fully zero-range frame clears the level.
+                    let active = v.ranges.iter().any(|r| r.is_finite() && *r > 0.0);
+                    let mut safety = self.safety.lock().unwrap();
+                    if *index == 1 {
+                        safety.cliff(active, received);
+                    } else {
+                        safety.drop_sensor(active, received);
+                    }
+                }
                 PlayerData::Position2d(v) => {
                     self.odom_history
                         .push(stamp, received, (v.x as f64, v.y as f64, v.yaw as f64));

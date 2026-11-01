@@ -86,18 +86,30 @@ fn run_bounded_drive(
     ms: u64,
     ack: std::sync::mpsc::Sender<bool>,
 ) -> bool {
-    if send_velocity(rollback, vx, vyaw).is_err() {
+    if let Err(e) = send_velocity(rollback, vx, vyaw) {
+        eprintln!("[supervisor] DRIVE {vx} {vyaw} {ms} velocity write FAILED: {e}");
         let _ = ack.send(false);
         return false;
     }
+    eprintln!("[supervisor] DRIVE {vx} {vyaw} {ms} accepted, holding local deadline");
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     *drive.lock().unwrap() = Some(tx);
     let _ = ack.send(true);
     // Hold the lease on this thread: STOP wakes the channel, the deadline
     // bounds the wait. Either way the local zero follows.
-    let _cancelled = rx.recv_timeout(Duration::from_millis(ms)).is_ok();
+    let cancelled = rx.recv_timeout(Duration::from_millis(ms)).is_ok();
     drive.lock().unwrap().take();
-    let _ = send_velocity(rollback, 0.0, 0.0);
+    eprintln!(
+        "[supervisor] drive finished ({}, {ms} ms); sending local zero",
+        if cancelled {
+            "stopped by client"
+        } else {
+            "deadline"
+        }
+    );
+    if let Err(e) = send_velocity(rollback, 0.0, 0.0) {
+        eprintln!("[supervisor] local zero write FAILED: {e}");
+    }
     true
 }
 

@@ -688,7 +688,7 @@ fn scan_packet(stamp: f64) -> Vec<u8> {
     packet(6, 0, 3, stamp, &p)
 }
 /// Data packet builder copied from tests/server.rs (local there, too).
-fn packet(interf: u16, index: u16, subtype: u8, stamp: f64, payload: &[u8]) -> Vec<u8> {
+pub fn packet(interf: u16, index: u16, subtype: u8, stamp: f64, payload: &[u8]) -> Vec<u8> {
     let mut p = encode_header(&MsgHeader {
         addr: DevAddr {
             host: 0,

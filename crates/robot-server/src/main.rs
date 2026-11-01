@@ -356,8 +356,14 @@ async fn session(socket: WebSocket, app: App) {
                             r.command(id, None, std::time::Instant::now());
                         }
                         let mut safety = app.safety.lock().unwrap();
-                        if safety.reset_blocked() {
+                        // A reset under a still-present hazard is refused with
+                        // the reason; the latch stays on (#65).
+                        let outcome = safety.reset_blocked();
+                        if outcome.is_ok() {
                             app.states.send_modify(|state| state.clear_blocked());
+                        } else {
+                            let reason = format!("{:?}", outcome.err().unwrap()).to_lowercase();
+                            eprintln!("robot-server: reset refused: {reason} still present");
                         }
                     }
                 }
