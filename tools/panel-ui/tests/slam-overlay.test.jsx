@@ -58,6 +58,42 @@ describe('SLAM overlay rendering', () => {
     expect(ctx.arc).toHaveBeenCalledWith(127 + 100 / 3, 127, 2, 0, 2 * Math.PI)
   })
 
+  // BUG: versioned map frames arrive independently of scan/pose updates.
+  // HYPOTHESIS: the repaint effect does not depend on mapFrame, so an already
+  // rendered canvas ignores a late/new map until unrelated telemetry changes.
+  // SOLUTION: mapFrame participates in the canvas repaint effect dependencies.
+  // RESULT: FIXED — late maps and changed versions repaint without scan/pose updates;
+  // actual browser pixels changed from 0 to 12380 wall pixels on map delivery.
+  // STATUS: FIXED
+  it.each(['robot', 'map'])('repaints a late map frame without new scan/pose in %s frame', (frame) => {
+    const props = { scan, slam, view: { ...view, frame }, onView: () => {} }
+    const { rerender } = render(<LidarCanvas {...props} mapFrame={null} />)
+    draw()
+    expect(ctx.drawImage).not.toHaveBeenCalled()
+    ctx.fillRect.mockClear()
+    rerender(<LidarCanvas {...props} mapFrame={mapFrame} />)
+    draw()
+    expect(ctx.drawImage).toHaveBeenCalledTimes(1)
+    const pixels = imageCtx.putImageData.mock.calls.at(-1)[0].data
+    expect(pixels[3]).toBeGreaterThan(0)
+    expect(pixels[7]).toBe(0)
+  })
+
+  it('repaints a changed map version without unrelated telemetry', () => {
+    const props = { scan, slam, view: { ...view, frame: 'map' }, onView: () => {} }
+    const { rerender } = render(<LidarCanvas {...props} mapFrame={mapFrame} />)
+    draw()
+    ctx.drawImage.mockClear()
+    imageCtx.putImageData.mockClear()
+    const changed = { version: 2, grid: { ...mapFrame.grid, cells: '-1,100' } }
+    rerender(<LidarCanvas {...props} mapFrame={changed} />)
+    draw()
+    expect(ctx.drawImage).toHaveBeenCalledTimes(1)
+    const pixels = imageCtx.putImageData.mock.calls.at(-1)[0].data
+    expect(pixels[3]).toBe(0)
+    expect(pixels[7]).toBeGreaterThan(0)
+  })
+
   it('hides overlay on a local timeout, even with repeated unchanged telemetry', () => {
     const { rerender } = mount(); draw()
     expect(ctx.drawImage).toHaveBeenCalledTimes(1)

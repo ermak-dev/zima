@@ -106,7 +106,7 @@ export default function LidarCanvas({ scan, view, onView, slam, mapFrame, slamSt
     const remaining = Math.max(0, freshness.maxAgeMs - (performance.now() - pair.receivedAt))
     const timer = setTimeout(() => scheduleRef.current?.(), remaining + 1)
     return () => clearTimeout(timer)
-  }, [scan, view, slam, freshness.aligned, freshness.matched, freshness.maxAgeMs])
+  }, [scan, view, slam, mapFrame, freshness.aligned, freshness.matched, freshness.maxAgeMs])
 
   useEffect(() => {
     const canvas = canvasRef.current
