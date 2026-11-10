@@ -287,7 +287,7 @@ def _trajectory(poses):
                 for a, b in zip(poses, poses[1:])))
 
 
-def run(adapter, capture, *, lidar_yaw_deg, max_odom_age_ms=250., timeout_s=120.):
+def run(adapter, capture, *, lidar_yaw_deg, max_odom_age_ms=250., timeout_s=120., map_out=None):
     """Execute only start_mapping + updates on an explicitly trusted local adapter.
 
     Per-scan results retain actual adapter diagnostics and all association metadata.
@@ -315,6 +315,17 @@ def run(adapter, capture, *, lidar_yaw_deg, max_odom_age_ms=250., timeout_s=120.
             results.append(dict(scan_sequence=record['scan_sequence'], scan_id=record['scan_id'],
                 association=record['association'], pose=pose, diagnostics=diagnostics,
                 tracking=reply.get('tracking'), quality=reply.get('quality')))
+        grid = None
+        if map_out is not None:
+            reply = _exchange(process, dict(op='map'), deadline, budget)
+            inner = reply.get('grid')
+            _require(isinstance(inner, dict), 'adapter map reply missing grid object')
+            grid = {
+                'x_min': inner.get('x_min'), 'y_min': inner.get('y_min'),
+                'res': inner.get('res'), 'w': inner.get('w'),
+                'h': inner.get('h'), 'cells': inner.get('cells'),
+            }
+            _require(all(grid[k] is not None for k in grid), 'adapter map reply missing grid fields')
         process.stdin.close()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -343,6 +354,10 @@ def run(adapter, capture, *, lidar_yaw_deg, max_odom_age_ms=250., timeout_s=120.
     stamps = [a['scan_source_stamp'] for a in associations]
     intervals = [1000*(b-a) for a, b in zip(stamps, stamps[1:]) if a is not None and b is not None]
     odom_poses = [r['absolute_odom'] for r in prepared['records']]
+    if map_out is not None and grid is not None:
+        with open(map_out, 'x', encoding='utf-8') as fh:
+            json.dump(grid, fh)
+        os.chmod(map_out, 0o600)
     return dict(capture_complete=capture['complete'], completion=capture['completion'],
         lidar_yaw_deg=lidar_yaw_deg, sensor_x=-.1, source_time_verified=False,
         beam_time_verified=False, deskew_applied=False, truth_available=False,
@@ -376,7 +391,8 @@ def main():
     try:
         capture = load(args.input, allow_incomplete=args.allow_incomplete)
         result = run(args.adapter, capture, lidar_yaw_deg=args.lidar_yaw_deg,
-                     max_odom_age_ms=args.max_odom_age_ms, timeout_s=args.timeout)
+                     max_odom_age_ms=args.max_odom_age_ms, timeout_s=args.timeout,
+                     map_out=args.map_out)
         print(json.dumps(result, allow_nan=False))
     except (OSError, ValueError, TimeoutError) as exc:
         parser.exit(1, 'hardware replay: ' + str(exc) + '\n')

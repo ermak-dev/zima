@@ -192,6 +192,56 @@ for line in sys.stdin:
             adapter.write_text('#!/usr/bin/python3 -I\nimport sys\nsys.stdout.write("x"*5000000);sys.stdout.flush()\n')
             with self.assertRaises(ValueError): m.run(adapter, capture, lidar_yaw_deg=0)
 
+    def test_map_out_saves_final_grid(self):
+        """--map-out (#70): after replay the adapter {"op":"map"} grid is
+        saved as JSON 0600 without overwriting an existing file."""
+        import tempfile
+        m = self.module()
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as fh:
+            for row in rows([odom(), frame(laser())]):
+                fh.write(json.dumps(row) + '\n')
+            path = fh.name
+        capture = m.load(path)
+        reply = dict(ok=True, pose=dict(x=0.0, y=0.0, yaw=0.0), quality=0.9,
+                     tracking='tracking',
+                     diagnostics=dict(used_points=10, reference_points=10,
+                                      accepted=True, reason='accepted',
+                                      goodness=0.9, iterations=3, duration_ms=1.0,
+                                      correspondences=10, residual_rms=0.01,
+                                      mapping_paused=False))
+        grid = dict(x_min=0.0, y_min=0.0, res=0.05, w=4, h=4,
+                    cells=','.join(['0'] * 16))
+        fake = (
+            '#!/usr/bin/env python3\n'
+            'import json, sys\n'
+            f'reply = {reply!r}\n'
+            f'grid = {grid!r}\n'
+            'for line in sys.stdin:\n'
+            '    req = json.loads(line)\n'
+            '    if req.get("op") == "map":\n'
+            '        print(json.dumps(dict(ok=True, grid=grid)), flush=True)\n'
+            '    else:\n'
+            '        print(json.dumps(reply), flush=True)\n')
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            adapter = td / 'adapter'
+            adapter.write_text(fake)
+            adapter.chmod(0o755)
+            out = td / 'map.json'
+            result = m.run(str(adapter), capture, lidar_yaw_deg=0., map_out=out)
+            self.assertTrue(out.is_file(), 'map_out file missing')
+            import stat as statmod
+            self.assertEqual(statmod.S_IMODE(out.stat().st_mode), 0o600)
+            data = json.loads(out.read_text())
+            for key in ('x_min', 'y_min', 'res', 'w', 'h', 'cells'):
+                self.assertIn(key, data)
+            existing = td / 'again.json'
+            existing.write_text('keep')
+            with self.assertRaises(OSError):
+                m.run(str(adapter), capture, lidar_yaw_deg=0., map_out=existing)
+            self.assertEqual(existing.read_text(), 'keep')
+            self.assertIsInstance(result, dict)
+
     def test_cli_requires_explicit_lidar_yaw(self):
         self.module()
         result = subprocess.run([sys.executable, '-I', str(TOOL), 'anything', '--adapter', '/trusted'], capture_output=True)
