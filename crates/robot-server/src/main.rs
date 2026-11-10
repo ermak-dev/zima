@@ -1,6 +1,7 @@
 mod audio;
 mod camera;
 mod compass;
+mod floorplan;
 mod grants;
 mod mcp;
 mod mcp_drive;
@@ -146,6 +147,9 @@ struct App {
     /// Supervisor address/token for the robot-local drive lease (#64);
     /// None when the session runs without a supervisor (audio-only, tests).
     supervisor: Option<(String, String)>,
+    /// Versioned polygonal floorplan layer (#83).
+    floorplans: std::sync::Arc<floorplan::Floorplans>,
+    floorplans_rx: Option<tokio::sync::watch::Receiver<Value>>,
 }
 /// Whether this session ever commanded the cleaning motors; duties live in
 /// the typed state. The write half sends PWM commands on the sole Player
@@ -187,6 +191,22 @@ enum ResetKind {
     #[serde(rename = "reset_blocked")]
     ResetBlocked,
 }
+/// Operator-triggered polygonal floorplan rebuild (#83). POST, not WS: the
+/// operator is a human at the panel, not the robot's drive owner.
+async fn floorplan_rebuild(State(app): State<App>) -> Response {
+    let (status, body) = floorplan::rebuild(&app).await;
+    let mut response = axum::response::Response::builder().status(
+        axum::http::StatusCode::from_u16(status)
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str("application/json") {
+        response = response.header(axum::http::header::CONTENT_TYPE, value);
+    }
+    response
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
 async fn index() -> Response {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/panel.html");
     match tokio::fs::read_to_string(path).await {
@@ -292,6 +312,7 @@ async fn session(socket: WebSocket, app: App) {
     let mut state = app.state.clone();
     let mut scan = app.scan.clone();
     let mut maps = app.maps.clone();
+    let mut floorplans = app.floorplans_rx.clone();
     let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::channel(4);
     // Independent send/receive futures: a slow viewer never delays a disconnect
     // or command lease. watch channels retain only the latest state and scan.
@@ -413,10 +434,24 @@ async fn session(socket: WebSocket, app: App) {
                 send_frame(&mut output, "map", current).await?;
             }
         }
+        // The cached polygonal floorplan (#83) replays the same way; it only
+        // changes on an explicit rebuild, never with the frequent state.
+        if let Some(fp) = floorplans.as_mut() {
+            let current = fp.borrow_and_update().clone();
+            if current != Value::Null {
+                send_frame(&mut output, "floorplan", current).await?;
+            }
+        }
         loop {
             let map_change = async {
                 match maps.as_mut() {
                     Some(maps) => maps.changed().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let floorplan_change = async {
+                match floorplans.as_mut() {
+                    Some(fp) => fp.changed().await,
                     None => std::future::pending().await,
                 }
             };
@@ -425,6 +460,7 @@ async fn session(socket: WebSocket, app: App) {
              r=state.changed()=>{r?;let v=state.borrow_and_update().to_json();send_frame(&mut output,"state",v).await?;},
              r=scan.changed()=>{r?;let v=scan.borrow_and_update().clone();if let Some(v)=v{send_frame(&mut output,"scan",v).await?;}}
              _=map_change=>{if let Some(maps)=maps.as_mut(){let v=maps.borrow_and_update().clone();send_frame(&mut output,"map",v).await?;}}
+             _=floorplan_change=>{if let Some(fp)=floorplans.as_mut(){let v=fp.borrow_and_update().clone();send_frame(&mut output,"floorplan",v).await?;}}
             }
         }
         #[allow(unreachable_code)]
@@ -660,6 +696,7 @@ async fn run_session(
         (None, None)
     };
     let motors = Arc::new(Mutex::new(Motors { active: false }));
+    let (floorplans, floorplans_rx) = floorplan::Floorplans::new();
     let app = App {
         safety,
         state,
@@ -681,6 +718,8 @@ async fn run_session(
                 std::env::var("ROBOT_SUPERVISOR_TOKEN").unwrap_or_default(),
             )
         }),
+        floorplans: Arc::new(floorplans),
+        floorplans_rx: Some(floorplans_rx),
     };
     let listener = match TcpListener::bind((c.listen.as_str(), c.port)).await {
         Ok(l) => l,
@@ -705,6 +744,10 @@ async fn run_session(
         .route("/camera.mjpeg", get(camera::proxy))
         .route("/vision/ws", get(vision::upgrade))
         .route("/mcp", axum::routing::post(mcp::endpoint))
+        .route(
+            "/api/floorplan/rebuild",
+            axum::routing::post(floorplan_rebuild),
+        )
         .with_state(app)
         .merge(audio::router(audio));
     let mut http = tokio::spawn(async move { axum::serve(listener, router).await });

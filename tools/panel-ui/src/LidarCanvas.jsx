@@ -83,7 +83,7 @@ function gridImage(cache, m) {
 // The canvas is an imperative island: React never renders into it. The
 // backing buffer is sized only when the element resizes (not on every
 // frame), and redraws happen on data/interaction, not on a fixed timer.
-export default function LidarCanvas({ scan, view, onView, slam, mapFrame, slamState }) {
+export default function LidarCanvas({ scan, view, onView, slam, mapFrame, floorplanFrame, slamState }) {
   const localState = useSlamState(slamState ? null : slam, scan)
   const freshness = slamState || localState
   const canvasRef = useRef(null)
@@ -97,7 +97,7 @@ export default function LidarCanvas({ scan, view, onView, slam, mapFrame, slamSt
       previous.scan.stamp === scan.stamp && previous.slam.scan_stamp === slam.scan_stamp
     pairRef.current = { scan, slam, map: mapFrame, receivedAt: same ? previous.receivedAt : performance.now() - (freshness.ageMs ?? 0) }
   }
-  stateRef.current = { scan, view, onView, slam, map: mapFrame, freshness }
+  stateRef.current = { scan, view, onView, slam, map: mapFrame, floorplan: floorplanFrame, freshness }
 
   useEffect(() => {
     scheduleRef.current?.()
@@ -106,7 +106,7 @@ export default function LidarCanvas({ scan, view, onView, slam, mapFrame, slamSt
     const remaining = Math.max(0, freshness.maxAgeMs - (performance.now() - pair.receivedAt))
     const timer = setTimeout(() => scheduleRef.current?.(), remaining + 1)
     return () => clearTimeout(timer)
-  }, [scan, view, slam, mapFrame, freshness.aligned, freshness.matched, freshness.maxAgeMs])
+  }, [scan, view, slam, mapFrame, floorplanFrame, freshness.aligned, freshness.matched, freshness.maxAgeMs])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -174,6 +174,50 @@ export default function LidarCanvas({ scan, view, onView, slam, mapFrame, slamSt
           ctx.imageSmoothingEnabled = false
           ctx.drawImage(image, 0, 0)
           ctx.restore()
+        }
+      }
+
+      // The polygonal floorplan (#83) lives in map coordinates: the world
+      // view draws it directly; the robot view transforms it through the
+      // inverse SLAM pose exactly like the grid image.
+      const fp = v.showFloorplan !== false ? s.floorplan : null
+      if (fp && (world || matchedSlam)) {
+        const rot = (p) => {
+          if (world) return p
+          const c = Math.cos(pose.yaw), sn = Math.sin(pose.yaw)
+          return [p[0] * c + p[1] * sn - pose.x, -p[0] * sn + p[1] * c - pose.y]
+        }
+        for (const room of fp.rooms || []) {
+          const poly = room.polygon || []
+          if (poly.length < 3) continue
+          ctx.beginPath()
+          poly.forEach((p, i) => {
+            const [x, y] = at(...rot(p))
+            i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)
+          })
+          ctx.closePath()
+          ctx.fillStyle = 'rgba(46, 160, 84, 0.10)'
+          ctx.fill()
+        }
+        ctx.lineWidth = Math.max(1.2, k * 0.03)
+        ctx.strokeStyle = '#1f6b3a'
+        for (const w of fp.walls || []) {
+          if (w.observed === false) continue
+          const [ax, ay] = at(...rot(w.a))
+          const [bx, by] = at(...rot(w.b))
+          ctx.beginPath()
+          ctx.moveTo(ax, ay)
+          ctx.lineTo(bx, by)
+          ctx.stroke()
+        }
+        ctx.strokeStyle = '#208020'
+        for (const d of fp.doors || []) {
+          const [ax, ay] = at(...rot(d.a))
+          const [bx, by] = at(...rot(d.b))
+          ctx.beginPath()
+          ctx.moveTo(ax, ay)
+          ctx.lineTo(bx, by)
+          ctx.stroke()
         }
       }
 

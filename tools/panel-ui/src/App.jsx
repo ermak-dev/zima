@@ -22,9 +22,14 @@ export default function App() {
   // The versioned SLAM grid arrives in its own `map` frames; the frequent
   // state carries only `slam.map_version`.
   const [mapFrame, setMapFrame] = useState(null)
+  // The polygonal floorplan (#83): its own versioned frames, changed only by
+  // an explicit rebuild, never by frequent state updates.
+  const [floorplanFrame, setFloorplanFrame] = useState(null)
+  const [floorplanBusy, setFloorplanBusy] = useState(false)
+  const [floorplanError, setFloorplanError] = useState('')
   // Keep result age above collapsible panels: reopening a canvas is not a new result.
   const slamState = useSlamState(state.slam, scan)
-  const [view, setView] = useState({ radius: 3, center: null, frame: 'robot', showScan: true, showMap: true })
+  const [view, setView] = useState({ radius: 3, center: null, frame: 'robot', showScan: true, showMap: true, showFloorplan: true })
   const [collapsed, setCollapsed] = useState({ lidar: false, camera: false, sensors: false })
   const [expanded, setExpanded] = useState(null)
   const [visionEnabled, setVisionEnabled] = useState(false)
@@ -51,6 +56,10 @@ export default function App() {
     if (msg.type === 'state') setState(msg.data)
     else if (msg.type === 'scan') setScan(msg.data)
     else if (msg.type === 'map' && msg.data && Number.isInteger(msg.data.version)) setMapFrame(msg.data)
+    else if (msg.type === 'floorplan' && msg.data && Number.isInteger(msg.data.version)) {
+      setFloorplanFrame(msg.data)
+      setFloorplanError('')
+    }
     else if (msg.type === 'vision' && typeof msg.data?.enabled === 'boolean') setVisionEnabled(msg.data.enabled)
     else if (msg.type === 'recovery') {
       setRecoveryMessage(msg.data?.isError
@@ -59,6 +68,23 @@ export default function App() {
     }
   }, [])
   const { connected, send } = usePanelSocket(onMessage)
+  const rebuildFloorplan = useCallback(async () => {
+    if (floorplanBusy) return
+    setFloorplanBusy(true)
+    setFloorplanError('')
+    try {
+      const res = await fetch('/api/floorplan/rebuild', { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        setFloorplanError(body?.error || `Пересчёт не удался (${res.status})`)
+      }
+      // Success arrives as a `floorplan` WS frame; nothing to apply here.
+    } catch {
+      setFloorplanError('Пересчёт не удался: нет соединения')
+    } finally {
+      setFloorplanBusy(false)
+    }
+  }, [floorplanBusy])
   const [speed, setSpeed] = useState(DEFAULT_LINEAR_SPEED)
   const linearLimit = Number.isFinite(speed) ? Math.min(Math.max(speed, 0.01), HARD_LIMITS.v) : DEFAULT_LINEAR_SPEED
   const [turnSpeed, setTurnSpeed] = useState(DEFAULT_ANGULAR_SPEED)
@@ -172,6 +198,9 @@ export default function App() {
                 <label className="layer-toggle" title="Показывать карту SLAM (occupancy)">
                   <input type="checkbox" checked={view.showMap} onChange={(e) => setView((v) => ({ ...v, showMap: e.target.checked }))} />Карта SLAM
                 </label>
+                <label className="layer-toggle" title="Полигональная карта: стены, комнаты и двери по пересчёту">
+                  <input type="checkbox" checked={view.showFloorplan} onChange={(e) => setView((v) => ({ ...v, showFloorplan: e.target.checked }))} />Полигонная карта
+                </label>
                 <button id="lidar-frame" type="button" aria-pressed={view.frame === 'map'}
                   title="Фиксированный кадр карты: отличить повреждение карты от скачка позы"
                   onClick={() => setView((v) => ({ ...v, frame: v.frame === 'map' ? 'robot' : 'map', center: null }))}>Кадр карты</button>
@@ -186,11 +215,12 @@ export default function App() {
           </div>
           {!collapsed.lidar && (
             <div className="lidar-stage">
-              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} mapFrame={mapFrame} slamState={slamState} />
+              <LidarCanvas scan={scan} view={view} onView={setView} slam={state.slam} mapFrame={mapFrame} floorplanFrame={floorplanFrame} slamState={slamState} />
               <div className="legend">
                 <span><i className="dot" />Скан лидара</span>
                 <span><i className="robot-dot" />{view.frame === 'map' ? 'Робот · поза SLAM' : 'Робот · начало координат'}</span>
                 <span>Карта · занято / свободно / неизвестно</span>
+                {view.showFloorplan && floorplanFrame && <span>Полигон · комнаты / стены / двери</span>}
                 {view.frame === 'map' && <span>Фиксированный map · скан только при совпадении с позой</span>}
               </div>
             </div>
@@ -269,6 +299,16 @@ export default function App() {
         <button id="stop" type="button" onClick={stop}>Стоп · Space</button>
         <span className="limits">≤ {HARD_LIMITS.v} м/с &nbsp; ≤ {HARD_LIMITS.w} рад/с</span>
         <MotorsFooter motors={state.motors} send={send} />
+        <span className="floorplan-control">
+          <button id="floorplan-rebuild" type="button" disabled={floorplanBusy || !connected}
+            title="Пересчитать полигональную карту по текущей карте SLAM"
+            onClick={rebuildFloorplan}>Пересчитать карту{floorplanBusy ? '…' : ''}</button>
+          <span id="floorplan-status" data-testid="floorplan-status">{
+            (floorplanFrame
+              ? `${floorplanFrame.rooms?.length ?? 0} комн · ${floorplanFrame.walls?.length ?? 0} стен · v${floorplanFrame.version}`
+              : 'Полигонов ещё нет')
+              + (floorplanError ? ` · ${floorplanError}` : '')}</span>
+        </span>
         <SpeechPanel settings={audioSettings} />
       </footer>
     </>
