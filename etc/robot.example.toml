@@ -13,9 +13,10 @@ port = 8085
 host = "" # Empty: use the resolved robot host.
 port = 7665
 timeout_ms = 5000
-listen = "0.0.0.0"
+listen = "127.0.0.1"
 binary = "../crates/target/armv7-unknown-linux-gnueabihf/release/robot-supervisor"
-# Generate a private random token before explicitly deploying with robot daemon start.
+# An empty token disables authentication entirely; the supervisor API must
+# not listen beyond localhost without a generated private token.
 token = ""
 
 [run]
