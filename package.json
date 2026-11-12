@@ -2,14 +2,12 @@
   "name": "robot",
   "version": "1.0.0",
   "description": "Ручное управление root-нутым Roborock V1: текущий лидар, датчики и камера в браузере, отдельный Python-контур записи, распознавания речи и динамика. Штатный Player остаётся драйвером железа; на хосте работают Rust-сервер и опциональный аудиосервис.",
-  "main": "index.js",
   "directories": {
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "bash tests/test_robot.sh && bash tests/test_robot_camera.sh && python3 tests/test_robot_bug.py"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC"
+  "license": "MIT",
+  "private": true
 }
