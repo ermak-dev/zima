@@ -762,7 +762,7 @@ pub fn decode_data(msg: &Message) -> Result<Option<PlayerData>, Error> {
 
 // --- vendor motor command (interface 170) ---
 // Ground truth: installed-firmware XDR table + RubyChassisDriver::ProcessMessage
-// (docs/player-platform-survey.md, 2026-10-03): motor:0 fan, motor:1 main brush,
+// (firmware survey, 2026-10-03; see HARDWARE.md): motor:0 fan, motor:1 main brush,
 // motor:2 side brush; CMD subtype 1 = player_motor_cmd_pwm_pack, one XDR float.
 // The driver scales by 100 internally; clients publish the raw duty value.
 // Subscriptions are never made: the vendor enqueues a zero on the last
