@@ -1,3 +1,5 @@
+# Relative paths resolve against cargo's working directory, so cross-build
+# from this directory (crates/), as documented in SOFTWARE.md.
 [target.armv7-unknown-linux-musleabihf]
-linker = "./tools/arm-lld.sh"
+linker = "../tools/arm-lld.sh"
 rustflags = ["-C", "target-feature=+crt-static"]
