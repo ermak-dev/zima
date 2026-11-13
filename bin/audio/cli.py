@@ -329,7 +329,7 @@ def _run_companion(args):
     gain = CameraGainLease(ssh, volume=args.gain, ttl_s=args.max_seconds, startup_s=args.startup_seconds)
     try:
         with CameraSession(explicit=True, ttl_s=args.max_seconds, startup_s=args.startup_seconds, gain=gain) as session:
-            command = [str(ROOT/'bin/robot'), 'audio', 'run', '--config', str(args.config)]
+            command = [str(ROOT/'bin/zima'), 'audio', 'run', '--config', str(args.config)]
             process = subprocess.Popen(command, start_new_session=True)
             next_check = 0.0
             try:

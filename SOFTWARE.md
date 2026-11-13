@@ -12,7 +12,7 @@ MRPT-SLAM подключается к серверной сессии; авто�
 
 ## Единая конфигурация
 
-`bin/robot` читает `etc/robot.toml` из каталога репозитория независимо от
+`bin/zima` читает `etc/robot.toml` из каталога репозитория независимо от
 текущего рабочего каталога. Рабочий файл содержит секреты: только обычный файл
 владельца с правами **0600**, без symlink; он исключён из Git. Публичный шаблон —
 [`etc/robot.example.toml`](etc/robot.example.toml), с пустыми ключами.
@@ -30,12 +30,12 @@ MRPT-SLAM подключается к серверной сессии; авто�
 Наличие ключа само по себе не включает облачный TTS: нужен `yandex.enabled = true`.
 
 ```sh
-bin/robot run                              # настройки из etc/robot.toml
-bin/robot --config /private/robot.toml run  # другой приватный TOML
-bin/robot --config /private/robot.toml say 'Привет'
+bin/zima run                              # настройки из etc/robot.toml
+bin/zima --config /private/robot.toml run  # другой приватный TOML
+bin/zima --config /private/robot.toml say 'Привет'
 ```
 
-Старые аргументы запуска остаются как явные переопределения. `robot audio …
+Старые аргументы запуска остаются как явные переопределения. `zima audio …
 --config FILE` по-прежнему выбирает прежний JSON-профиль аудиосервиса;
 общий TOML для этих команд задаётся **перед** `audio`. Настройки камеры и
 громкости также применяются к snapshot/record и старому аудиосервису; явный
@@ -43,7 +43,7 @@ JSON-профиль переопределяет его значения по у
 
 ### Озвучивание панели и CLI
 
-Панель и `robot say` используют один HTTP API хостового `robot-server`:
+Панель и `zima say` используют один HTTP API хостового `robot-server`:
 `POST /api/audio/say` с `{text, volume?}` возвращает `202` и идентификатор
 задания, `GET /api/audio/tasks/{id}` — его состояние,
 `POST /api/audio/tasks/{id}/cancel` — запрос отмены. Успех означает только
@@ -55,7 +55,7 @@ JSON-профиль переопределяет его значения по у
 Синтез Yandex выполняется на хосте. Ключ не попадает ни в браузер, ни на робот.
 Готовый WAV передаётся аутентифицированному `robot-supervisor` по TCP.
 Громкость по умолчанию 0.35, предел 0.9; обе настройки берутся из TOML.
-Адрес API для `robot say` по умолчанию следует `[server]`; для удалённого
+Адрес API для `zima say` по умолчанию следует `[server]`; для удалённого
 хоста можно отдельно задать `audio.endpoint`.
 
 На роботе для этого пути нужен **один бинарник** `robot-supervisor`.
@@ -66,13 +66,13 @@ JSON-профиль переопределяет его значения по у
 ```sh
 bash tools/build-supervisor.sh   # только локальная ARM/glibc-сборка
 # Следующая команда меняет файлы на роботе; запускать только явно разрешённо:
-bin/robot daemon start
-bin/robot serve                  # HTTP/TTS без подключения к Player и без handoff
+bin/zima daemon start
+bin/zima serve                  # HTTP/TTS без подключения к Player и без handoff
 # В другом терминале, пока serve или run работает:
-bin/robot say 'Проверка динамика'
+bin/zima say 'Проверка динамика'
 ```
 
-Для обычной панели достаточно одной команды **`bin/robot run`**: она сама
+Для обычной панели достаточно одной команды **`bin/zima run`**: она сама
 сравнивает SHA-256 запущенного супервизора с локальным ARM-бинарником,
 при необходимости обновляет свободный процесс, затем выполняет handoff
 и запускает хостовый сервер с панелью и TTS. Отдельный `daemon start` перед
@@ -81,7 +81,7 @@ bin/robot say 'Проверка динамика'
 обязателен даже при работающем сервере; сборка — `bash tools/build-supervisor.sh`.
 Приведённая выше пара `daemon start` / `serve` нужна только для отдельного
 HTTP/TTS-режима без управления шасси. `serve` и `run` не нужно запускать
-одновременно на одном HTTP-порту. Старые флаги `robot say
+одновременно на одном HTTP-порту. Старые флаги `zima say
 --yandex-env` и `--piper-module-path` удалены: выбор и ключи провайдера теперь
 на стороне сервера. Отдельный Python-аудиосервис остаётся для прежних функций
 захвата/ASR и не требуется для TTS панели.
@@ -95,12 +95,12 @@ HTTP/TTS-режима без управления шасси. `serve` и `run` �
 robot-server: Rust, рабочая машина
     ├── Player TCP :6665 ↔ Player на роботе ↔ LDS / шасси
     ├── heartbeat / WAV / cancel TCP :7665 → robot-supervisor на роботе
-    ├── Yandex SpeechKit ← задания TTS панели и robot say
+    ├── Yandex SpeechKit ← задания TTS панели и zima say
     ├── HTTP /mjpeg ← majestic на OpenIPC-камере
     └── опциональный YOLO-адаптер: JPEG по stdio → SSH gpu → YOLOE-26
         └── JPEG + объекты → отдельный /vision/ws → оверлей камеры
 
-Python: robot audio run, отдельный запуск
+Python: zima audio run, отдельный запуск
     ├── локальный HTTP IPC :8086 ← команды audio CLI
     ├── HTTP /audio.opus ← majestic
     ├── pipes ↔ дочерний ffmpeg: Opus → PCM
@@ -113,7 +113,7 @@ Python: robot audio run, отдельный запуск
 
 | Компонент | Граница и ответственность |
 | --- | --- |
-| `bin/robot` | Короткоживущий CLI или shell-обёртка надзорной сессии: SSH, блокировка, запуск сервера, восстановление контроллера. |
+| `bin/zima` | Короткоживущий CLI или shell-обёртка надзорной сессии: SSH, блокировка, запуск сервера, восстановление контроллера. |
 | `robot-server` | Один процесс с Player-клиентом, HTTP/WS, прокси камеры и состоянием панели. Чтение Player, отправка скоростей и heartbeat выполняются независимо. |
 | Браузер | React и Canvas. Веб-сервер Node.js при обычной работе не нужен. |
 | `robot-supervisor` | Постоянный сервер на роботе: аутентификация, эксклюзивная сессия маски/heartbeat и независимое аудио. При потере владельца восстанавливает контроллер, но продолжает слушать. |
@@ -158,7 +158,7 @@ Python: robot audio run, отдельный запуск
 
 ## Жизненный цикл серверной сессии
 
-`bin/robot run`, `panel` и `bridge` запускают одну и ту же надзорную сессию.
+`bin/zima run`, `panel` и `bridge` запускают одну и ту же надзорную сессию.
 По умолчанию подключаются лидарный MRPT-SLAM через
 `tools/mrpt-adapter/adapter` и распознавание объектов через `tools/yolo/adapter`:
 панель получает позу, карту и объекты поверх камеры. MRPT должен быть собран,
@@ -230,7 +230,7 @@ ARM-бинарника нет: сравнивается выбранный `ROBO
 
 Закрытие страницы не завершает серверную сессию. Потеря соединения
 управляющего браузера сбрасывает его команду, но процесс и супервизор остаются
-до завершения команды запуска. После живой сессии проверяют `bin/robot status`:
+до завершения команды запуска. После живой сессии проверяют `bin/zima status`:
 ожидается `enabled`.
 
 ### Ограничения команд
@@ -246,7 +246,7 @@ ARM-бинарника нет: сравнивается выбранный `ROBO
 клавиши новая настройка применяется очередной отправкой (период 150 мс).
 После настройки слайдера WASD работает и при оставшемся на нём фокусе,
 а стрелки сохраняют стандартное управление самим слайдером. Прямая команда
-`robot move` по-прежнему использует 0.1 м/с. Очередь старых скоростей не
+`zima move` по-прежнему использует 0.1 м/с. Очередь старых скоростей не
 проигрывается после задержки.
 Период обработки команд сервера — 20 мс; молчание Player не блокирует этот таймер.
 
@@ -363,7 +363,7 @@ MCL spread-прокси хранится отдельно в `localization_quali
 ### Единая запись прогона
 
 ```sh
-bin/robot run --no-yolo --record-dir /private/existing-parent/new-session
+bin/zima run --no-yolo --record-dir /private/existing-parent/new-session
 ```
 
 Это обычная живая сессия, не подключение к чужому серверу. Параметр также
@@ -436,7 +436,7 @@ NACK не мешает запуску сервера.
 Развёрнутая панель занимает только рабочую область, не перекрывая footer.
 На очень маленьких экранах доступна внутренняя прокрутка датчиков.
 Компас получает отдельное аутентифицированное подключение к
-`ROBOT_SUPERVISOR_ADDR` (обычный `bin/robot run` задаёт его автоматически).
+`ROBOT_SUPERVISOR_ADDR` (обычный `bin/zima run` задаёт его автоматически).
 После `AUTH` команда `COMPASS` передаёт не чаще 10 Гц строки
 `COMPASS <stamp> <raw_x> <raw_y> <raw_z>`. Это независимый наблюдатель:
 нет `ACTIVATE`, захвата evdev, команд движения или восстановления контроллера.
@@ -462,7 +462,7 @@ NACK не мешает запуску сервера.
 хостовый `robot-server`, bundle и ARM `robot-supervisor`; локальная сборка —
 `cargo build --manifest-path crates/Cargo.toml -p robot-server --release`,
 `npm --prefix tools/panel-ui run build`, `bash tools/build-supervisor.sh`.
-Следующий разрешённый `robot run` автоматически обновит устаревший свободный
+Следующий разрешённый `zima run` автоматически обновит устаревший свободный
 супервизор по описанному выше протоколу. До подтверждённой остановки старого
 процесса его ELF не заменяется; при активной сессии обновление запрещено. Пороговый vendor `position3d:2` остаётся только в
 служебной телеметрии и не может заменить или затереть магнитное измерение.
@@ -505,13 +505,13 @@ vendor-motor может влиять на привод. Для этих стро
 Обычный запуск включает оба адаптера:
 
 ```sh
-bin/robot run
+bin/zima run
 # Эквивалентно явному выбору:
-bin/robot run --slam-adapter tools/mrpt-adapter/adapter --yolo-adapter tools/yolo/adapter
+bin/zima run --slam-adapter tools/mrpt-adapter/adapter --yolo-adapter tools/yolo/adapter
 # Отключить только распознавание, оставить карту:
-bin/robot run --no-yolo
+bin/zima run --no-yolo
 # Обычная камера без обоих адаптеров:
-bin/robot run --no-slam --no-yolo
+bin/zima run --no-slam --no-yolo
 ```
 
 **Эти команды запускают обычную серверную сессию с передачей управления
@@ -551,11 +551,11 @@ heartbeat/управление. YOLO не получает доступа к п�
 
 ```sh
 YOLO_CLASSES='["person","chair","shoe","cable","cat","dog"]' YOLO_CONF=0.3 \
-  bin/robot run
+  bin/zima run
 ```
 
 Зависимости и веса устанавливаются **только явной подготовкой**, не при
-`robot run`. Подробности, pinned-зависимости, локальный режим, протокол и
+`zima run`. Подробности, pinned-зависимости, локальный режим, протокол и
 лицензия Ultralytics AGPL/Enterprise — в [tools/yolo/README.md](tools/yolo/README.md).
 На GPU нужны готовые CUDA-wheel и совместимый драйвер, не nvcc/toolkit.
 
@@ -591,7 +591,7 @@ ARM-помощники. Кросс-конфигурация находится �
 необходимые устройства.**
 
 ```sh
-bin/robot run
+bin/zima run
 # http://127.0.0.1:8085
 ```
 
@@ -606,9 +606,9 @@ SSH-обёртку и её предел ожидания. `ROBOT_SERVER_HEARTBEA
 
 `robot-server --help` описывает низкоуровневые параметры Player и камеры.
 Прямой запуск сервера не заменяет передачу владения контроллером и маской.
-Для обычной работы используется `bin/robot run`.
+Для обычной работы используется `bin/zima run`.
 
-Отдельные аппаратные команды доступны через `bin/robot --help`:
+Отдельные аппаратные команды доступны через `bin/zima --help`:
 `status`, `enable`, `disable`, `position`, `battery`, `fan`, `stop`, `move`,
 `mask`, `snapshot`. Они не должны конкурировать с активной серверной сессией.
 `position` при завершении посылает нулевую скорость, поэтому для просмотра
@@ -628,9 +628,9 @@ CLI не использует ROS и не отправляет команды д
 не являются проверкой реального микрофона.
 
 ```sh
-bin/robot audio check-config --config config/audio.example.json
-bin/robot audio run --config config/audio.example.json
-bin/robot audio status
+bin/zima audio check-config --config config/audio.example.json
+bin/zima audio run --config config/audio.example.json
+bin/zima audio status
 ```
 
 Пример профиля — [`config/audio.example.json`](config/audio.example.json).
@@ -659,21 +659,21 @@ Wake word, его модели обучения/оценки и голосово
 ### Команды аудио
 
 ```sh
-bin/robot audio listen on
-bin/robot audio record ./test.wav --seconds 6
-bin/robot audio start
-bin/robot audio import ./notification.wav --config ~/.config/robot/audio.json
-bin/robot audio play ASSET_ID --volume 0.35 --ttl 5
-bin/robot audio say 'Проверка динамика'
-bin/robot audio stop
-bin/robot audio mute on
+bin/zima audio listen on
+bin/zima audio record ./test.wav --seconds 6
+bin/zima audio start
+bin/zima audio import ./notification.wav --config ~/.config/robot/audio.json
+bin/zima audio play ASSET_ID --volume 0.35 --ttl 5
+bin/zima audio say 'Проверка динамика'
+bin/zima audio stop
+bin/zima audio mute on
 ```
 
 Команды работают только с явно включёнными функциями профиля. `record`
-использует сервисный поток; самостоятельный `bin/robot record` / `audio capture`
+использует сервисный поток; самостоятельный `bin/zima record` / `audio capture`
 не требует сервиса. Готовый WAV создаётся с `0600`, без перезаписи; разрыв или
 пропуск в незавершённой сервисной записи делает её недействительной.
-`bin/robot say` также работает самостоятельно. Учтите аппаратные ограничения
+`bin/zima say` также работает самостоятельно. Учтите аппаратные ограничения
 усиления и акустики из [HARDWARE.md](HARDWARE.md).
 
 IPC предоставляет `GET /status` и `POST /request` с JSON-объектом `command`.
@@ -690,7 +690,7 @@ Helper собирается локально:
 bash bin/audio/build.sh --output ~/.cache/robot/build/robot-audio-arm
 ```
 
-Отдельно разрешённое развёртывание: `bin/robot audio deploy --binary PATH --confirm`.
+Отдельно разрешённое развёртывание: `bin/zima audio deploy --binary PATH --confirm`.
 Оно меняет файл на роботе и не является частью обычного `audio run`.
 `audio companion` — особый ограниченный режим камеры/маски; обычное аудио
 его не требует. Не запускайте companion одновременно с серверной сессией.
@@ -705,7 +705,7 @@ bash tests/test_robot_camera.sh
 bash tests/test_robot_owner.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 (cd tools/panel-ui && npm test -- --run)
-shellcheck bin/robot bin/camera/snapshot bin/audio/build.sh tests/*.sh
+shellcheck bin/zima bin/camera/snapshot bin/audio/build.sh tests/*.sh
 ```
 
 Тесты сервера используют локальные Player, HTTP/WS и camera fixtures. Тесты
@@ -725,5 +725,5 @@ shellcheck bin/robot bin/camera/snapshot bin/audio/build.sh tests/*.sh
 
 Не открывайте управляющие порты в интернет. HTTP/Basic камеры не шифруется;
 пароли находятся в приватном netrc, GitLab-токены — в игнорируемом `.env`.
-Трекер вызывается только через `bin/robot bug`; правила русскоязычных задач
+Трекер вызывается только через `bin/zima bug`; правила русскоязычных задач
 и обработки секретов описаны в [CLAUDE.md](CLAUDE.md).

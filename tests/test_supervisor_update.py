@@ -89,7 +89,7 @@ class SupervisorUpdateTests(unittest.TestCase):
         self.script.write_text(SERVER)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('ROBOT_')}
         self.env['ROBOT_SUPERVISOR_TOKEN'] = 'update-test-secret'
-        text = (ROOT / 'bin/robot').read_text()
+        text = (ROOT / 'bin/zima').read_text()
         function = text[text.index('supervisor_request() {'):text.index('\nsupervisor_start() {')]
         self.harness = '''set -euo pipefail
 ssh_host=fake

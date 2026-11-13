@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""robot bug — GitLab issues for the robot project.
+"""zima bug — GitLab issues for the robot project.
 
 The credential is loaded from the private .env beside the repository, with
 process variables taking precedence: GITLAB_TOKEN, a personal access token with
@@ -37,7 +37,7 @@ def load_gitlab_env(path, environ):
 
 
 def fail(message):
-    raise SystemExit(f"robot bug: {message}")
+    raise SystemExit(f"zima bug: {message}")
 
 
 def project_id():
@@ -303,7 +303,7 @@ def command_mr(args):
 
 def main():
     load_gitlab_env(ROOT / ".env", os.environ)
-    parser = argparse.ArgumentParser(prog="robot bug", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="zima bug", description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     list_cmd = commands.add_parser("list", help="список issues")
     list_cmd.add_argument("--all", action="store_true")

@@ -16,7 +16,7 @@ Masks are computed by the segmentation model but are not returned.
 
 ## Panel integration
 
-From the repository root, `bin/robot run` enables both
+From the repository root, `bin/zima run` enables both
 `tools/mrpt-adapter/adapter` and `tools/yolo/adapter` by default. It is equivalent
 to specifying `--slam-adapter tools/mrpt-adapter/adapter --yolo-adapter tools/yolo/adapter`.
 The same defaults apply to the `panel` and `bridge` aliases. This hands over the

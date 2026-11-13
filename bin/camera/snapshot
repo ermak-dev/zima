@@ -3,8 +3,8 @@
 set -euo pipefail
 umask 077
 
-fail() { echo "robot snapshot: $*" >&2; exit 1; }
-(( $# <= 1 )) || fail 'usage: robot snapshot [output.jpg]'
+fail() { echo "zima snapshot: $*" >&2; exit 1; }
+(( $# <= 1 )) || fail 'usage: zima snapshot [output.jpg]'
 netrc=${ROBOT_CAMERA_NETRC:-${XDG_CONFIG_HOME:-$HOME/.config}/robot/camera.netrc}
 [[ -f $netrc && ! -L $netrc ]] || fail "missing regular credential file $netrc (create a mode-0600 netrc entry for machine cam)"
 [[ $(stat -c %a -- "$netrc") == 600 && $(stat -c %u -- "$netrc") == "$(id -u)" ]] || fail "credential file $netrc must be owned by you with mode 0600"

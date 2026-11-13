@@ -101,7 +101,7 @@ exit 0
         return path
 
     def run_cli(self, *args, **overrides):
-        return subprocess.run([str(ROOT / 'bin/robot'), *args], env=self.env | overrides,
+        return subprocess.run([str(ROOT / 'bin/zima'), *args], env=self.env | overrides,
                               capture_output=True, text=True, timeout=10)
 
     # FEATURE: normal sessions start panel MRPT SLAM by default.
@@ -148,8 +148,8 @@ exit 0
     def test_default_adapter_path_is_relative_to_repository(self):
         repo = self.directory / 'repo'
         (repo / 'bin').mkdir(parents=True)
-        cli = repo / 'bin/robot'
-        cli.write_text((ROOT / 'bin/robot').read_text())
+        cli = repo / 'bin/zima'
+        cli.write_text((ROOT / 'bin/zima').read_text())
         cli.chmod(0o700)
         shutil.copy2(ROOT / 'bin/config.py', repo / 'bin/config.py')
         (repo / 'python').mkdir()
@@ -212,8 +212,8 @@ exit 0
     def test_yolo_default_path_is_relative_to_repository(self):
         repo = self.directory / 'repo'
         (repo / 'bin').mkdir(parents=True)
-        cli = repo / 'bin/robot'
-        cli.write_text((ROOT / 'bin/robot').read_text())
+        cli = repo / 'bin/zima'
+        cli.write_text((ROOT / 'bin/zima').read_text())
         cli.chmod(0o700)
         shutil.copy2(ROOT / 'bin/config.py', repo / 'bin/config.py')
         (repo / 'python').mkdir()
@@ -441,7 +441,7 @@ exit 0
         self.assertEqual(self.log.read_text().splitlines(), ['resolve'])
 
     def test_sigterm_stops_child_and_restores_controller(self):
-        process = subprocess.Popen([str(ROOT / 'bin/robot'), 'run'],
+        process = subprocess.Popen([str(ROOT / 'bin/zima'), 'run'],
                                    env=self.env | {'SERVER_HOLD': '1'},
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: process.poll() is None and process.kill())

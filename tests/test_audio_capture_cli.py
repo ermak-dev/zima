@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
-ROBOT = ROOT / 'bin' / 'robot'
+ROBOT = ROOT / 'bin' / 'zima'
 
 from robot_audio.types import AudioChunk
 
@@ -170,8 +170,8 @@ class CaptureCliTests(unittest.TestCase):
                          ['capture', str(self.wav), '--seconds', '2'])
         help_text = subprocess.run([str(ROBOT), '--help'], env=env, cwd=ROOT,
                                    capture_output=True, text=True, timeout=10).stdout
-        self.assertIn('robot record', help_text)
-        self.assertIn('robot bug', help_text)
+        self.assertIn('zima record', help_text)
+        self.assertIn('zima bug', help_text)
 
     def test_default_config_refusal_names_the_consent_switch(self):
         """The CLI default disables the microphone; the error must say how to enable it."""

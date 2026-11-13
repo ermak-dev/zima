@@ -53,7 +53,7 @@ class NativeArchitectureTests(unittest.TestCase):
         self.assertFalse((ROOT / 'ros2/robot_audio_interfaces/package.xml').exists())
 
     def test_cli_and_frontend_do_not_launch_ros_or_offer_mapping(self):
-        cli = (ROOT / 'bin/robot').read_text()
+        cli = (ROOT / 'bin/zima').read_text()
         self.assertNotRegex(cli, r'(?m)^\s*(?:source_ros\b|source .*?/opt/ros|ros2\s+(?:run|launch))')
         ui = (ROOT / 'tools/panel-ui/src/App.jsx').read_text()
         self.assertNotIn('useOccupancyMap', ui)

@@ -32,7 +32,7 @@ def main():
     config = load_config(path)
     env = export_env(config)
     env['_ROBOT_CONFIG_LOADED'] = '1'
-    os.execve(str(ROOT / 'bin/robot'), [str(ROOT / 'bin/robot'), *args], env)
+    os.execve(str(ROOT / 'bin/zima'), [str(ROOT / 'bin/zima'), *args], env)
 
 
 if __name__ == '__main__':

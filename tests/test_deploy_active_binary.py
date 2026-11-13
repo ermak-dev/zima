@@ -21,7 +21,7 @@ class DeployTests(unittest.TestCase):
             shutil.copy2('/bin/sleep',target)
             source.write_bytes(b'updated-helper')
             original=hashlib.sha256(target.read_bytes()).digest()
-            text=(ROOT/'bin/robot').read_text()
+            text=(ROOT/'bin/zima').read_text()
             function=text[text.index('deploy_file() {'):text.index('controller_status() {')]
             harness='''set -euo pipefail
 fail() { printf '%s\\n' "$*" >&2; exit 2; }

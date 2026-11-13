@@ -80,64 +80,64 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_log() { grep -Fqx -- "$1" "$tmp/log" || fail "expected $1"; }
 expect_failure() { if "$@" >"$tmp/out" 2>&1; then fail "unexpected success: $*"; fi; }
 
-"$root/bin/robot" --help >"$tmp/out"
-grep -q 'robot enable|disable|status' "$tmp/out" || fail 'help is missing flat controller commands'
+"$root/bin/zima" --help >"$tmp/out"
+grep -q 'zima enable|disable|status' "$tmp/out" || fail 'help is missing flat controller commands'
 : > "$tmp/log"
-"$root/bin/robot" disable
-"$root/bin/robot" enable
+"$root/bin/zima" disable
+"$root/bin/zima" enable
 # The fake ssh logs only its argument string; the marker scripts were
 # consumed on stdin. Two bash -s dispatches mean both scripts ran.
 [[ $(grep -c 'ssh:robot bash -s' "$tmp/log") == 2 ]] || fail 'enable/disable not dispatched'
 : > "$tmp/log"
 # FEATURE: battery dispatch is read-only even with the stock controller enabled.
-"$root/bin/robot" battery
+"$root/bin/zima" battery
 assert_log 'robotctl:192.0.2.82 battery'
 [[ $(wc -l < "$tmp/log") == 1 ]] || fail 'battery touched controller or armed movement guard'
 : > "$tmp/log"
-expect_failure "$root/bin/robot" battery extra
+expect_failure "$root/bin/zima" battery extra
 [[ ! -s $tmp/log ]] || fail 'invalid battery arguments performed IO'
-"$root/bin/robot" position
+"$root/bin/zima" position
 assert_log 'robotctl:192.0.2.82 position'
-"$root/bin/robot" snapshot "$tmp/frame.jpg"
+"$root/bin/zima" snapshot "$tmp/frame.jpg"
 assert_log "camera:$tmp/frame.jpg"
 : > "$tmp/log"
-"$root/bin/robot" move forward 0.5
+"$root/bin/zima" move forward 0.5
 assert_log 'robotctl:192.0.2.82 move forward 0.5'
 assert_log 'ssh:robot rm -f -- /tmp/robot-drive-guard.TEST'
 [[ $(grep -n 'ssh:robot bash -s' "$tmp/log" | tail -1 | cut -d: -f1) -lt $(grep -n 'robotctl:.* move ' "$tmp/log" | cut -d: -f1) ]] || fail 'guard was not armed before movement'
 : > "$tmp/log"
-ROBOT_TEST_CONTROLLER_STATE=enabled expect_failure "$root/bin/robot" move forward 0.5
+ROBOT_TEST_CONTROLLER_STATE=enabled expect_failure "$root/bin/zima" move forward 0.5
 if grep -q 'robotctl:.* move ' "$tmp/log"; then fail 'default move bypassed controller gate'; fi
 : > "$tmp/log"
-ROBOT_TEST_CONTROLLER_STATE=enabled "$root/bin/robot" move --with-controller forward 0.5
+ROBOT_TEST_CONTROLLER_STATE=enabled "$root/bin/zima" move --with-controller forward 0.5
 assert_log 'robotctl:192.0.2.82 move forward 0.5'
 assert_log 'ssh:robot rm -f -- /tmp/robot-drive-guard.TEST'
 : > "$tmp/log"
-ROBOT_ROBOTCTL_FAIL=1 expect_failure "$root/bin/robot" move forward 0.1
+ROBOT_ROBOTCTL_FAIL=1 expect_failure "$root/bin/zima" move forward 0.1
 if grep -q 'ssh:robot rm -f -- /tmp/robot-drive-guard.TEST' "$tmp/log"; then fail 'guard was disarmed after failed movement'; fi
 : > "$tmp/log"
 for args in 'move sideways 1' 'move forward 0' 'move forward 3' 'move forward nan' 'move forward -1' 'move forward 1 extra' 'move --with-controller forward 3' 'move --with-controller sideways 0.5' 'position extra' 'enable extra' 'disable extra' 'status extra'; do
     read -r -a argv <<< "$args"
-    expect_failure "$root/bin/robot" "${argv[@]}"
+    expect_failure "$root/bin/zima" "${argv[@]}"
 done
 : > "$tmp/log"
-"$root/bin/robot" mask hold
+"$root/bin/zima" mask hold
 assert_log 'ssh:robot /tmp/mask-owner/mask-owner hold --mask 10f8ff --timeout 5'
 : > "$tmp/log"
-"$root/bin/robot" mask hold --mask 10f0ff
+"$root/bin/zima" mask hold --mask 10f0ff
 assert_log 'ssh:robot /tmp/mask-owner/mask-owner hold --mask 10f0ff --timeout 5'
 : > "$tmp/log"
-ROBOT_TEST_CONTROLLER_STATE=enabled expect_failure "$root/bin/robot" mask hold
+ROBOT_TEST_CONTROLLER_STATE=enabled expect_failure "$root/bin/zima" mask hold
 if grep -q 'mask-owner' "$tmp/log"; then fail 'mask hold bypassed controller gate'; fi
 : > "$tmp/log"
-ROBOT_MASK_OWNER_FAIL=1 expect_failure "$root/bin/robot" mask hold
+ROBOT_MASK_OWNER_FAIL=1 expect_failure "$root/bin/zima" mask hold
 : > "$tmp/log"
-"$root/bin/robot" mask restore
+"$root/bin/zima" mask restore
 assert_log 'ssh:robot /tmp/mask-owner/mask-owner restore'
 : > "$tmp/log"
 for args in 'mask' 'mask unknown' 'mask hold --mask zzz' 'mask hold --mask 1f8ff' 'mask hold --mask 10f8ff --timeout 0' 'mask restore extra' 'mask hold --mask 10f8ff --timeout' 'mask hold --mask'; do
     read -r -a argv <<< "$args"
-    expect_failure "$root/bin/robot" "${argv[@]}"
+    expect_failure "$root/bin/zima" "${argv[@]}"
 done
 [[ ! -s $tmp/log ]] || fail 'invalid mask commands contacted robot'
 
@@ -154,19 +154,19 @@ sleep 300
 EOF
 chmod +x "$tmp/bin/hang-ssh"
 start=$SECONDS
-ROBOT_SSH="$tmp/bin/hang-ssh" ROBOT_SSH_TIMEOUT_S=3 expect_failure "$root/bin/robot" status
+ROBOT_SSH="$tmp/bin/hang-ssh" ROBOT_SSH_TIMEOUT_S=3 expect_failure "$root/bin/zima" status
 elapsed=$((SECONDS - start))
 (( elapsed < 30 )) || fail "status hung for ${elapsed}s on an unreachable robot"
 : > "$tmp/log"
-"$root/bin/robot" stop
+"$root/bin/zima" stop
 assert_log 'robotctl:192.0.2.82 stop'
-"$root/bin/robot" fan
+"$root/bin/zima" fan
 assert_log 'robotctl:192.0.2.82 fan'
 [[ -d $root/bin/controller ]] && fail 'bin/controller still exists'
 [[ ! -e $root/bin/controller/player.c ]] || fail 'C player client still exists'
 printf 'robot CLI tests passed\n'
 
-# --- controller handoff internals (executed remotely by bin/robot) ---
+# --- controller handoff internals (executed remotely by bin/zima) ---
 # `robot enable` deploys controller-restore.sh (mkdir/sha/upload) and then
 # runs it — the same script the supervisor runs for rollback. The fake ssh
 # maps the remote path onto a per-test copy; enable/disable internals run
@@ -220,25 +220,25 @@ chmod +x "$tmp/bin/ssh" "$tmp/bin/initctl" "$tmp/bin/pgrep" "$tmp/bin/pkill"
 export PATH="$tmp/bin:$PATH" ROBOT_PROCESS_LIST="$tmp/ProcessList.conf" ROBOT_BACKUP="$tmp/ProcessList.backup" ROBOT_TEST_STATE="$tmp/controller-alive"
 printf 'player,player\nRoboController,setsid RoboController&,1,3,0\nAppProxy,app\n' > "$ROBOT_PROCESS_LIST"
 echo alive > "$ROBOT_TEST_STATE"
-"$root/bin/robot" disable
+"$root/bin/zima" disable
 grep -q '^# ROBOT_DISABLED: RoboController,setsid RoboController&,1,3,0$' "$ROBOT_PROCESS_LIST" || fail 'watchdog entry not disabled'
 [[ ! -e $ROBOT_TEST_STATE ]] || fail 'controller still running'
-"$root/bin/robot" disable
-"$root/bin/robot" enable
+"$root/bin/zima" disable
+"$root/bin/zima" enable
 grep -q '^RoboController,setsid RoboController&,1,3,0$' "$ROBOT_PROCESS_LIST" || fail 'watchdog entry not restored'
 [[ -e $ROBOT_TEST_STATE ]] || fail 'controller did not return'
-"$root/bin/robot" enable
+"$root/bin/zima" enable
 [[ ! -e $ROBOT_BACKUP ]] || fail 'recovery backup left after successful restore'
 
 # Watchdog readiness race: after initctl restart the old WatchDoge takes
 # ~10 s to die (and upstart may crash-loop it longer); disable/enable must
 # keep retrying past that window instead of failing and rolling back.
 echo 7 > "$tmp/wd-delay"
-ROBOT_TEST_WD_DELAY="$tmp/wd-delay" "$root/bin/robot" disable \
+ROBOT_TEST_WD_DELAY="$tmp/wd-delay" "$root/bin/zima" disable \
     || fail 'disable failed while WatchDoge was respawning'
 grep -q '^# ROBOT_DISABLED:' "$ROBOT_PROCESS_LIST" || fail 'entry not disabled during watchdog delay'
 echo 7 > "$tmp/wd-delay"
-ROBOT_TEST_WD_DELAY="$tmp/wd-delay" "$root/bin/robot" enable \
+ROBOT_TEST_WD_DELAY="$tmp/wd-delay" "$root/bin/zima" enable \
     || fail 'enable failed while WatchDoge was respawning'
 
 # A stale recovery copy left by an aborted rollback must not block every
@@ -247,25 +247,25 @@ ROBOT_TEST_WD_DELAY="$tmp/wd-delay" "$root/bin/robot" enable \
 # stale copy and proceeds, leaving a fresh recovery copy behind.
 cp -p "$ROBOT_PROCESS_LIST" "$tmp/enabled-copy"
 cp -p "$ROBOT_PROCESS_LIST" "$ROBOT_BACKUP"
-"$root/bin/robot" disable \
+"$root/bin/zima" disable \
     || fail 'disable blocked by a stale recovery copy'
 grep -q '^# ROBOT_DISABLED:' "$ROBOT_PROCESS_LIST" || fail 'entry not disabled despite stale copy cleanup'
 [[ ! -e $ROBOT_TEST_STATE ]] || fail 'controller still running with stale copy present'
 [[ -f $ROBOT_BACKUP ]] || fail 'recovery copy missing after stale-copy cleanup'
 cmp -s "$tmp/enabled-copy" "$ROBOT_BACKUP" || fail 'recovery copy is not the fresh enabled config'
-"$root/bin/robot" enable >/dev/null 2>&1 || fail 'enable after stale-copy cleanup failed'
+"$root/bin/zima" enable >/dev/null 2>&1 || fail 'enable after stale-copy cleanup failed'
 
 sed -i 's/RoboController,setsid RoboController\&,1,3,0/RoboController,unexpected/' "$ROBOT_PROCESS_LIST"
-expect_failure "$root/bin/robot" disable
+expect_failure "$root/bin/zima" disable
 grep -q '^RoboController,unexpected$' "$ROBOT_PROCESS_LIST" || fail 'unexpected entry was overwritten'
 
 printf 'player,player\nRoboController,setsid RoboController&,1,3,0\nAppProxy,app\n' > "$ROBOT_PROCESS_LIST"
 touch "$tmp/fail-restart"
-ROBOT_FAIL_RESTART="$tmp/fail-restart" expect_failure "$root/bin/robot" disable
+ROBOT_FAIL_RESTART="$tmp/fail-restart" expect_failure "$root/bin/zima" disable
 grep -q '^RoboController,setsid RoboController&,1,3,0$' "$ROBOT_PROCESS_LIST" || fail 'entry not restored after failed restart'
 [[ -e $ROBOT_BACKUP ]] || fail 'lost recovery copy while restart failed'
 rm "$tmp/fail-restart"
-"$root/bin/robot" enable
+"$root/bin/zima" enable
 [[ ! -e $ROBOT_BACKUP ]] || fail 'recovery copy remained after retry'
 [[ -e $ROBOT_TEST_STATE ]] || fail 'controller did not recover after retry'
 

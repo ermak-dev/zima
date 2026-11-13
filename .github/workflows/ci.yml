@@ -24,4 +24,4 @@ jobs:
       - name: Bug tracker CLI tests
         run: python3 tests/test_robot_bug.py
       - name: shellcheck
-        run: shellcheck bin/robot bin/camera/snapshot tests/*.sh
+        run: shellcheck bin/zima bin/camera/snapshot tests/*.sh

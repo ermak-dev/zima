@@ -184,7 +184,7 @@ class GitLabCommandTests(unittest.TestCase):
             fake_bug.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n")
             fake_bug.chmod(0o700)
             result = subprocess.run(
-                [str(ROOT / "bin" / "robot"), "bug", "list", "--all"],
+                [str(ROOT / "bin" / "zima"), "bug", "list", "--all"],
                 capture_output=True,
                 text=True,
                 env={**os.environ, "ROBOT_BUG_BIN": str(fake_bug), "ROBOT_SSH": "/does/not/exist"},

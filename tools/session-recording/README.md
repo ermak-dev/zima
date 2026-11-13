@@ -10,7 +10,7 @@ the physical camera remained unreachable.
 ## Launch and configuration
 
 ```sh
-bin/robot run --record-dir /absolute/path/to/new-session
+bin/zima run --record-dir /absolute/path/to/new-session
 ```
 
 This is a normal live robot session, not a passive attach command. Usual hardware

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class SayCliTests(test_say_api_cli.SayApiTests):
     def run_say(self, *args):
-        return subprocess.run([str(ROOT/'bin/robot'),'say',*args],env=self.env,
+        return subprocess.run([str(ROOT/'bin/zima'),'say',*args],env=self.env,
                               capture_output=True,text=True,timeout=10)
 
     def test_help_needs_no_ros_or_ssh(self):

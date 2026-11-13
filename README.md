@@ -26,7 +26,7 @@ single live scan relative to the robot body, not a room map.
 
 Перед запуском прочитайте разделы безопасности и жизненного цикла сессии
 (документация на русском).
-`bin/robot run`, `panel` и `bridge` передают управление физическим роботом;
+`bin/zima run`, `panel` и `bridge` передают управление физическим роботом;
 это не пассивный просмотр. Разработка и штатные тесты используют локальные
 фейки и не требуют робота.
 
@@ -41,7 +41,7 @@ Offline test suites run on local fakes and do not require the robot:
 bash tests/test_robot.sh
 bash tests/test_robot_camera.sh
 python3 tests/test_robot_bug.py
-shellcheck bin/robot bin/camera/snapshot tests/*.sh
+shellcheck bin/zima bin/camera/snapshot tests/*.sh
 ```
 
 ## License

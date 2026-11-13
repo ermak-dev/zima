@@ -258,7 +258,7 @@ class ConfigCliTests(unittest.TestCase):
         (self.root / "bin").mkdir(parents=True)
         # Copy only public source files; never read a real .env, private TOML,
         # netrc, user audio profile, or any host credential file.
-        shutil.copy2(ROOT / "bin" / "robot", self.root / "bin" / "robot")
+        shutil.copy2(ROOT / "bin" / "zima", self.root / "bin" / "zima")
         if MODULE.is_file():
             (self.root / "python").mkdir()
             shutil.copy2(MODULE, self.root / "python" / "robot_config.py")
@@ -309,7 +309,7 @@ elif sys.argv[-2:] == ['bash', '-s']:
                     "TEST_SCRIPT": str(Path(self.temp.name) / 'supervisor-script')}
 
     def run_cli(self, *args):
-        return subprocess.run([str(self.root / "bin" / "robot"), *map(str, args)],
+        return subprocess.run([str(self.root / "bin" / "zima"), *map(str, args)],
                               cwd=self.outside, env=self.env, capture_output=True,
                               text=True, timeout=10)
 

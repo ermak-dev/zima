@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-ROBOT = ROOT / 'bin' / 'robot'
+ROBOT = ROOT / 'bin' / 'zima'
 
 
 class AudioCliTests(unittest.TestCase):

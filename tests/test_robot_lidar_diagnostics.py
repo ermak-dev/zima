@@ -39,7 +39,7 @@ sys.stdout.buffer.write(Path(os.environ['TEST_ARCHIVE']).read_bytes())
                     member.size=len(data);archive.addfile(member,io.BytesIO(data))
 
     def run_cli(self,output):
-        return subprocess.run([str(ROOT/'bin/robot'),'diagnose','lidar',str(output)],env=self.env,
+        return subprocess.run([str(ROOT/'bin/zima'),'diagnose','lidar',str(output)],env=self.env,
                               capture_output=True,text=True,timeout=10)
 
     def test_captures_only_vendor_data_with_private_permissions(self):

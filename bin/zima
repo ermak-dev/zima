@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # Control the rooted vacuum through Player without starting cleaning.
-# Usage: robot [--config FILE] <command>  # private mode-0600 TOML; paths relative to FILE
-#        robot serve [--config FILE] [--port N] [--listen HOST]  # host HTTP/audio, no controller handoff
-#        robot daemon start [--config FILE]  # explicitly deploy/start persistent supervisor
-# Usage: robot enable|disable|status        # stock controller handoff
-#        robot position|fan|battery|stop   # battery: read-only power:0 JSON
-#        robot snapshot [output.jpg]
-#        robot diagnose lidar OUTPUT_DIR  # read-only vendor files for offline timing audit
-#        robot record <output.wav> [--seconds N] [--gain 0..90]  # test WAV, no ROS
-#        robot say "text" [--volume V]  # shared web TTS API; settings from TOML
-#        robot audio <command>   # capture, playback, speech (see audio --help)
-#        robot move [--with-controller] forward|backward|left|right <seconds (0, 2]>
-#        robot mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
-#        robot mask restore
-#        robot run [--port N] [--listen HOST] [--no-slam] [--no-yolo] [--record-dir NEW_DIR]
+# Usage: zima [--config FILE] <command>  # private mode-0600 TOML; paths relative to FILE
+#        zima serve [--config FILE] [--port N] [--listen HOST]  # host HTTP/audio, no controller handoff
+#        zima daemon start [--config FILE]  # explicitly deploy/start persistent supervisor
+# Usage: zima enable|disable|status        # stock controller handoff
+#        zima position|fan|battery|stop   # battery: read-only power:0 JSON
+#        zima snapshot [output.jpg]
+#        zima diagnose lidar OUTPUT_DIR  # read-only vendor files for offline timing audit
+#        zima record <output.wav> [--seconds N] [--gain 0..90]  # test WAV, no ROS
+#        zima say "text" [--volume V]  # shared web TTS API; settings from TOML
+#        zima audio <command>   # capture, playback, speech (see audio --help)
+#        zima move [--with-controller] forward|backward|left|right <seconds (0, 2]>
+#        zima mask hold [--mask HEX] [--timeout SECS]   # requires controller stopped
+#        zima mask restore
+#        zima run [--port N] [--listen HOST] [--no-slam] [--no-yolo] [--record-dir NEW_DIR]
 #                  [--slam-adapter EXE] [--yolo-adapter EXE] [--supervisor HOST:PORT]
-#        robot panel [--port N] [--listen HOST]  # alias for run (hands over controller)
-#        robot bridge [--port N] [--listen HOST] # alias for run
-#        robot bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
+#        zima panel [--port N] [--listen HOST]  # alias for run (hands over controller)
+#        zima bridge [--port N] [--listen HOST] # alias for run
+#        zima bug <list|show|labels|new|comment|edit|close|reopen|relabel|start|mr|project> ...
 set -euo pipefail
 
 # Config values cross this boundary only as environment data, never shell code.
@@ -41,7 +41,7 @@ ssh_wrap() {
 }
 
 usage() { sed -n '2,/^set /{ /^# /s/^# //p; }' "$0"; }
-fail() { echo "robot: $*" >&2; exit 2; }
+fail() { echo "zima: $*" >&2; exit 2; }
 repo_root() { cd "$(dirname "$(realpath "$0")")/.." && pwd; }
 
 # Upload a file to the robot only when it differs (sha256 compare), via a
@@ -55,7 +55,7 @@ deploy_file() {
     if [[ $remote_sha != "$local_sha" ]]; then
         ssh_wrap "$ssh_host" "for executable in /proc/[0-9]*/exe; do
             if test \"\$executable\" -ef $remote_path; then
-                printf '%s\\n' 'robot: executable is in use; refusing to replace it' >&2
+                printf '%s\\n' 'zima: executable is in use; refusing to replace it' >&2
                 exit 1
             fi
         done
@@ -96,7 +96,7 @@ rollback() {
         if initctl restart rrwatchdoge >&2; then
             rm -f "$backup"
         else
-            echo 'robot: watchdog restart failed during rollback; recovery copy preserved' >&2
+            echo 'zima: watchdog restart failed during rollback; recovery copy preserved' >&2
         fi
     fi
 }
@@ -113,11 +113,11 @@ if ! grep -Fqx "$marker" "$list"; then
     # matches the live config, refuse when it does not — that would be
     # someone else's state to inspect.
     if [[ -e $backup ]] && { ! grep -Fqx "$entry" "$list" || ! cmp -s "$backup" "$list"; }; then
-        echo 'robot: existing controller recovery copy; inspect before proceeding' >&2
+        echo 'zima: existing controller recovery copy; inspect before proceeding' >&2
         exit 1
     fi
     rm -f "$backup"
-    [[ $(grep -Fxc "$entry" "$list") == 1 ]] || { echo 'robot: unexpected RoboController entry' >&2; exit 1; }
+    [[ $(grep -Fxc "$entry" "$list") == 1 ]] || { echo 'zima: unexpected RoboController entry' >&2; exit 1; }
     cp -p "$list" "$backup"
     changed=1
     tmp=$(mktemp "${list}.robot.XXXXXX")
@@ -126,7 +126,7 @@ if ! grep -Fqx "$marker" "$list"; then
     mv -f "$tmp" "$list"
     tmp=
 elif [[ ! -f $backup ]]; then
-    echo 'robot: disabled entry has no recovery copy' >&2
+    echo 'zima: disabled entry has no recovery copy' >&2
     exit 1
 fi
 
@@ -137,7 +137,7 @@ for i in $(seq 1 30); do
     pgrep -x WatchDoge >/dev/null && break
     sleep 1
 done
-pgrep -x WatchDoge >/dev/null || { echo 'robot: watchdog failed to start' >&2; exit 1; }
+pgrep -x WatchDoge >/dev/null || { echo 'zima: watchdog failed to start' >&2; exit 1; }
 if pgrep -x RoboController >/dev/null; then
     pkill -TERM -x RoboController
     for i in $(seq 1 30); do
@@ -145,7 +145,7 @@ if pgrep -x RoboController >/dev/null; then
         sleep 1
     done
 fi
-! pgrep -x RoboController >/dev/null || { echo 'robot: controller remained running' >&2; exit 1; }
+! pgrep -x RoboController >/dev/null || { echo 'zima: controller remained running' >&2; exit 1; }
 echo 'controller disabled; watchdog and Player remain running'
 REMOTE
 }
@@ -153,7 +153,7 @@ REMOTE
 controller_enable() {
     # The enable logic lives in ONE place: controller-restore.sh (also
     # deployed to the robot for the supervisor's rollback). Running it over
-    # ssh keeps `robot enable` and the supervisor's restore byte-identical;
+    # ssh keeps `zima enable` and the supervisor's restore byte-identical;
     # the script is idempotent and validates its own preconditions.
     # deploy_file's sha compare makes the common path one cheap ssh call.
     deploy_file "$(repo_root)/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh
@@ -199,7 +199,7 @@ REMOTE
         if "$binary" "$host" "$@"; then
             ssh_wrap "$ssh_host" rm -f -- "$guard"
         else
-            echo 'robot: movement failed; on-robot guard will restart Player after 10 seconds' >&2
+            echo 'zima: movement failed; on-robot guard will restart Player after 10 seconds' >&2
             return 1
         fi
     else
@@ -313,7 +313,7 @@ legacy_shutdown() {
 }
 if [[ $mode == update ]]; then
     lock=/tmp/mask-owner/update.lock
-    mkdir "$lock" 2>/dev/null || { echo 'robot: supervisor update already locked' >&2; exit 2; }
+    mkdir "$lock" 2>/dev/null || { echo 'zima: supervisor update already locked' >&2; exit 2; }
     trap 'rmdir "$lock" 2>/dev/null || true' EXIT
     if probe; then exit 0; else status=$?; fi
     [[ $status == 5 ]] || exit "$status"
@@ -323,7 +323,7 @@ if [[ $mode == update ]]; then
     reply=$(request SHUTDOWN) || exit "$?"
     case $reply in
         STOPPING) ;;
-        BUSY) echo 'robot: supervisor is busy; update refused' >&2; exit 2 ;;
+        BUSY) echo 'zima: supervisor is busy; update refused' >&2; exit 2 ;;
         REFUSED) legacy_shutdown || exit "$?" ;;
         *) exit 4 ;;
     esac
@@ -331,10 +331,10 @@ if [[ $mode == update ]]; then
         [[ -e /proc/$daemon_pid/exe ]] || break
         sleep 0.1
     done
-    [[ ! -e /proc/$daemon_pid/exe ]] || { echo 'robot: supervisor did not stop; update aborted' >&2; exit 2; }
+    [[ ! -e /proc/$daemon_pid/exe ]] || { echo 'zima: supervisor did not stop; update aborted' >&2; exit 2; }
     for executable in /proc/[0-9]*/exe; do
         if test "$executable" -ef "$remote"; then
-            echo 'robot: supervisor executable is still in use; update aborted' >&2
+            echo 'zima: supervisor executable is still in use; update aborted' >&2
             exit 2
         fi
     done
@@ -349,7 +349,7 @@ else
     [[ $mode == check ]] && exit "$status"
     if [[ $status == 2 ]]; then
         [[ $mode == start ]] && exit 0
-        echo 'robot: supervisor has an active session; refusing to disturb it' >&2
+        echo 'zima: supervisor has an active session; refusing to disturb it' >&2
         exit 2
     fi
     [[ $status == 3 ]] || exit "$status"
@@ -357,7 +357,7 @@ fi
 nohup /tmp/mask-owner/robot-supervisor listen --listen "$listen" --heartbeat-port "$port" --timeout-ms "$timeout_ms" >> /tmp/robot-supervisor.log 2>&1 < /dev/null &
 pid=$!
 for _ in {1..30}; do
-    kill -0 "$pid" 2>/dev/null || { echo 'robot: supervisor failed to start' >&2; exit 1; }
+    kill -0 "$pid" 2>/dev/null || { echo 'zima: supervisor failed to start' >&2; exit 1; }
     if probe; then
         exit 0
     else
@@ -369,7 +369,7 @@ for _ in {1..30}; do
     fi
     sleep 0.1
 done
-echo 'robot: supervisor did not become ready' >&2
+echo 'zima: supervisor did not become ready' >&2
 exit 1
 REMOTE
     } | ssh_wrap "$ssh_host" bash -s >&2
@@ -395,7 +395,7 @@ supervisor_start() {
             deploy_file "$binary" /tmp/mask-owner/robot-supervisor
             deploy_file "$repo/crates/mask-owner/controller-restore.sh" /tmp/mask-owner/controller-restore.sh ;;
         5)
-            printf '%s\n' 'robot: updating idle supervisor' >&2
+            printf '%s\n' 'zima: updating idle supervisor' >&2
             deploy_file "$binary" "/tmp/mask-owner/robot-supervisor.$sha.next"
             supervisor_request "$port" "$timeout_ms" update "$sha" \
                 || fail 'cannot update idle supervisor; controller was not changed' ;;
@@ -415,7 +415,7 @@ server_cleanup() {
     if (( handoff )); then
         current=$(controller_status) || current=unknown
         if [[ $current != enabled ]]; then
-            controller_enable >&2 || { echo 'robot: controller recovery failed' >&2; rc=1; }
+            controller_enable >&2 || { echo 'zima: controller recovery failed' >&2; rc=1; }
         fi
     fi
     exit "$rc"
@@ -426,13 +426,13 @@ cmd=${1:---help}
 case $cmd in
     --help|-h|help) usage ;;
     enable|disable)
-        (( $# == 0 )) || fail "usage: robot $cmd"
+        (( $# == 0 )) || fail "usage: zima $cmd"
         case $cmd in
             enable) controller_enable ;;
             disable) controller_disable ;;
         esac ;;
     status)
-        (( $# == 0 )) || fail 'usage: robot status'
+        (( $# == 0 )) || fail 'usage: zima status'
         controller_status ;;
     position|fan|battery)
         (( $# == 0 )) || fail "$cmd takes no arguments"
@@ -443,7 +443,7 @@ case $cmd in
         exec python3 -I "$(repo_root)/bin/diagnostics/lidar.py" "$@" ;;
     record)
         # Standalone test capture: no ROS, no controller, no robot modes. Use
-        # `robot audio record` instead while an audio service owns the stream.
+        # `zima audio record` instead while an audio service owns the stream.
         if [[ -n ${ROBOT_AUDIO_BIN:-} ]]; then exec "$ROBOT_AUDIO_BIN" capture "$@"; fi
         exec python3 "$(repo_root)/bin/audio/cli.py" capture "$@" ;;
     audio)
@@ -456,7 +456,7 @@ case $cmd in
     move)
         with_controller=0
         if [[ ${1:-} == --with-controller ]]; then with_controller=1; shift; fi
-        (( $# == 2 )) || fail 'usage: robot move [--with-controller] forward|backward|left|right <seconds>'
+        (( $# == 2 )) || fail 'usage: zima move [--with-controller] forward|backward|left|right <seconds>'
         case $1 in forward|backward|left|right) ;; *) fail 'unknown direction' ;; esac
         [[ $2 =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || fail 'duration must be a finite positive number'
         awk -v n="$2" 'BEGIN {exit !(n > 0 && n <= 2)}' || fail 'duration must be between 0 and 2 seconds'
@@ -464,7 +464,7 @@ case $cmd in
         if (( with_controller )); then
             [[ $state == enabled ]] || fail '--with-controller requires the stock controller to be running'
         else
-            [[ $state == disabled ]] || fail 'stop the stock controller first (robot disable), or use --with-controller for a supervised test'
+            [[ $state == disabled ]] || fail 'stop the stock controller first (zima disable), or use --with-controller for a supervised test'
         fi
         robotctl move "$1" "$2" ;;
     mask)
@@ -490,13 +490,13 @@ case $cmd in
                 ssh_wrap "$ssh_host" "$remote" hold --mask "$mask" --timeout "$timeout" ;;
             restore)
                 shift
-                (( $# == 0 )) || fail 'usage: robot mask restore'
+                (( $# == 0 )) || fail 'usage: zima mask restore'
                 remote=$(mask_owner_remote)
                 ssh_wrap "$ssh_host" "$remote" restore ;;
-            *) fail 'usage: robot mask hold [--mask HEX] [--timeout SECS] | restore' ;;
+            *) fail 'usage: zima mask hold [--mask HEX] [--timeout SECS] | restore' ;;
         esac ;;
     daemon)
-        [[ $# == 1 && $1 == start ]] || fail 'usage: robot daemon start [--config FILE]'
+        [[ $# == 1 && $1 == start ]] || fail 'usage: zima daemon start [--config FILE]'
         supervisor_start "${ROBOT_SUPERVISOR_PORT:-7665}" "${ROBOT_SUPERVISOR_TIMEOUT_MS:-5000}" start ;;
     run|panel|bridge|serve)
         port=${ROBOT_SERVER_PORT:-8085} listen=${ROBOT_SERVER_LISTEN:-127.0.0.1}
@@ -531,7 +531,7 @@ case $cmd in
                     shift 2 ;;
                 --no-slam) slam_adapter=; shift ;;
                 --no-yolo) yolo_adapter=; shift ;;
-                *) fail 'usage: robot run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE|--no-slam] [--yolo-adapter EXE|--no-yolo] [--record-dir NEW_DIR]' ;;
+                *) fail 'usage: zima run [--port N] [--listen HOST] [--heartbeat-port N] [--timeout-ms M] [--slam-adapter EXE|--no-slam] [--yolo-adapter EXE|--no-yolo] [--record-dir NEW_DIR]' ;;
             esac
         done
         if [[ -n ${ROBOT_SESSION_RECORD_DIR:-} ]]; then
