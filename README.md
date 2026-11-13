@@ -1,41 +1,75 @@
-# Roborock V1
+<p align="center"><img src="docs/icon.png" width="128" alt="Zima" /></p>
 
-**English summary:** Manual control of a rooted Roborock V1 vacuum robot — live
-lidar, sensors and camera in a browser panel, plus a separate Python loop for
-recording, speech recognition and the speaker. The stock Player stays the
-hardware driver; a Rust server and an optional audio service run on the host.
-This is a personal, hardware-specific project: ROS, SLAM-based autonomous
-navigation and wake-word are intentionally out of scope. The panel shows a
-single live scan relative to the robot body, not a room map.
+# Zima
 
-Ручное управление root-нутым Roborock V1: текущий лидар, датчики и камера
-в браузере, отдельный Python-контур записи, распознавания речи и динамика.
-Штатный Player остаётся драйвером железа; на хосте работают Rust-сервер
-и опциональный аудиосервис.
+Ручное управление root-нутым роботом-пылесосом Zima (Roborock V1): текущий лидар,
+телеметрия датчиков и камера в браузерной панели, отдельный Python-контур
+записи, распознавания речи и динамика — и главное, **MCP-сервер, через
+который LLM-агент может наблюдать за роботом и управлять им** под
+операторским допуском. Штатный Player остаётся драйвером железа; на хосте
+работают Rust-сервер и опциональный аудиосервис.
 
-## Документация / Documentation
+## Управление через MCP для LLM
+
+`robot-server` поднимает MCP-эндпоинт `POST /mcp` (Streamable HTTP,
+JSON-RPC 2.0, протокол 2025-11-25) — им управляет из коробки официальный
+`@modelcontextprotocol/sdk`. Наблюдение доступно всегда, движение — только
+с живым операторским допуском.
+
+Инструменты:
+
+* `robot_observe` — слепок состояния с возрастами источников, сводка лидара
+  по 8 секторам, последние YOLO-детекции; без JPEG в ответе.
+* `robot_get_map` — версионированный участок карты SLAM (grid/PNG,
+  `not_modified`).
+* `robot_get_camera_frame` — исходный JPEG-кадр камеры.
+* `robot_acquire_control` / `robot_release_control` — владение ручным
+  управлением (общее с веб-панелью); release обнуляет моторы.
+* `robot_drive_for` / `robot_stop` / `robot_get_action` — ограниченное
+  движение с идемпотентными `command_id`, честными исходами и бюджетом.
+* `robot_recover_bumper` — операторский отъезд назад после бампера.
+* `robot_reset_hazards` — сброс защёлки опасностей после освобождения
+  датчиков.
+* `robot_set_cleaning_motors` — PWM вентилятора и щёток под лизом.
+* `robot_say` — озвучивание через общий аудиотур с панелью.
+
+Движение ограничено программными пределами (0.5 м/с, 3.14 рад/с, дедлайн
+на локальном супервизоре на самом роботе). Операторский допуск задаётся
+только переменной окружения оператора
+`ROBOT_MCP_GRANT=subject,max_linear_mps,max_angular_radps,max_action_ms,budget_ms,ttl_s`
+— LLM не может выдать его себе сам. Сервер проверяет Origin, ограничивает
+тело запроса и по умолчанию слушает loopback.
+
+## Документация
 
 * **[HARDWARE.md](HARDWARE.md)** — железо, датчики, питание, аппаратные
   интерфейсы, подтверждённые ограничения и безопасность.
 * **[SOFTWARE.md](SOFTWARE.md)** — текущие процессы и модули, протоколы,
-  сборка, запуск, аудио, тесты и диагностика.
+  сборка, запуск, аудио, тесты и диагностика (включая полный контракт MCP).
 * **[CLAUDE.md](CLAUDE.md)** — правила работы с репозиторием: TDD,
   разрешения на живое железо и трекер задач.
 * **[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)** — сторонние
   компоненты и их лицензии.
 
-Перед запуском прочитайте разделы безопасности и жизненного цикла сессии
-(документация на русском).
+## Запуск
+
+```sh
+bash tools/build-supervisor.sh          # ARM-бинарник супервизора
+cargo build --manifest-path crates/Cargo.toml --release
+bin/zima run                            # http://127.0.0.1:8085
+```
+
 `bin/zima run`, `panel` и `bridge` передают управление физическим роботом;
-это не пассивный просмотр. Разработка и штатные тесты используют локальные
-фейки и не требуют робота.
+это не пассивный просмотр. Перед запуском прочитайте разделы безопасности
+и жизненного цикла сессии в документации. Разработка и штатные тесты
+используют локальные фейки и не требуют робота.
 
-ROS, SLAM, автономная навигация и wake word в текущую реализацию не входят.
-Панель показывает один текущий скан относительно корпуса, а не карту помещения.
+ROS, SLAM-навигация к цели, автономные поездки и wake word в текущую
+реализацию не входят; SLAM строит карту как телеметрию.
 
-## Tests
+## Тесты
 
-Offline test suites run on local fakes and do not require the robot:
+Офлайн-наборы работают на локальных фейках и не требуют робота:
 
 ```sh
 bash tests/test_robot.sh
@@ -44,9 +78,8 @@ python3 tests/test_robot_bug.py
 shellcheck bin/zima bin/camera/snapshot tests/*.sh
 ```
 
-## License
+## Лицензия
 
-The project code is licensed under the [MIT License](LICENSE); third-party
-components and their licenses are listed in
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). The optional YOLO path
-(see `tools/yolo/`) pulls in AGPL-3.0 dependencies at setup time.
+Код проекта — [MIT](LICENSE); сторонние компоненты и их лицензии перечислены
+в [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Опциональный YOLO-контур
+(`tools/yolo/`) подтягивает AGPL-зависимости при установке.
